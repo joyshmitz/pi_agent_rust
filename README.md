@@ -2,10 +2,10 @@
   <img src="https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/assets/pi-logo.svg" alt="Pi Logo" width="200"/>
 </p>
 
-<h1 align="center">Pi</h1>
+<h1 align="center">pi_agent_rust</h1>
 
 <p align="center">
-  <strong>High-performance AI coding agent CLI written in Rust</strong>
+  <strong>Pi — High-performance AI coding agent CLI written in Rust</strong>
 </p>
 
 <p align="center">
@@ -34,7 +34,7 @@ You want an AI coding assistant in your terminal, but existing tools are:
 
 ## The Solution
 
-**Pi** is a from-scratch Rust rewrite of the pi-mono TypeScript CLI. Single binary, instant startup, rock-solid streaming, and 7 battle-tested built-in tools.
+**Pi** is a from-scratch Rust rewrite of the Pi Agent TypeScript CLI. Single binary, instant startup, rock-solid streaming, and 7 battle-tested built-in tools.
 
 ```bash
 # Start a session
@@ -68,7 +68,7 @@ pi -p "What does this error mean?" < error.log
 ```bash
 # From source (requires Rust nightly)
 git clone https://github.com/Dicklesworthstone/pi_agent_rust.git
-cd pi
+cd pi_agent_rust
 cargo install --path .
 ```
 
@@ -167,7 +167,7 @@ rustup default nightly
 
 # Clone and build
 git clone https://github.com/Dicklesworthstone/pi_agent_rust.git
-cd pi
+cd pi_agent_rust
 cargo build --release
 
 # Binary is at target/release/pi
