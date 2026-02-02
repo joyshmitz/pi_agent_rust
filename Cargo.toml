@@ -1,0 +1,104 @@
+[package]
+name = "pi"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "High-performance AI coding agent CLI - Rust port of pi-mono"
+license = "MIT"
+repository = "https://github.com/yourname/pi"
+keywords = ["ai", "cli", "coding-agent", "llm", "anthropic"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lib]
+name = "pi"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pi"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive", "env", "string"] }
+clap_complete = "4"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
+async-trait = "0.1"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"] }
+reqwest-eventsource = "0.6"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Terminal
+crossterm = "0.28"
+unicode-width = "0.2"
+textwrap = "0.16"
+
+# Filesystem
+dirs = "5"
+tempfile = "3"
+fs4 = "0.13"
+glob = "0.3"
+ignore = "0.4"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+sha2 = "0.10"
+regex = "1"
+
+# Image processing (optional)
+image = { version = "0.25", optional = true }
+unicode-normalization = "0.1.25"
+
+[build-dependencies]
+vergen-gix = { version = "1", features = ["build", "cargo", "rustc"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+pretty_assertions = "1"
+tempfile = "3"
+
+[features]
+default = ["image-resize"]
+image-resize = ["image"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# Allow some common patterns
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
