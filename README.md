@@ -36,6 +36,10 @@ You want an AI coding assistant in your terminal, but existing tools are:
 
 **pi_agent_rust** is a from-scratch Rust port of [Pi Agent](https://github.com/badlogic/pi) by [Mario Zechner](https://github.com/badlogic) (made with his blessing!). Single binary, instant startup, rock-solid streaming, and 7 battle-tested built-in tools.
 
+This isn't a direct line-by-line port—it leverages two purpose-built Rust libraries:
+- **[asupersync](https://github.com/Dicklesworthstone/asupersync)** — A structured concurrency async runtime with built-in HTTP, TLS, and SQLite
+- **[rich_rust](https://github.com/Dicklesworthstone/rich_rust)** — A Rust port of [Rich](https://github.com/Textualize/rich) by [Will McGugan](https://github.com/willmcgugan), providing beautiful terminal output with markup syntax
+
 ```bash
 # Start a session
 pi "Help me refactor this function to use async/await"
@@ -459,7 +463,7 @@ Pi is honest about what it doesn't do:
 ## FAQ
 
 **Q: What's the relationship to the original Pi Agent?**
-A: This is an authorized Rust port of [Pi Agent](https://github.com/badlogic/pi) by [Mario Zechner](https://github.com/badlogic), created with his blessing. Mario's original TypeScript implementation is excellent—this port aims to bring the same great experience with Rust's performance benefits.
+A: This is an authorized Rust port of [Pi Agent](https://github.com/badlogic/pi) by [Mario Zechner](https://github.com/badlogic), created with his blessing. It's not a line-by-line translation—instead, it's built on [asupersync](https://github.com/Dicklesworthstone/asupersync) (a structured concurrency runtime) and [rich_rust](https://github.com/Dicklesworthstone/rich_rust) (a port of Will McGugan's [Rich](https://github.com/Textualize/rich) library), bringing idiomatic Rust architecture while preserving Pi Agent's excellent UX.
 
 **Q: Why rewrite in Rust?**
 A: Startup time matters when you're in a terminal all day. Rust gives us <100ms startup vs 500ms+ for Node.js. Plus, no runtime dependencies to manage.
