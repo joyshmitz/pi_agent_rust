@@ -97,6 +97,10 @@ jsonschema = { version = "0.40.2", default-features = false }
 name = "tools"
 harness = false
 
+[[bench]]
+name = "extensions"
+harness = false
+
 [features]
 default = ["image-resize"]
 image-resize = ["image"]
