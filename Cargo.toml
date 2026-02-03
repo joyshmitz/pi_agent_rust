@@ -24,7 +24,7 @@ clap = { version = "4", features = ["derive", "env", "string"] }
 clap_complete = "4"
 
 # Async runtime
-asupersync = { path = "../asupersync", default-features = false, features = ["tls-native-roots", "sqlite"] }
+asupersync = { version = "0.1.0", path = "../asupersync", default-features = false, features = ["tls-native-roots", "sqlite"] }
 futures = "0.3"
 async-trait = "0.1"
 
@@ -43,14 +43,14 @@ anyhow = "1"
 thiserror = "2"
 
 # Terminal output (rich_rust for beautiful TUI)
-rich_rust = { path = "../rich_rust", features = ["full"] }
+rich_rust = { version = "0.1.1", path = "../rich_rust", features = ["full"] }
 crossterm = "0.29"
 
 # Interactive TUI (charmed_rust - bubbletea/lipgloss/bubbles/glamour)
-bubbletea = { path = "../charmed_rust/crates/bubbletea" }
-lipgloss = { path = "../charmed_rust/crates/lipgloss" }
-bubbles = { path = "../charmed_rust/crates/bubbles" }
-glamour = { path = "../charmed_rust/crates/glamour" }
+bubbletea = { version = "0.1.0", path = "../charmed_rust/crates/bubbletea" }
+lipgloss = { version = "0.1.0", path = "../charmed_rust/crates/lipgloss" }
+bubbles = { version = "0.1.0", path = "../charmed_rust/crates/bubbles" }
+glamour = { version = "0.1.0", path = "../charmed_rust/crates/glamour" }
 unicode-width = "0.2"
 textwrap = "0.16"
 clipboard = { version = "0.5.0", optional = true }
@@ -61,8 +61,8 @@ tempfile = "3"
 fs4 = "0.13"
 glob = "0.3"
 ignore = "0.4"
-sqlmodel-sqlite = { path = "../sqlmodel_rust/crates/sqlmodel-sqlite" }
-sqlmodel-core = { path = "../sqlmodel_rust/crates/sqlmodel-core" }
+sqlmodel-sqlite = { version = "0.1.0", path = "../sqlmodel_rust/crates/sqlmodel-sqlite" }
+sqlmodel-core = { version = "0.1.0", path = "../sqlmodel_rust/crates/sqlmodel-core" }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
