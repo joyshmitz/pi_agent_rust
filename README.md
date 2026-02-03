@@ -72,10 +72,10 @@ pi -p "What does this error mean?" < error.log
 [asupersync](https://github.com/Dicklesworthstone/asupersync) is a structured concurrency async runtime designed for applications that need predictable resource cleanup. Key features used by pi_agent_rust:
 
 - **Capability-based context (`Cx`)**: Async functions receive an explicit context that controls what they can do (HTTP, filesystem, time). This makes testing deterministic.
-- **HTTP client with TLS**: Built-in `reqwest`-like API with rustls, avoiding OpenSSL dependency hell
+- **HTTP client with TLS**: Built-in HTTP API with rustls, avoiding OpenSSL dependency hell
 - **Structured cancellation**: When a parent task cancels, all child tasks cancel cleanly. No orphaned futures.
 
-The migration from tokio to asupersync is ongoing. Currently, tokio handles the main runtime while asupersync provides the SSE parser and will eventually handle all I/O.
+`pi_agent_rust` runs on `asupersync` end-to-end today (runtime + HTTP/TLS + cancellation). Provider streaming uses a minimal HTTP client (`src/http/client.rs`) feeding a custom SSE parser (`src/sse.rs`).
 
 ### rich_rust
 
@@ -644,7 +644,7 @@ strip = true         # Remove symbol tables
 | Component | Contribution |
 |-----------|-------------|
 | Core binary logic | ~3MB |
-| reqwest + TLS | ~5MB |
+| HTTP + TLS (rustls) | ~5MB |
 | serde + JSON | ~1MB |
 | clap (CLI) | ~1MB |
 | Other dependencies | ~3MB |
