@@ -140,7 +140,7 @@ Watch the response appear token-by-token, with thinking blocks shown inline.
 
 | Tool | Description | Example |
 |------|-------------|---------|
-| `read` | Read files with line numbers, supports images | Read src/main.rs lines 1-50 |
+| `read` | Read file contents, supports images | Read src/main.rs |
 | `write` | Create or overwrite files | Write a new config file |
 | `edit` | Surgical string replacement | Fix the typo on line 42 |
 | `bash` | Execute shell commands with timeout | Run the test suite |
@@ -162,7 +162,7 @@ Sessions persist as JSONL files with full conversation history:
 pi --continue
 
 # Open specific session
-pi --session ~/.pi/sessions/2024-01-15T10-30-00.jsonl
+pi --session ~/.pi/agent/sessions/--home-user-project--/2024-01-15T10-30-00.jsonl
 
 # Ephemeral (no persistence)
 pi --no-session
@@ -181,7 +181,7 @@ Enable deep reasoning for complex problems:
 pi --thinking high "Design a distributed rate limiter"
 ```
 
-Thinking levels: `none`, `low`, `medium`, `high`, `very_high`, `max`
+Thinking levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`
 
 ---
 
@@ -236,55 +236,62 @@ pi -p "Quick question"          # Print mode (no session)
 | `--no-session` | Don't persist conversation |
 | `-p, --print` | Single response, no interaction |
 | `--model <MODEL>` | Model to use (default: claude-sonnet-4-20250514) |
-| `--thinking <LEVEL>` | Thinking level: none/low/medium/high/very_high/max |
+| `--thinking <LEVEL>` | Thinking level: off/minimal/low/medium/high/xhigh |
 | `--tools <TOOLS>` | Comma-separated tool list |
 | `--api-key <KEY>` | API key (or use ANTHROPIC_API_KEY) |
+| `--list-models [PATTERN]` | List available models (optional fuzzy filter) |
+| `--export <PATH>` | Export session file to HTML |
 
-### Subcommands
+### Subcommands (planned)
 
 ```bash
-pi config              # Show configuration
-pi list models         # List available models
-pi list sessions       # List saved sessions
+# Package management (not yet implemented in this Rust port)
+pi install <source>    # Install extension/skill/prompt/theme
+pi remove <source>     # Remove from settings
+pi update [source]     # Update packages
+pi list                # List installed packages
+
+# Configuration UI (planned)
+pi config
 ```
 
 ---
 
 ## Configuration
 
-Pi reads configuration from `~/.config/pi/config.json`:
+Pi reads configuration from `~/.pi/agent/settings.json`:
 
 ```json
 {
-  "model": "claude-sonnet-4-20250514",
-  "thinkingLevel": "medium",
-  "maxTokens": 16384,
+  "default_provider": "anthropic",
+  "default_model": "claude-sonnet-4-20250514",
+  "default_thinking_level": "medium",
 
   "compaction": {
     "enabled": true,
-    "reserveTokens": 8192,
-    "keepFirstMessages": 2
+    "reserve_tokens": 8192,
+    "keep_recent_tokens": 20000
   },
 
   "retry": {
     "enabled": true,
-    "maxRetries": 3,
-    "baseDelayMs": 1000,
-    "maxDelayMs": 30000
+    "max_retries": 3,
+    "base_delay_ms": 1000,
+    "max_delay_ms": 30000
   },
 
   "images": {
-    "autoResize": true,
-    "blockImages": false
+    "auto_resize": true,
+    "block_images": false
   },
 
   "terminal": {
-    "showImages": true,
-    "clearOnStart": false
+    "show_images": true,
+    "clear_on_shrink": false
   },
 
-  "shellPath": "/bin/bash",
-  "shellCommandPrefix": "set -e"
+  "shell_path": "/bin/bash",
+  "shell_command_prefix": "set -e"
 }
 ```
 
@@ -294,6 +301,8 @@ Pi reads configuration from `~/.config/pi/config.json`:
 |----------|-------------|
 | `ANTHROPIC_API_KEY` | Anthropic API key |
 | `PI_CONFIG_PATH` | Custom config file path |
+| `PI_CODING_AGENT_DIR` | Override the global config directory |
+| `PI_PACKAGE_DIR` | Override the packages directory |
 | `PI_SESSIONS_DIR` | Custom sessions directory |
 
 ---
@@ -511,7 +520,7 @@ This design allows adding new providers (OpenAI, Gemini) without modifying the a
 
 ### read
 
-Read file contents with automatic line numbering:
+Read file contents (optionally images):
 
 ```
 Input: { "path": "src/main.rs", "offset": 10, "limit": 50 }
@@ -675,7 +684,7 @@ ln -s $(which fdfind) ~/.local/bin/fd
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."
 
-# Or in config.json
+# Or in settings.json
 { "apiKey": "sk-ant-..." }
 
 # Or per-command
@@ -691,7 +700,7 @@ Sessions are append-only JSONL. If corruption occurs:
 pi --no-session
 
 # Or delete the problematic session
-rm ~/.pi/sessions/corrupted-session.jsonl
+rm ~/.pi/agent/sessions/--home-user-project--/corrupted-session.jsonl
 ```
 
 ### "Streaming hangs"

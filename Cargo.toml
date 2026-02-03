@@ -6,6 +6,7 @@ rust-version = "1.85"
 description = "High-performance AI coding agent CLI - Rust port of Pi Agent"
 license = "MIT"
 repository = "https://github.com/Dicklesworthstone/pi_agent_rust"
+readme = "README.md"
 keywords = ["ai", "cli", "coding-agent", "llm", "anthropic"]
 categories = ["command-line-utilities", "development-tools"]
 
@@ -44,8 +45,14 @@ anyhow = "1"
 thiserror = "2"
 
 # Terminal output (rich_rust for beautiful TUI)
-rich_rust = { path = "../rich_rust" }
+rich_rust = { path = "../rich_rust", features = ["full"] }
 crossterm = "0.28"
+
+# Interactive TUI (charmed_rust - bubbletea/lipgloss/bubbles/glamour)
+bubbletea = { path = "../charmed_rust/crates/bubbletea", features = ["async"] }
+lipgloss = { path = "../charmed_rust/crates/lipgloss" }
+bubbles = { path = "../charmed_rust/crates/bubbles" }
+glamour = { path = "../charmed_rust/crates/glamour" }
 unicode-width = "0.2"
 textwrap = "0.16"
 
@@ -83,6 +90,11 @@ vergen-gix = { version = "1", features = ["build", "cargo", "rustc"] }
 tokio-test = "0.4"
 pretty_assertions = "1"
 tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "tools"
+harness = false
 
 [features]
 default = ["image-resize"]
