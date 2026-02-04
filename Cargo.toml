@@ -87,6 +87,7 @@ swc_ecma_parser = "33.0.1"
 swc_ecma_transforms_base = "36.0.1"
 swc_ecma_transforms_typescript = "40.0.0"
 swc_ecma_visit = "20.0.0"
+wasmtime = { version = "29.0", features = ["component-model"], optional = true }
 
 # Image processing (optional)
 image = { version = "0.25", optional = true }
@@ -118,6 +119,7 @@ harness = false
 default = ["image-resize", "clipboard"]
 image-resize = ["image"]
 clipboard = ["dep:clipboard"]
+wasm-host = ["dep:wasmtime"]
 
 [profile.release]
 opt-level = "z"
