@@ -240,6 +240,9 @@ pi @file.rs "Explain this"      # Include file as context
 pi -p "Quick question"          # Print mode (no session)
 ```
 
+Interactive file references:
+- Type `@relative/path` in the editor to attach a file’s contents (autocomplete inserts the `@` form).
+
 ### Options
 
 | Option | Description |
@@ -680,6 +683,8 @@ Each token appears on screen within milliseconds of leaving Anthropic's servers.
 ---
 
 ## Troubleshooting
+
+For a more complete guide, see [docs/troubleshooting.md](docs/troubleshooting.md).
 
 ### "fd not found"
 
