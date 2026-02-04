@@ -93,6 +93,7 @@ insta = { version = "1", features = ["filters"] }
 tempfile = "3"
 criterion = { version = "0.7", features = ["html_reports"] }
 jsonschema = { version = "0.40.2", default-features = false }
+proptest = "1.6"
 
 [[bench]]
 name = "tools"
