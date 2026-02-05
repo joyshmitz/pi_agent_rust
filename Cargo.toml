@@ -121,6 +121,7 @@ default = ["image-resize", "clipboard"]
 image-resize = ["image"]
 clipboard = ["dep:clipboard", "dep:arboard"]
 wasm-host = ["dep:wasmtime"]
+sqlite-sessions = []
 
 [profile.release]
 opt-level = "z"
