@@ -4,11 +4,22 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "High-performance AI coding agent CLI - Rust port of Pi Agent"
+authors = ["Jeffrey Emanuel"]
 license = "MIT"
+license-file = "LICENSE"
 repository = "https://github.com/Dicklesworthstone/pi_agent_rust"
+homepage = "https://github.com/Dicklesworthstone/pi_agent_rust"
+documentation = "https://docs.rs/pi_agent_rust"
 readme = "README.md"
 keywords = ["ai", "cli", "coding-agent", "llm", "anthropic"]
 categories = ["command-line-utilities", "development-tools"]
+include = [
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+    "build.rs",
+    "src/**",
+]
 
 [lib]
 name = "pi"
