@@ -6,7 +6,6 @@ rust-version = "1.85"
 description = "High-performance AI coding agent CLI - Rust port of Pi Agent"
 authors = ["Jeffrey Emanuel"]
 license = "MIT"
-license-file = "LICENSE"
 repository = "https://github.com/Dicklesworthstone/pi_agent_rust"
 homepage = "https://github.com/Dicklesworthstone/pi_agent_rust"
 documentation = "https://docs.rs/pi_agent_rust"
