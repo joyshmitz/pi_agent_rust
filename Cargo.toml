@@ -133,6 +133,7 @@ image-resize = ["image"]
 clipboard = ["dep:clipboard", "dep:arboard"]
 wasm-host = ["dep:wasmtime"]
 sqlite-sessions = []
+ext-conformance = []
 
 [profile.release]
 opt-level = "z"
