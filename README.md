@@ -94,7 +94,7 @@ pi -p "What does this error mean?" < error.log
 - **Markdown**: Terminal-rendered markdown with syntax highlighting
 - **Themes**: Consistent color schemes across components
 
-The terminal UI (currently WIP) uses rich_rust for all output formatting, providing the same visual quality as Rich-based Python tools.
+The terminal UI uses rich_rust for all output formatting, providing the same visual quality as Rich-based Python tools.
 
 ---
 
@@ -964,7 +964,7 @@ src/
 ├── session.rs       # Session persistence
 ├── sse.rs           # SSE parser
 ├── tools.rs         # Built-in tools
-└── tui.rs           # Terminal UI (WIP)
+└── tui.rs           # Terminal UI rendering helpers
 ```
 
 ---
