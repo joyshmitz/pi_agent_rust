@@ -157,3 +157,31 @@ nursery = { level = "warn", priority = -1 }
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 module_name_repetitions = "allow"
+
+# ---------------------------------------------------------------------------
+# Local development with sibling crates
+# ---------------------------------------------------------------------------
+# This project depends on published crates.io versions of asupersync,
+# rich_rust, charmed-*, and sqlmodel-*. CI builds verify this (no sibling
+# repos are checked out).
+#
+# To develop against LOCAL checkouts of these crates, uncomment the
+# [patch.crates-io] section below. Cargo will use the local paths when they
+# satisfy the version requirement and fall back to crates.io otherwise.
+#
+# IMPORTANT: Do NOT commit this section. To prevent accidental commits:
+#   git update-index --skip-worktree Cargo.toml
+# To re-enable tracking:
+#   git update-index --no-skip-worktree Cargo.toml
+#
+# [patch.crates-io]
+# asupersync = { path = "../asupersync" }
+# rich_rust = { path = "../rich_rust" }
+# charmed-bubbletea = { path = "../charmed_rust/crates/bubbletea" }
+# charmed-bubbletea-macros = { path = "../charmed_rust/crates/bubbletea-macros" }
+# charmed-lipgloss = { path = "../charmed_rust/crates/lipgloss" }
+# charmed-bubbles = { path = "../charmed_rust/crates/bubbles" }
+# charmed-glamour = { path = "../charmed_rust/crates/glamour" }
+# charmed-harmonica = { path = "../charmed_rust/crates/harmonica" }
+# sqlmodel-core = { path = "../sqlmodel_rust/crates/sqlmodel-core" }
+# sqlmodel-sqlite = { path = "../sqlmodel_rust/crates/sqlmodel-sqlite" }
