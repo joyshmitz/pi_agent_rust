@@ -34,7 +34,7 @@ clap = { version = "4", features = ["derive", "env", "string"] }
 clap_complete = "4"
 
 # Async runtime
-asupersync = { version = "0.1.0", path = "../asupersync", default-features = false, features = ["tls-native-roots", "sqlite", "tracing-integration"] }
+asupersync = { version = "0.1.0", default-features = false, features = ["tls-native-roots", "sqlite", "tracing-integration"] }
 futures = "0.3"
 async-trait = "0.1"
 
@@ -53,14 +53,14 @@ anyhow = "1"
 thiserror = "2"
 
 # Terminal output (rich_rust for beautiful TUI)
-rich_rust = { version = "0.1.1", path = "../rich_rust", features = ["full"] }
+rich_rust = { version = "0.1.1", features = ["full"] }
 crossterm = "0.29"
 
 # Interactive TUI (charmed_rust - bubbletea/lipgloss/bubbles/glamour)
-bubbletea = { package = "charmed-bubbletea", version = "0.1.0", path = "../charmed_rust/crates/bubbletea" }
-lipgloss = { package = "charmed-lipgloss", version = "0.1.0", path = "../charmed_rust/crates/lipgloss" }
-bubbles = { package = "charmed-bubbles", version = "0.1.0", path = "../charmed_rust/crates/bubbles" }
-glamour = { package = "charmed-glamour", version = "0.1.0", path = "../charmed_rust/crates/glamour" }
+bubbletea = { package = "charmed-bubbletea", version = "0.1.2" }
+lipgloss = { package = "charmed-lipgloss", version = "0.1.2" }
+bubbles = { package = "charmed-bubbles", version = "0.1.2" }
+glamour = { package = "charmed-glamour", version = "0.1.2" }
 unicode-width = "0.2"
 textwrap = "0.16"
 clipboard = { version = "0.5.0", optional = true }
@@ -72,8 +72,8 @@ tempfile = "3"
 fs4 = "0.13"
 glob = "0.3"
 ignore = "0.4"
-sqlmodel-sqlite = { version = "0.1.0", path = "../sqlmodel_rust/crates/sqlmodel-sqlite" }
-sqlmodel-core = { version = "0.1.0", path = "../sqlmodel_rust/crates/sqlmodel-core" }
+sqlmodel-sqlite = { version = "0.1.1" }
+sqlmodel-core = { version = "0.1.1" }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -111,7 +111,7 @@ vergen-gix = { version = "1", features = ["build", "cargo", "rustc"] }
 pretty_assertions = "1"
 insta = { version = "1", features = ["filters"] }
 tempfile = "3"
-asupersync = { version = "0.1.0", path = "../asupersync", default-features = false, features = ["test-internals"] }
+asupersync = { version = "0.1.0", default-features = false, features = ["test-internals"] }
 criterion = { version = "0.7", features = ["html_reports"] }
 jsonschema = { version = "0.40.2", default-features = false }
 proptest = "1.6"
