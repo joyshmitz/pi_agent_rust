@@ -119,6 +119,7 @@ asupersync = { version = "0.1.0", default-features = false, features = ["test-in
 criterion = { version = "0.7", features = ["html_reports"] }
 jsonschema = { version = "0.40.2", default-features = false }
 proptest = "1.6"
+wat = "1"
 
 [[bench]]
 name = "tools"
