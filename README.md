@@ -371,14 +371,16 @@ Pi reads configuration from `~/.pi/agent/settings.json`:
 │ Provider Layer  │  │  Tool Registry     │  │  Extension Mgr   │
 │ • Anthropic     │  │  • read  • bash    │  │  • QuickJS RT    │
 │ • OpenAI        │  │  • write • grep    │  │  • Capability    │
-│ • Gemini        │  │  • edit  • find    │  │    policy        │
-│ • Azure OpenAI  │  │  • ls              │  │  • Node shims    │
-│ • Extensions    │  │  • ext-registered  │  │  • Event hooks   │
+│ • OpenAI Resp.  │  │  • edit  • find    │  │    policy        │
+│ • Gemini        │  │  • ls              │  │  • Node shims    │
+│ • Cohere/Azure  │  │  • ext-registered  │  │  • Event hooks   │
+│ • Extensions    │  │                    │  │                  │
 └────────┬────────┘  └─────────┬──────────┘  └───────┬──────────┘
          │                     │                      │
 ┌────────▼─────────────────────▼──────────────────────▼──────────┐
 │                     Session Persistence                         │
-│  • JSONL format (v3)   • Tree structure   • Per-project dirs    │
+│  • JSONL format (v3)   • Tree structure   • Session index/cache  │
+│  • Per-project dirs    • Optional SQLite backend                │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -783,7 +785,7 @@ Pi is honest about what it doesn't do:
 
 | Limitation | Workaround |
 |------------|------------|
-| **Not all legacy providers** | Anthropic/OpenAI/Gemini/Azure supported; others TBD |
+| **Not all provider APIs** | Built-in support includes Anthropic, OpenAI (Chat + Responses), Gemini, Cohere, and Azure OpenAI; some ecosystem-specific APIs are still TBD |
 | **No web browsing** | Use bash with curl |
 | **No GUI** | Terminal-only by design |
 | **Some extensions need npm stubs** | 5 npm packages not yet shimmed; see EXTENSIONS.md §8.1 |
@@ -931,8 +933,8 @@ A: This is an authorized Rust port of [Pi Agent](https://github.com/badlogic/pi)
 **Q: Why rewrite in Rust?**
 A: Startup time matters when you're in a terminal all day. Rust gives us <100ms startup vs 500ms+ for Node.js. Plus, no runtime dependencies to manage.
 
-**Q: Can I use OpenAI/Gemini models?**
-A: Yes. Set `OPENAI_API_KEY` or `GOOGLE_API_KEY` and use `--provider`/`--model` (e.g. `--provider openai --model gpt-4o`).
+**Q: Can I use OpenAI/Gemini/Cohere/Azure models?**
+A: Yes. Configure the relevant provider key (`OPENAI_API_KEY`, `GOOGLE_API_KEY`, `COHERE_API_KEY`, or `AZURE_OPENAI_API_KEY`) and select with `--provider`/`--model` (for example `--provider openai --model gpt-4o`).
 
 **Q: How do sessions work?**
 A: Each session is a JSONL file with message entries. Sessions are per-project (based on working directory) and support branching via parent references.
@@ -1037,9 +1039,22 @@ src/
 ├── error.rs         # Error types
 ├── model.rs         # Message types
 ├── provider.rs      # Provider trait
+├── models.rs        # Model registry + models.json overrides
 ├── providers/
-│   └── anthropic.rs # Anthropic implementation
-├── session.rs       # Session persistence
+│   ├── anthropic.rs
+│   ├── openai.rs
+│   ├── openai_responses.rs
+│   ├── gemini.rs
+│   ├── cohere.rs
+│   ├── azure.rs
+│   └── mod.rs       # Provider factory + extension bridge
+├── extensions.rs    # Extension protocol + capability policy
+├── extensions_js.rs # QuickJS runtime bridge
+├── interactive.rs   # Interactive TUI app loop/state
+├── rpc.rs           # RPC/stdio mode
+├── resources.rs     # Skills/prompt/theme/extension loading
+├── session.rs       # Session persistence (JSONL/tree)
+├── session_index.rs # Session metadata index/cache
 ├── sse.rs           # SSE parser
 ├── tools.rs         # Built-in tools
 └── tui.rs           # Terminal UI rendering helpers
