@@ -191,3 +191,7 @@ module_name_repetitions = "allow"
 # charmed-harmonica = { path = "../charmed_rust/crates/harmonica" }
 # sqlmodel-core = { path = "../sqlmodel_rust/crates/sqlmodel-core" }
 # sqlmodel-sqlite = { path = "../sqlmodel_rust/crates/sqlmodel-sqlite" }
+
+# Temporary: use git asupersync for macOS/Windows cross-platform fixes until 0.1.1 is published.
+[patch.crates-io]
+asupersync = { git = "https://github.com/Dicklesworthstone/asupersync.git", rev = "673cf66" }
