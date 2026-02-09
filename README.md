@@ -981,6 +981,10 @@ cargo clippy         # Lint check
 ./scripts/e2e/run_all.sh --profile ci
 ./scripts/e2e/run_all.sh --rerun-from tests/e2e_results/<timestamp>/summary.json --skip-unit
 
+# Multi-agent safety: with CODEX_THREAD_ID set, run_all defaults
+# CARGO_TARGET_DIR to target/agents/<CODEX_THREAD_ID> unless overridden.
+# Set CARGO_TARGET_DIR explicitly if you want a custom shared or isolated target.
+
 # All tests
 cargo test
 
