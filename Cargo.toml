@@ -134,6 +134,10 @@ harness = false
 name = "system"
 harness = false
 
+[[bench]]
+name = "tui_perf"
+harness = false
+
 [features]
 default = ["image-resize", "clipboard"]
 image-resize = ["image"]
