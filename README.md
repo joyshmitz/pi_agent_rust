@@ -533,11 +533,12 @@ When multiple resources share the same name, the first occurrence wins. Collisio
 ┌────────▼────────┐  ┌─────────▼──────────┐  ┌───────▼──────────┐
 │ Provider Layer  │  │  Tool Registry     │  │  Extension Mgr   │
 │ • Anthropic     │  │  • read  • bash    │  │  • QuickJS RT    │
-│ • OpenAI        │  │  • write • grep    │  │  • Capability    │
-│ • OpenAI Resp.  │  │  • edit  • find    │  │    policy        │
-│ • Gemini        │  │  • ls              │  │  • Node shims    │
-│ • Cohere/Azure  │  │  • ext-registered  │  │  • Event hooks   │
-│ • Extensions    │  │                    │  │                  │
+│ • OpenAI (Chat/ │  │  • write • grep    │  │  • Capability    │
+│   Responses)    │  │  • edit  • find    │  │    policy        │
+│ • Gemini/Cohere │  │  • ls              │  │  • Node shims    │
+│ • Azure/Bedrock │  │  • ext-registered  │  │  • Event hooks   │
+│ • Vertex/Copilot│  │                    │  │  • Runtime risk  │
+│ • GitLab/Ext    │  │                    │  │    controller    │
 └────────┬────────┘  └─────────┬──────────┘  └───────┬──────────┘
          │                     │                      │
 ┌────────▼─────────────────────▼──────────────────────▼──────────┐
@@ -546,6 +547,8 @@ When multiple resources share the same name, the first occurrence wins. Collisio
 │  • Per-project dirs    • Optional SQLite backend                │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+Current native providers in `src/providers/` are `anthropic`, `openai`, `openai_responses`, `gemini`, `cohere`, `azure`, `bedrock`, `vertex`, `copilot`, and `gitlab`, with extension-provided `streamSimple` providers routed through the same agent loop.
 
 ### Key Design Decisions
 
@@ -1405,7 +1408,7 @@ Pi is honest about what it doesn't do:
 
 | Limitation | Workaround |
 |------------|------------|
-| **Not all provider APIs** | Built-in support includes Anthropic, OpenAI (Chat + Responses), Gemini, Cohere, and Azure OpenAI; some ecosystem-specific APIs are still TBD |
+| **Not all provider APIs** | Built-in support includes Anthropic, OpenAI (Chat + Responses), Gemini, Cohere, Azure OpenAI, Bedrock, Vertex AI, GitHub Copilot, and GitLab Duo; some ecosystem-specific APIs are still TBD |
 | **No web browsing** | Use bash with curl |
 | **No GUI** | Terminal-only by design |
 | **Some extensions need npm stubs** | 5 npm packages not yet shimmed; see EXTENSIONS.md §8.1 |
@@ -1553,8 +1556,8 @@ A: This is an authorized Rust port of [Pi Agent](https://github.com/badlogic/pi)
 **Q: Why rewrite in Rust?**
 A: Startup time matters when you're in a terminal all day. Rust gives us <100ms startup vs 500ms+ for Node.js. Plus, no runtime dependencies to manage.
 
-**Q: Can I use OpenAI/Gemini/Cohere/Azure models?**
-A: Yes. Configure the relevant provider key (`OPENAI_API_KEY`, `GOOGLE_API_KEY`, `COHERE_API_KEY`, or `AZURE_OPENAI_API_KEY`) and select with `--provider`/`--model` (for example `--provider openai --model gpt-4o`).
+**Q: Can I use providers beyond Anthropic (OpenAI/Gemini/Cohere/Azure/Bedrock/Vertex/Copilot/GitLab)?**
+A: Yes. Native providers include OpenAI (Chat + Responses), Gemini, Cohere, Azure OpenAI, Amazon Bedrock, Vertex AI, GitHub Copilot, and GitLab Duo. Set the provider-specific credentials (for example `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `COHERE_API_KEY`, `AZURE_OPENAI_API_KEY`, AWS credentials for Bedrock, `GITHUB_COPILOT_API_KEY`/`GITHUB_TOKEN`, or `GITLAB_TOKEN`/`GITLAB_API_KEY`) and select via `--provider`/`--model`.
 
 **Q: How do sessions work?**
 A: Each session is a JSONL file with message entries. Sessions are per-project (based on working directory) and support branching via parent references.
@@ -1592,7 +1595,7 @@ A: Yes. Point any provider at a custom base URL via `models.json` or `--base-url
 | **Language** | Rust | TypeScript | Python | Electron |
 | **Startup** | <100ms | ~1s | ~2s | ~5s |
 | **Memory** | <50MB | ~200MB | ~150MB | ~500MB |
-| **Providers** | Anthropic | Anthropic | Many | Many |
+| **Providers** | Anthropic + OpenAI/Responses + Gemini/Cohere + Azure/Bedrock/Vertex + Copilot/GitLab | Anthropic | Many | Many |
 | **Tools** | 7 built-in | Many | File-focused | IDE-integrated |
 | **Sessions** | JSONL tree | Proprietary | Git-based | Proprietary |
 | **Open source** | Yes | Yes | Yes | No |
@@ -1664,35 +1667,54 @@ cargo llvm-cov --all-targets --workspace --html
 
 ### Project Structure
 
+Selected core modules (non-exhaustive):
+
 ```
 src/
-├── main.rs          # CLI entry point
-├── lib.rs           # Library exports
-├── agent.rs         # Agent loop
-├── cli.rs           # Argument parsing
-├── config.rs        # Configuration
-├── error.rs         # Error types
-├── model.rs         # Message types
-├── provider.rs      # Provider trait
-├── models.rs        # Model registry + models.json overrides
+├── main.rs                # CLI entry point
+├── lib.rs                 # Library exports
+├── app.rs                 # Startup/model selection helpers
+├── agent.rs               # Agent loop + event orchestration
+├── agent_cx.rs            # asupersync capability context wiring
+├── cli.rs                 # Argument parsing
+├── config.rs              # Configuration
+├── auth.rs                # API key/OAuth/AWS credential storage
+├── model.rs               # Message/content/stream event types
+├── provider.rs            # Provider trait
+├── provider_metadata.rs   # Canonical provider IDs + routing defaults
+├── models.rs              # Model registry + models.json overrides
 ├── providers/
-│   ├── anthropic.rs
-│   ├── openai.rs
-│   ├── openai_responses.rs
-│   ├── gemini.rs
-│   ├── cohere.rs
-│   ├── azure.rs
-│   └── mod.rs       # Provider factory + extension bridge
-├── extensions.rs    # Extension protocol + capability policy
-├── extensions_js.rs # QuickJS runtime bridge
-├── interactive.rs   # Interactive TUI app loop/state
-├── rpc.rs           # RPC/stdio mode
-├── resources.rs     # Skills/prompt/theme/extension loading
-├── session.rs       # Session persistence (JSONL/tree)
-├── session_index.rs # Session metadata index/cache
-├── sse.rs           # SSE parser
-├── tools.rs         # Built-in tools
-└── tui.rs           # Terminal UI rendering helpers
+│   ├── anthropic.rs        # Anthropic Messages API
+│   ├── openai.rs           # OpenAI Chat Completions
+│   ├── openai_responses.rs # OpenAI Responses API
+│   ├── gemini.rs           # Gemini API
+│   ├── cohere.rs           # Cohere Chat API
+│   ├── azure.rs            # Azure OpenAI
+│   ├── bedrock.rs          # Amazon Bedrock Converse
+│   ├── vertex.rs           # Google Vertex AI
+│   ├── copilot.rs          # GitHub Copilot backend
+│   ├── gitlab.rs           # GitLab Duo backend
+│   └── mod.rs              # Provider factory + extension bridge
+├── tools.rs                # Built-in tool implementations
+├── sse.rs                  # Streaming SSE parser
+├── http/
+│   ├── client.rs           # asupersync-backed HTTP client
+│   ├── sse.rs              # HTTP SSE helpers
+│   └── mod.rs
+├── session.rs              # JSONL session persistence/tree ops
+├── session_index.rs        # SQLite session metadata index/cache
+├── session_sqlite.rs       # Optional sqlite-sessions backend
+├── compaction.rs           # Context compaction algorithm
+├── interactive.rs          # Interactive TUI app loop/state
+├── interactive/            # Bubble Tea-style TUI submodules
+├── rpc.rs                  # RPC/stdio mode
+├── extensions.rs           # Extension protocol + policy + security
+├── extensions_js.rs        # QuickJS runtime bridge + hostcalls
+├── extension_dispatcher.rs # Hostcall/tool dispatch plumbing
+├── extension_preflight.rs  # Extension compatibility scanner
+├── extension_validation.rs # Extension validation pipeline glue
+├── resources.rs            # Skills/prompt/theme/extension loading
+└── tui.rs                  # Terminal UI rendering helpers
 ```
 
 ---
