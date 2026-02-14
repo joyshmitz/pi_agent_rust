@@ -319,6 +319,7 @@ cargo run --bin ext_full_validation --
   - Provider compatibility cells: `750/750` pass (`100.0%`) after self-contained extension artifact fixes.
   - Scenario suite: `25/25` pass
   - Auto-repair sweep: `220` clean pass, `2` repaired pass (`monorepo_escape`), `1` still failing (`community/nicobailon-interview-tool`, missing `form/index.html` asset).
+  - Reality check: provider compatibility is fully green, but the full extension pipeline is not yet 100% green.
 
 ---
 
