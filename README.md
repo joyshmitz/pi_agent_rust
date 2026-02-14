@@ -103,11 +103,13 @@ The terminal UI uses rich_rust for all output formatting, providing the same vis
 ### 1. Install
 
 ```bash
-# From source (requires Rust nightly)
-git clone https://github.com/Dicklesworthstone/pi_agent_rust.git
-cd pi_agent_rust
-cargo install --path .
+# Install latest release binary
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash
 ```
+
+If you already have the original TypeScript `pi` installed, the installer asks
+whether to make Rust Pi canonical as `pi` and automatically create `legacy-pi`
+for the old command.
 
 ### 2. Configure API Key
 
@@ -195,6 +197,31 @@ Thinking levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`
 - **Prompt templates**: Markdown files under `~/.pi/agent/prompts/` or `.pi/prompts/`; invoke via `/<template> [args]`.
 - **Packages**: Share bundles with `pi install npm:@org/pi-packages` (skills, prompts, themes, extensions).
 
+### Autocomplete
+
+Pi provides context-aware autocomplete in the interactive editor:
+
+- **`@` file references**: Type `@` followed by a path fragment to attach file contents. The completion engine indexes project files (respecting `.gitignore`) via the `ignore` crate's `WalkBuilder`, capping at 5,000 entries.
+- **`/` slash commands**: Built-in commands (`/help`, `/model`, `/tree`, `/clear`, `/compact`, `/exit`) and user-defined prompt templates and skills all appear as completions.
+- **Fuzzy scoring**: Prefix matches rank above substring matches. Results are sorted by match quality, then by kind (commands > templates > skills > files > paths).
+- **Background refresh**: A background thread re-indexes the project file tree every 30 seconds, so completions stay current without blocking the input loop.
+
+### Three Execution Modes
+
+Pi runs in three modes, each suited to different workflows:
+
+| Mode | Invocation | Use Case |
+|------|-----------|----------|
+| **Interactive** | `pi` (default) | Full TUI with streaming, tools, session branching, autocomplete |
+| **Print** | `pi -p "..."` | Single response to stdout, no TUI, scriptable |
+| **RPC** | `pi --mode rpc` | Headless JSON protocol over stdin/stdout for IDE integrations |
+
+**Interactive mode** provides the full experience: a multi-line text editor with history, scrollable conversation viewport, model selector (`Ctrl+P`), session branch navigator (`/tree`), and real-time token/cost tracking.
+
+**Print mode** sends one message, streams the response to stdout, and exits. Useful for shell scripts and one-off queries.
+
+**RPC mode** exposes a line-delimited JSON protocol for programmatic control. Clients send commands (`prompt`, `steer`, `follow-up`, `abort`, `get-state`, `compact`) and receive streaming events. This is how IDE extensions and custom frontends integrate with Pi. See [RPC Protocol](#rpc-protocol) for the wire format.
+
 ### Extensions
 
 Pi runs legacy JS/TS extensions **without Node or Bun**, using an embedded
@@ -215,7 +242,26 @@ and [docs/extension-catalog.json](docs/extension-catalog.json) for the
 
 ## Installation
 
-### From Source (Recommended)
+### Curl Installer (Recommended)
+
+```bash
+# Latest release
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash
+
+# Non-interactive + auto PATH update
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash -s -- --yes --easy-mode
+
+# Pin a release tag
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash -s -- --version v0.1.0
+```
+
+The installer is idempotent and supports a migration path from TypeScript Pi:
+- Detect existing TS `pi` command
+- Prompt to install Rust Pi as canonical `pi`
+- Preserve old CLI behind `legacy-pi`
+- Record state for clean uninstall/restore
+
+### From Source
 
 Requires Rust nightly (2024 edition features):
 
@@ -238,6 +284,15 @@ cargo build --release
 Pi has minimal runtime dependencies:
 - `fd`: Required for the `find` tool (install via `apt install fd-find` or `brew install fd`)
 - `rg`: Optional, improves grep performance (install via `apt install ripgrep` or `brew install ripgrep`)
+
+### Uninstall
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/uninstall.sh" | bash
+```
+
+By default, uninstall removes installer-managed Rust binaries/aliases and
+restores a migrated TypeScript `pi` if one was preserved.
 
 ---
 
@@ -325,6 +380,31 @@ Pi reads configuration from `~/.pi/agent/settings.json`:
   "shell_command_prefix": "set -e"
 }
 ```
+
+### Configuration Precedence
+
+Settings are resolved in priority order (first match wins):
+
+1. **CLI flags** (`--model`, `--thinking`, `--provider`, etc.)
+2. **Environment variables** (`ANTHROPIC_API_KEY`, `PI_CONFIG_PATH`, etc.)
+3. **Project settings** (`.pi/settings.json` in the working directory)
+4. **Global settings** (`~/.pi/agent/settings.json`)
+5. **Built-in defaults**
+
+This means a CLI flag always overrides a `settings.json` value, and a project-level setting overrides the global one.
+
+### Resource Resolution
+
+Skills, prompt templates, themes, and extensions follow the same resolution order:
+
+1. CLI-specified paths (`--skill`, `--prompt-template`, `--theme`, `-e`)
+2. Project directory (`.pi/skills/`, `.pi/prompts/`, `.pi/themes/`, `.pi/extensions/`)
+3. Global directory (`~/.pi/agent/skills/`, `~/.pi/agent/prompts/`, etc.)
+4. Installed packages (`~/.pi/agent/packages/`)
+
+When multiple resources share the same name, the first occurrence wins. Collisions are logged as diagnostics.
+
+**Prompt template expansion** supports positional arguments: `$1`, `$2`, `$@` (all args), and slice syntax `${@:start}`, `${@:start:length}`. For example, a template invoked as `/review src/main.rs --strict` receives `src/main.rs` as `$1` and `--strict` as `$2`.
 
 ### Environment Variables
 
@@ -567,6 +647,330 @@ pub struct StreamOptions {
 
 This design allows adding new providers (OpenAI, Gemini) without modifying the agent loop. Each provider translates the common types to its wire format and emits a unified `StreamEvent` stream.
 
+### Compaction Algorithm
+
+Long conversations eventually exceed the model's context window. Pi's compaction algorithm reclaims space by summarizing older messages while preserving recent context.
+
+The algorithm runs automatically after each agent turn when estimated token usage exceeds `context_window - reserve_tokens`:
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                     Full Conversation                         │
+│  msg1 → msg2 → msg3 → ... → msgN-5 → msgN-4 → ... → msgN   │
+│  ├──── older messages ─────┤ ├─── recent messages ──────────┤ │
+│                                                              │
+│  Step 1: Find cut point at a valid turn boundary             │
+│  Step 2: LLM summarizes msgs 1..N-5 into compact paragraph  │
+│  Step 3: Store Compaction entry in session JSONL             │
+│  Step 4: Next agent call uses [summary] + msgs N-4..N       │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Token estimation** uses a conservative `chars ÷ 4` heuristic for text and a flat 1,200 tokens per image. When an assistant message includes a `usage` field from the API, that measured value takes precedence over the heuristic.
+
+**Cut point selection** prefers boundaries between complete user-assistant turns. If the budget forces a mid-turn cut, the algorithm includes prefix messages from the split turn so the model retains context about what was being discussed at the boundary.
+
+**File operation tracking** extracts `read`, `write`, and `edit` tool calls from the messages being summarized. The compaction prompt includes these paths so the summary preserves awareness of which files were examined or modified:
+
+```
+<read-files>
+src/main.rs
+src/config.rs
+</read-files>
+
+<modified-files>
+src/auth.rs
+</modified-files>
+```
+
+**Configurable parameters:**
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `reserve_tokens` | 8% of context window | Safety margin for response generation |
+| `keep_recent_tokens` | 10% of context window | Minimum recent context preserved |
+
+Compaction can also be triggered manually with `/compact` in interactive mode or the `compact` RPC command.
+
+### Multi-Provider Routing & Model Registry
+
+Pi routes model requests through a provider factory that resolves the correct backend implementation from a `(provider, model, api)` tuple.
+
+**Resolution flow:**
+
+```
+User specifies --provider openai --model gpt-4o
+               │
+               ▼
+  ┌──────────────────────────┐
+  │  Provider Metadata Table  │  Maps "openai" → canonical ID,
+  │                           │  determines API type (Completions
+  │                           │  vs Responses vs custom)
+  └────────────┬──────────────┘
+               │
+  ┌────────────▼──────────────┐
+  │  URL Normalization         │  Appends /chat/completions,
+  │                            │  /responses, or /chat depending
+  │                            │  on detected API type
+  └────────────┬──────────────┘
+               │
+  ┌────────────▼──────────────┐
+  │  Compat Config             │  Applies per-model overrides:
+  │                            │  system_role_name, max_tokens
+  │                            │  field name, feature flags
+  └────────────┬──────────────┘
+               │
+  ┌────────────▼──────────────┐
+  │  Provider Instance         │  Anthropic | OpenAI | Gemini
+  │                            │  Cohere | Azure | Bedrock | ...
+  └───────────────────────────┘
+```
+
+**`models.json` overrides**: Users can define custom providers in `~/.pi/agent/models.json` or `.pi/models.json`. Each entry specifies a model ID, base URL, API type, and optional compat flags, letting you route to self-hosted models, proxies, or providers that Pi does not natively support.
+
+**Compat config** handles the differences between OpenAI-compatible APIs:
+
+| Override | Example | Purpose |
+|----------|---------|---------|
+| `system_role_name` | `"developer"` | o1 models use "developer" instead of "system" |
+| `max_tokens_field` | `"max_completion_tokens"` | Some models require a different field name |
+| `supports_tools` | `false` | Suppress tool definitions for models that reject them |
+| `supports_streaming` | `false` | Fall back to non-streaming for incompatible endpoints |
+| `custom_headers` | `{"X-Custom": "val"}` | Per-provider header injection |
+
+**Fuzzy matching**: When a provider name doesn't match any known provider, Pi computes edit distance against all registered names and suggests the closest match in the error message.
+
+### Extension Hostcall Protocol
+
+Extensions run in an embedded QuickJS runtime (`rquickjs` crate) and communicate with Pi through a structured hostcall protocol. This is the mechanism that lets JavaScript code invoke Pi's built-in tools, make HTTP requests, and interact with the session, all without direct OS access.
+
+**Execution model:**
+
+```
+┌─────────────────── QuickJS VM ───────────────────┐
+│                                                   │
+│  extension.js calls:                              │
+│    pi.tool("read", {path: "src/main.rs"})         │
+│      │                                            │
+│      ▼                                            │
+│    enqueue HostcallRequest {                      │
+│      call_id: "hc-0042",                          │
+│      kind: Tool { name: "read" },                 │
+│      payload: { path: "src/main.rs" },            │
+│    }                                              │
+│      │                                            │
+│      ▼                                            │
+│    return Promise (resolve/reject stored in map)  │
+│                                                   │
+└────────────────────────┬──────────────────────────┘
+                         │
+    drain_hostcall_requests()
+                         │
+                         ▼
+┌─────────────── ExtensionDispatcher ──────────────┐
+│                                                   │
+│  1. Check capability policy:                      │
+│     read tool → requires "read" capability        │
+│     → Policy says: Allow / Deny / Prompt          │
+│                                                   │
+│  2. If allowed → dispatch to ToolRegistry         │
+│     → Execute read tool                           │
+│     → Get ToolOutput                              │
+│                                                   │
+│  3. complete_hostcall("hc-0042", Ok(result))      │
+│     → Resolves the Promise in QuickJS             │
+│                                                   │
+│  4. runtime.tick()                                │
+│     → Drains Promise .then() chains               │
+│     → Extension JS continues execution            │
+│                                                   │
+└───────────────────────────────────────────────────┘
+```
+
+**Capability mapping**: Each hostcall kind maps to a required capability:
+
+| Hostcall | Required Capability | Dangerous? |
+|----------|-------------------|------------|
+| `pi.tool("read", ...)` | `read` | No |
+| `pi.tool("write", ...)` | `write` | No |
+| `pi.tool("bash", ...)` | `exec` | Yes |
+| `pi.http(request)` | `http` | No |
+| `pi.exec(cmd, args)` | `exec` | Yes |
+| `pi.env(key)` | `env` | Yes |
+| `pi.session(op, ...)` | `session` | No |
+| `pi.ui(op, ...)` | `ui` | No |
+| `pi.log(entry)` | `log` | No (always allowed) |
+
+**Deduplication**: Each hostcall's parameters are canonicalized (object keys sorted, structure normalized) and SHA-256 hashed. Identical requests within a short window can be deduplicated to avoid redundant tool executions.
+
+**Auto-repair pipeline**: When an extension fails to load or produces runtime errors, Pi's repair system can automatically fix common issues:
+
+| Repair Mode | Behavior |
+|-------------|----------|
+| `Off` | No repairs |
+| `Suggest` | Log suggestions, don't apply |
+| `AutoSafe` (default) | Apply provably safe fixes (missing file paths, asset references) |
+| `AutoStrict` | Apply aggressive heuristic fixes (pattern-based transforms) |
+
+**Compatibility scanner**: Before loading, Pi statically analyzes extension source code for imports, `require()` calls, and forbidden patterns (`eval`, `Function()`, `process.binding`, `dlopen`). The scan produces a capability evidence ledger that informs policy decisions.
+
+**Environment variable filtering**: Extensions calling `pi.env()` hit a blocklist that denies access to API keys, credentials, tokens, and private keys. The filter blocks exact matches (`ANTHROPIC_API_KEY`, `AWS_SECRET_ACCESS_KEY`), suffix patterns (`*_API_KEY`, `*_SECRET`, `*_TOKEN`), and prefix patterns (`AWS_SECRET_*`, `AWS_SESSION_*`). Only `PI_*` variables are unconditionally allowed.
+
+### Interactive TUI Architecture
+
+The interactive mode uses the **Elm Architecture** (Model-Update-View) via the `charmed_rust` library family, which is a Rust port of Go's [Bubble Tea](https://github.com/charmbracelet/bubbletea) framework.
+
+**Component stack:**
+
+```
+┌────────────────────────────────────────────────────┐
+│                 Terminal (crossterm)                │
+│  Raw mode │ Alt screen │ Keyboard/Mouse events      │
+└──────────────────────┬─────────────────────────────┘
+                       │
+┌──────────────────────▼─────────────────────────────┐
+│             bubbletea Program Loop                  │
+│  Init() → Update(Msg) → View() → render cycle      │
+└──────────────────────┬─────────────────────────────┘
+                       │
+┌──────────────────────▼─────────────────────────────┐
+│                  PiApp (Model)                      │
+│                                                     │
+│  ┌─────────────┐ ┌──────────────┐ ┌─────────────┐  │
+│  │  TextArea    │ │  Viewport    │ │  Spinner     │  │
+│  │  (editor)    │ │  (convo)     │ │  (status)    │  │
+│  └─────────────┘ └──────────────┘ └─────────────┘  │
+│                                                     │
+│  ┌─────────────────────────────────────────────┐    │
+│  │           Overlay Stack                      │    │
+│  │  Model Selector │ Session Picker │ /tree     │    │
+│  │  Settings UI    │ Theme Picker   │ Branches  │    │
+│  │  Capability Prompt (extension UI)            │    │
+│  └─────────────────────────────────────────────┘    │
+└──────────────────────┬─────────────────────────────┘
+                       │
+              async channels (mpsc)
+                       │
+┌──────────────────────▼─────────────────────────────┐
+│             Agent Async Task                        │
+│  Runs on asupersync runtime                         │
+│  Streams provider responses                         │
+│  Executes tools                                     │
+│  Sends PiMsg events back to TUI thread              │
+└────────────────────────────────────────────────────┘
+```
+
+**The async/sync bridge**: The agent runs on the `asupersync` async runtime in a separate thread. It communicates with the bubbletea UI thread through `mpsc` channels. Each streaming event (text delta, tool start, tool update, agent done) becomes a `PiMsg` variant delivered to `PiApp::update()`, keeping the UI responsive during API streaming and tool execution.
+
+**Viewport scrolling**: The conversation viewport tracks whether the user is at the bottom. When new content arrives and the user hasn't scrolled up, the viewport auto-follows the stream tail. Scrolling up disables auto-follow; pressing `End` or typing a new message re-enables it.
+
+**Overlay system**: Modal UIs (model selector, session picker, branch navigator, extension capability prompts) stack on top of the main conversation view. Each overlay captures keyboard input until dismissed. Only the topmost active overlay receives events.
+
+**Slash commands** available in the interactive editor:
+
+| Command | Action |
+|---------|--------|
+| `/help` | Show available commands and keybindings |
+| `/model` or `Ctrl+P` | Open model selector with fuzzy search |
+| `/tree` | Browse and fork the conversation tree |
+| `/clear` | Clear conversation and start fresh |
+| `/compact` | Trigger manual compaction |
+| `/thinking <level>` | Change thinking level mid-conversation |
+| `/share` | Export session to GitHub Gist |
+| `/exit` or `Ctrl+C` | Exit Pi |
+
+### RPC Protocol
+
+The RPC mode (`pi --mode rpc`) exposes a line-delimited JSON protocol over stdin/stdout for programmatic integration. Each line is a self-contained JSON object.
+
+**Client → Pi (stdin):**
+
+```json
+{"type": "prompt", "message": "Explain this function", "id": "req-001"}
+{"type": "steer", "message": "Focus on error handling"}
+{"type": "follow-up", "message": "Now add tests"}
+{"type": "abort"}
+{"type": "get-state"}
+{"type": "compact", "reserve": 8192, "keepRecent": 20000}
+```
+
+**Pi → Client (stdout):**
+
+```json
+{"type": "event", "event": "agent_start", "data": {"session_id": "..."}}
+{"type": "event", "event": "text_delta", "data": {"text": "The function"}}
+{"type": "event", "event": "tool_start", "data": {"tool": "read", "input": {}}}
+{"type": "event", "event": "tool_end", "data": {"tool": "read", "output": {}}}
+{"type": "event", "event": "agent_done", "data": {"usage": {}}}
+{"type": "response", "id": "req-001", "data": {"status": "ok"}}
+```
+
+**I/O architecture**: Two dedicated threads handle stdin reading and stdout writing, bridged to the async agent runtime via channels. The stdin thread retries on transient errors to prevent dropped input. The stdout thread flushes after every line to prevent buffering delays.
+
+**Message queuing**: While the agent is streaming a response, incoming messages are routed to one of two queues:
+
+| Queue | Behavior | Use Case |
+|-------|----------|----------|
+| **Steering** | Interrupts current response; processed on next turn | Course corrections |
+| **Follow-up** | Queued until current response completes | Sequential instructions |
+
+Queue modes (`All` or `OneAtATime`) control whether multiple queued messages are batched into a single turn or processed individually.
+
+**Extension UI over RPC**: When an extension requests user input (capability prompt, selection dialog), Pi emits an `extensionUiRequest` event. The client renders the prompt in its own UI and responds with an `extensionUiResponse` message. IDE extensions can then present native UI for capability decisions instead of falling back to terminal prompts.
+
+### Session Indexing
+
+Session resume (`pi -c` or `pi -r`) needs to find the most recent session for the current project without scanning every JSONL file on disk. Pi maintains a SQLite index (`session-index.sqlite`) that provides constant-time lookups.
+
+**Schema:**
+
+```sql
+CREATE TABLE sessions (
+    path            TEXT PRIMARY KEY,
+    id              TEXT NOT NULL,
+    cwd             TEXT NOT NULL,
+    timestamp       TEXT NOT NULL,
+    message_count   INTEGER NOT NULL,
+    last_modified   INTEGER NOT NULL,
+    size_bytes      INTEGER NOT NULL,
+    name            TEXT
+);
+```
+
+**Update lifecycle:**
+
+1. After saving a session JSONL file, Pi upserts its metadata into the index
+2. `pi -c` queries `WHERE cwd = ? ORDER BY last_modified DESC LIMIT 1`
+3. `pi -r` queries the same table and presents a picker sorted by recency
+
+**Concurrency**: A file-based lock (`session-index.lock`) serializes writes from concurrent Pi instances. Reads use WAL mode for non-blocking access.
+
+**Staleness-based reindexing**: If the index is older than a configurable threshold, Pi runs a full re-scan of the sessions directory to catch files created by other instances or manual edits. The re-scan keeps the index accurate without a centralized daemon.
+
+### Authentication & Credential Management
+
+Beyond simple API keys, Pi supports OAuth, AWS credential chains, and service key exchange. Credentials are stored in `~/.pi/agent/auth.json` with file-locked access to prevent corruption from concurrent instances.
+
+| Mechanism | Providers | Details |
+|-----------|-----------|---------|
+| **API Key** | Anthropic, OpenAI, Gemini, Cohere, 12+ others | Static key via env var or settings |
+| **OAuth** | Anthropic (console), GitHub Copilot, GitLab | Browser-based flow with automatic token refresh |
+| **AWS Credentials** | Bedrock | Access key + secret + optional session token; region-aware |
+| **Service Key** | SAP AI Core | Client ID/secret exchange for bearer token |
+| **Bearer Token** | Custom providers | Static token in auth storage |
+
+**OAuth token lifecycle:**
+
+1. User runs `pi` with an OAuth-configured provider
+2. Pi checks `auth.json` for an existing token
+3. If missing: opens browser to authorization URL, user authenticates, Pi receives authorization code, exchanges it for access + refresh tokens, stores both with expiry timestamp
+4. If expired but refresh token valid: exchanges refresh token for new access token, updates `auth.json`
+5. Bearer token attached to API requests
+
+**Credential status reporting**: `pi config` shows the status of each configured provider's credentials: `Missing`, `ApiKey`, `OAuthValid` (with time until expiry), `OAuthExpired` (with time since expiry), `AwsCredentials`, or `BearerToken`.
+
+**Diagnostic codes**: Auth failures produce specific diagnostic codes (`MissingApiKey`, `InvalidApiKey`, `QuotaExceeded`, `OAuthTokenRefreshFailed`, `MissingAzureDeployment`, `MissingRegion`, etc.) with context-specific error hints rather than generic messages.
+
 ---
 
 ## Tool Details
@@ -714,6 +1118,26 @@ API Server → TCP → SSE Parser → Event Handler → Terminal
 
 Each token appears on screen within milliseconds of leaving Anthropic's servers. The SSE parser processes events as they arrive rather than waiting for complete responses.
 
+### TUI Rendering Performance
+
+The interactive TUI targets 60fps rendering with several optimization layers:
+
+**Frame timing telemetry**: Every render cycle is instrumented. Slow frames (>16ms) are tracked and classifiable by phase: viewport sync, message encoding, markdown rendering. This data feeds the internal performance monitor.
+
+**Message render cache**: Markdown-to-ANSI conversion involves syntax highlighting, table layout, and link detection. Pi caches the rendered output per message and invalidates only on theme change or terminal resize. During streaming, only the actively-changing message is re-rendered; all prior messages hit the cache.
+
+**Pre-allocated render buffers**: The `RenderBuffers` struct is reused across render cycles. Rather than allocating new `String` buffers each frame, Pi writes into pre-sized buffers and clears them before reuse, eliminating thousands of small allocations per second during streaming.
+
+**Memory pressure monitoring**: A `MemoryMonitor` samples process heap size and classifies it into three tiers:
+
+| Tier | Threshold | Action |
+|------|-----------|--------|
+| **Normal** | <80% of budget | No action |
+| **Pressure** | 80-95% of budget | Collapse tool output displays, hide thinking blocks |
+| **Critical** | >95% of budget | Truncate older messages, force compaction |
+
+Progressive degradation keeps Pi responsive during long sessions with accumulated tool output.
+
 ---
 
 ## Troubleshooting
@@ -840,7 +1264,7 @@ Each fixture specifies:
 - **Input**: Tool parameters
 - **Expected**: Output content patterns, exact field matches, or error conditions
 
-This allows validating that the Rust implementation produces equivalent results to the TypeScript original without coupling to implementation details.
+The Rust implementation can be validated against the TypeScript original without coupling to implementation details.
 
 ### Extension System
 
@@ -947,6 +1371,21 @@ A: Pi has a full extension system. Drop a `.ts` or `.js` extension file into you
 
 **Q: Why isn't X feature included?**
 A: Pi focuses on core coding assistance. Features like web browsing, image generation, etc. are out of scope. Use specialized tools for those.
+
+**Q: How does compaction work?**
+A: When a conversation exceeds the model's context window, Pi summarizes older messages using the LLM itself, storing the summary as a session entry. Recent messages are kept verbatim. The cut point is chosen at a turn boundary, and the summary includes a record of which files were read or modified so the model retains that awareness. Compaction runs automatically after each agent turn when needed, or manually via `/compact`.
+
+**Q: Can I add a custom provider that Pi doesn't support natively?**
+A: Yes. Create a `models.json` file in `~/.pi/agent/` or `.pi/` with entries specifying the model ID, base URL, and API type (usually `openai-completions` for OpenAI-compatible endpoints). Pi's compat config system handles field name differences and feature flag overrides. Extensions can also register entirely custom providers.
+
+**Q: How does Pi decide which session to resume?**
+A: Pi maintains a SQLite index of all session files. When you run `pi -c`, it queries the index for the most recently modified session whose working directory matches your current project. This avoids scanning the filesystem on every resume.
+
+**Q: What happens if an extension tries to access something dangerous?**
+A: Every hostcall from an extension is checked against the active capability policy before execution. Dangerous capabilities (`exec`, `env`) are denied by default under the `safe` policy, require a user prompt under `balanced`, and are allowed under `permissive`. Denied calls return an error to the extension's Promise. Pi also blocks extensions from reading sensitive environment variables (API keys, credentials, tokens) regardless of policy.
+
+**Q: Does Pi work with self-hosted or proxied LLMs?**
+A: Yes. Point any provider at a custom base URL via `models.json` or `--base-url`. Pi normalizes the URL path per API type and applies compat config overrides for any field name or feature differences. This works with vLLM, Ollama, LiteLLM, and similar OpenAI-compatible servers.
 
 ---
 
