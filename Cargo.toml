@@ -112,6 +112,7 @@ image = { version = "0.25", optional = true }
 vergen-gix = { version = "1", features = ["build", "cargo", "rustc"] }
 
 [dev-dependencies]
+arbitrary = { version = "1", features = ["derive"] }
 pretty_assertions = "1"
 insta = { version = "1", features = ["filters"] }
 tempfile = "3"
@@ -145,6 +146,7 @@ clipboard = ["dep:clipboard", "dep:arboard"]
 wasm-host = ["dep:wasmtime"]
 sqlite-sessions = []
 ext-conformance = []
+fuzzing = []
 
 [profile.release]
 opt-level = "z"
