@@ -139,7 +139,7 @@ name = "tui_perf"
 harness = false
 
 [features]
-default = ["image-resize", "clipboard"]
+default = ["image-resize", "clipboard", "wasm-host"]
 image-resize = ["image"]
 clipboard = ["dep:clipboard", "dep:arboard"]
 wasm-host = ["dep:wasmtime"]
