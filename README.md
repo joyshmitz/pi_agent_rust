@@ -623,7 +623,7 @@ This is a second comparison pass focused on high-impact architectural deltas and
 | Area | Original pi-mono (`packages/coding-agent`) | `pi_agent_rust` | Why this divergence exists |
 |------|---------------------------------------------|------------------|----------------------------|
 | **Distribution model** | npm package (`npm install -g @mariozechner/pi-coding-agent`) | Single Rust binary (`pi`) | Remove Node runtime dependency and improve startup/deployment portability |
-| **Execution surfaces** | Interactive + print + JSON mode + RPC + SDK | Interactive + print + RPC (full event stream over RPC) | Focus hardening effort on primary terminal + RPC integration surfaces |
+| **Execution surfaces** | Interactive + print + JSON mode + RPC + SDK | Interactive + print + JSON mode + RPC (SDK parity tracked in `bd-c9usa`) | Strict drop-in parity is the target; JSON mode streams JSONL events identical to pi-mono, and SDK parity remains on the certification path |
 | **Default built-in tool posture** | Defaults to `read/write/edit/bash` (others available) | Seven built-ins treated as first-class (`read/write/edit/bash/grep/find/ls`) | Keep common code-navigation and shell workflows available without extra configuration |
 | **Extension trust model** | Extension/package model documented as full system access | Embedded runtime with capability-gated hostcalls and policy profiles | Reduce ambient authority and make extension behavior auditable/deny-by-default |
 | **Session architecture emphasis** | JSONL tree session model and branch navigation | JSONL v3 tree + explicit session index (SQLite sidecar) + optional SQLite session backend | Faster resume/lookups at scale and safer multi-instance coordination |
@@ -633,7 +633,7 @@ This is a second comparison pass focused on high-impact architectural deltas and
 
 Practical consequence of these deltas:
 - Extension/package workflows are compatible across both implementations.
-- For this CLI’s scope, this Rust implementation is stronger across reliability, lifecycle control, and bounded failure behavior.
+- The non-negotiable goal is strict drop-in replacement for pi-mono across all use cases; release language claiming complete replacement is gated by parity certification artifacts.
 
 ### Algorithmic Mechanics: pi-mono Baseline vs Rust Implementation
 
@@ -1838,10 +1838,21 @@ Each entry below includes the document name, purpose, bottom-line takeaway, and 
 - `docs/schema/extension_manifest.json` - Purpose: JSON schema for extension manifests. Bottom line: extension manifest validation must pass this schema. Link: [View](docs/schema/extension_manifest.json)
 - `docs/schema/extension_protocol.json` - Purpose: JSON schema for extension protocol messages. Bottom line: extension message contracts are formalized here. Link: [View](docs/schema/extension_protocol.json)
 - `docs/schema/mock_spec.json` - Purpose: schema for mock/test spec fixtures. Bottom line: mock fixtures should conform to this contract. Link: [View](docs/schema/mock_spec.json)
+- `docs/schema/runtime_hostcall_telemetry.json` - Purpose: JSON schema for runtime hostcall telemetry events. Bottom line: hostcall telemetry producers must conform to this schema. Link: [View](docs/schema/runtime_hostcall_telemetry.json)
+- `docs/sec_traceability_matrix.json` - Purpose: machine-readable security requirement traceability matrix. Bottom line: security coverage and test mappings are tracked here. Link: [View](docs/sec_traceability_matrix.json)
+- `docs/sec_traceability_matrix.md` - Purpose: narrative security traceability matrix with requirement-to-test linkage. Bottom line: human-readable security coverage status is documented here. Link: [View](docs/sec_traceability_matrix.md)
 - `docs/security/baseline-audit.md` - Purpose: code-grounded security baseline audit and gap analysis. Bottom line: this is the current security posture snapshot. Link: [View](docs/security/baseline-audit.md)
+- `docs/security/incident-response-runbook.md` - Purpose: incident response procedures for security events. Bottom line: follow this runbook during active security incidents. Link: [View](docs/security/incident-response-runbook.md)
+- `docs/security/incident-runbook.md` - Purpose: incident detection, classification, and handling guide. Bottom line: use this for initial incident triage and escalation. Link: [View](docs/security/incident-runbook.md)
 - `docs/security/invariants.machine.json` - Purpose: machine-checkable security invariant manifest with test mappings. Bottom line: invariant automation should read this file. Link: [View](docs/security/invariants.machine.json)
 - `docs/security/invariants.md` - Purpose: normative security invariants and precedence semantics. Bottom line: this is the SEC-1.2 policy/risk contract. Link: [View](docs/security/invariants.md)
+- `docs/security/lockfile-format.md` - Purpose: lockfile format specification for extension integrity verification. Bottom line: lockfile structure and validation rules are defined here. Link: [View](docs/security/lockfile-format.md)
+- `docs/security/maintenance-playbook.md` - Purpose: security maintenance procedures and scheduled operations. Bottom line: use this for routine security upkeep and policy refresh. Link: [View](docs/security/maintenance-playbook.md)
 - `docs/security/manifest-v2-migration.md` - Purpose: migration guidance from legacy extension manifests to manifest v2 security fields. Bottom line: use this to upgrade manifests without losing capability/policy intent. Link: [View](docs/security/manifest-v2-migration.md)
+- `docs/security/operator-handbook.md` - Purpose: comprehensive operator handbook for security operations. Bottom line: this is the primary security ops reference for day-to-day work. Link: [View](docs/security/operator-handbook.md)
+- `docs/security/operator-quick-reference.md` - Purpose: quick-reference card for security operators. Bottom line: use this cheat sheet for fast lookups during operations. Link: [View](docs/security/operator-quick-reference.md)
+- `docs/security/policy-tuning-guide.md` - Purpose: guide for tuning extension security policies and risk thresholds. Bottom line: policy calibration and adjustment procedures are here. Link: [View](docs/security/policy-tuning-guide.md)
+- `docs/security/runtime-hostcall-telemetry.md` - Purpose: runtime hostcall telemetry design and event catalog. Bottom line: hostcall observability and event semantics are documented here. Link: [View](docs/security/runtime-hostcall-telemetry.md)
 - `docs/security/security-slos.md` - Purpose: quantitative security SLOs, risk budgets, and release/rollback gates. Bottom line: security release readiness is numerically gated here. Link: [View](docs/security/security-slos.md)
 - `docs/security/threat-model.md` - Purpose: formal extension ecosystem threat model. Bottom line: this is the SEC-1.1 attacker and control baseline. Link: [View](docs/security/threat-model.md)
 - `docs/session.md` - Purpose: session model, persistence, and branching semantics. Bottom line: session behavior and storage contracts are here. Link: [View](docs/session.md)
