@@ -344,9 +344,11 @@ The installer is idempotent and supports a migration path from TypeScript Pi:
 - Preserve old CLI behind `legacy-pi`
 - Record state for clean uninstall/restore
 
-### Distribution Compatibility Contract
+### Distribution Compatibility Contract (Packaging/Invocation Scope)
 
 For drop-in adoption, packaging and invocation compatibility follows this contract:
+
+- This section covers packaging/invocation behavior only; strict functional drop-in replacement messaging is governed by the release certification gates in `docs/dropin-certification-contract.json`.
 
 - Canonical executable name is `pi` across release assets and installer-managed installs.
 - Existing TypeScript `pi` installs can be migrated in place; the prior command is preserved as `legacy-pi`.
@@ -648,7 +650,7 @@ This is a second comparison pass focused on high-impact architectural deltas and
 | Area | Original pi-mono (`packages/coding-agent`) | `pi_agent_rust` | Why this divergence exists |
 |------|---------------------------------------------|------------------|----------------------------|
 | **Distribution model** | npm package (`npm install -g @mariozechner/pi-coding-agent`) | Single Rust binary (`pi`) | Remove Node runtime dependency and improve startup/deployment portability |
-| **Execution surfaces** | Interactive + print + JSON mode + RPC + SDK | Interactive + print + JSON mode + RPC (SDK parity tracked in `bd-c9usa`) | Strict drop-in parity is the target; JSON mode streams JSONL events identical to pi-mono, and SDK parity remains on the certification path |
+| **Execution surfaces** | Interactive + print + JSON mode + RPC + SDK | Interactive + print + JSON mode + RPC (SDK parity tracked in `bd-c9usa`) | Strict drop-in parity remains the target and is release-gated; JSON/RPC/SDK parity claims are conditioned on certification artifacts |
 | **Default built-in tool posture** | Defaults to `read/write/edit/bash` (others available) | Seven built-ins treated as first-class (`read/write/edit/bash/grep/find/ls`) | Keep common code-navigation and shell workflows available without extra configuration |
 | **Extension trust model** | Extension/package model documented as full system access | Embedded runtime with capability-gated hostcalls and policy profiles | Reduce ambient authority and make extension behavior auditable/deny-by-default |
 | **Session architecture emphasis** | JSONL tree session model and branch navigation | JSONL v3 tree + explicit session index (SQLite sidecar) + optional SQLite session backend | Faster resume/lookups at scale and safer multi-instance coordination |
@@ -658,7 +660,9 @@ This is a second comparison pass focused on high-impact architectural deltas and
 
 Practical consequence of these deltas:
 - Extension/package workflows are compatible across both implementations.
-- The non-negotiable goal is strict drop-in replacement for pi-mono across all use cases; release language claiming complete replacement is gated by parity certification artifacts.
+- The non-negotiable goal is strict drop-in replacement for pi-mono across all use cases.
+- Strict drop-in replacement language is allowed only when `docs/dropin-certification-contract.json` gates pass and `docs/dropin-certification-verdict.json` reports `overall_verdict = CERTIFIED`.
+- `docs/parity-certification.json` is an informational snapshot and does not override release-gate policy for strict replacement claims.
 
 ### Algorithmic Mechanics: pi-mono Baseline vs Rust Implementation
 
@@ -1812,10 +1816,10 @@ Each entry below includes the document name, purpose, bottom-line takeaway, and 
 - `docs/models.md` - Purpose: model catalog behavior, selection, and overrides. Bottom line: model resolution logic is documented here. Link: [View](docs/models.md)
 - `docs/non-mock-rubric.json` - Purpose: rubric defining non-mock testing expectations. Bottom line: use this to gate real-behavior evidence quality. Link: [View](docs/non-mock-rubric.json)
 - `docs/packages.md` - Purpose: package installation and package-content conventions. Bottom line: package usage and structure are defined here. Link: [View](docs/packages.md)
-- `docs/dropin-certification-contract.json` - Purpose: strict drop-in certification contract and gate thresholds. Bottom line: release claims must satisfy this contract. Link: [View](docs/dropin-certification-contract.json)
+- `docs/dropin-certification-contract.json` - Purpose: strict drop-in certification contract and gate thresholds. Bottom line: strict replacement messaging is allowed only when this contract is satisfied and the verdict artifact is `CERTIFIED`. Link: [View](docs/dropin-certification-contract.json)
 - `docs/dropin-parity-gap-ledger.json` - Purpose: machine-readable ledger of known drop-in parity gaps and severity. Bottom line: unresolved critical/high gaps block strict replacement messaging. Link: [View](docs/dropin-parity-gap-ledger.json)
 - `docs/integrator-migration-playbook.md` - Purpose: operator/integrator migration and rollback playbook for moving from TypeScript Pi to Rust Pi. Bottom line: use this to run staged, evidence-backed migrations. Link: [View](docs/integrator-migration-playbook.md)
-- `docs/parity-certification.json` - Purpose: machine-readable parity certification snapshot. Bottom line: parity claims are justified by this artifact. Link: [View](docs/parity-certification.json)
+- `docs/parity-certification.json` - Purpose: machine-readable parity progress snapshot. Bottom line: informational status only; strict replacement release claims are controlled by the drop-in contract plus verdict artifact. Link: [View](docs/parity-certification.json)
 - `docs/program-governance.md` - Purpose: governance model for roadmap, gates, and ownership. Bottom line: governance decisions and responsibilities are defined here. Link: [View](docs/program-governance.md)
 - `docs/prompt-templates.md` - Purpose: prompt template system and usage guide. Bottom line: reusable prompt behaviors are managed via this doc. Link: [View](docs/prompt-templates.md)
 - `docs/sdk.md` - Purpose: SDK cookbook and migration guide for embedding Pi programmatically. Bottom line: use this for copy/paste Rust equivalents of TypeScript SDK workflows. Link: [View](docs/sdk.md)
