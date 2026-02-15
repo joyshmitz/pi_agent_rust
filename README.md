@@ -344,6 +344,28 @@ The installer is idempotent and supports a migration path from TypeScript Pi:
 - Preserve old CLI behind `legacy-pi`
 - Record state for clean uninstall/restore
 
+### Distribution Compatibility Contract
+
+For drop-in adoption, packaging and invocation compatibility follows this contract:
+
+- Canonical executable name is `pi` across release assets and installer-managed installs.
+- Existing TypeScript `pi` installs can be migrated in place; the prior command is preserved as `legacy-pi`.
+- If you keep TypeScript `pi` as canonical (`--keep-existing-pi`), Rust Pi is installed as `pi-rust`.
+- Version-pinned installs are supported via `install.sh --version vX.Y.Z` for deterministic rollouts.
+- Every GitHub release ships platform binaries plus `SHA256SUMS` for integrity validation.
+
+Representative smoke checks:
+
+```bash
+# Canonical command should exist and execute
+command -v pi
+pi --version
+pi --help >/dev/null
+
+# If a TS migration was performed, legacy command remains available
+command -v legacy-pi && legacy-pi --version
+```
+
 ### From Source
 
 Requires Rust nightly (2024 edition features):
@@ -1793,6 +1815,7 @@ Each entry below includes the document name, purpose, bottom-line takeaway, and 
 - `docs/parity-certification.json` - Purpose: machine-readable parity certification snapshot. Bottom line: parity claims are justified by this artifact. Link: [View](docs/parity-certification.json)
 - `docs/program-governance.md` - Purpose: governance model for roadmap, gates, and ownership. Bottom line: governance decisions and responsibilities are defined here. Link: [View](docs/program-governance.md)
 - `docs/prompt-templates.md` - Purpose: prompt template system and usage guide. Bottom line: reusable prompt behaviors are managed via this doc. Link: [View](docs/prompt-templates.md)
+- `docs/sdk.md` - Purpose: SDK cookbook and migration guide for embedding Pi programmatically. Bottom line: use this for copy/paste Rust equivalents of TypeScript SDK workflows. Link: [View](docs/sdk.md)
 
 ### 3. Provider Subsystem
 
