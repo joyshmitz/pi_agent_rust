@@ -1318,6 +1318,28 @@ strip = true         # Remove symbol tables
 
 Compare to Node.js: the `node` binary alone is 80MB+, before any application code.
 
+### Allocator Strategy for Benchmarks
+
+Shipping builds default to the platform allocator. For allocator experiments, Pi
+supports `jemalloc` as an explicit build-time option:
+
+```bash
+# System allocator baseline + jemalloc variant in one repeatable run
+BENCH_ALLOCATORS_CSV=system,jemalloc \
+  ./scripts/bench_extension_workloads.sh
+```
+
+The benchmark harness records both requested and effective allocator metadata in
+its JSONL output (`allocator_requested`, `allocator_effective`,
+`allocator_fallback_reason`) via `PI_BENCH_ALLOCATOR`.
+
+- `system`: build and run without allocator feature overrides
+- `jemalloc`: build with `--features jemalloc`
+- `auto`: prefer `jemalloc`, fall back to `system` if build fails
+
+If `jemalloc` is requested but unavailable for the current build, the run fails
+closed to the compiled allocator and includes a fallback reason in artifacts.
+
 ### Memory Usage
 
 Rust's ownership model enables predictable memory usage without garbage collection pauses:
