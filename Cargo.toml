@@ -139,6 +139,10 @@ harness = false
 name = "tui_perf"
 harness = false
 
+# Gap H: jemalloc for 10-20% allocation-heavy path improvement.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
+
 [features]
 default = ["image-resize", "clipboard", "wasm-host"]
 image-resize = ["image"]
@@ -147,6 +151,7 @@ wasm-host = ["dep:wasmtime"]
 sqlite-sessions = []
 ext-conformance = []
 fuzzing = []
+jemalloc = ["tikv-jemallocator"]
 
 [profile.release]
 opt-level = "z"
@@ -158,6 +163,14 @@ strip = true
 [profile.dev]
 opt-level = 0
 debug = true
+
+# Performance benchmarking profile: opt-level=3, with debug info.
+[profile.perf]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+debug = 1
+strip = false
 
 [lints.rust]
 unsafe_code = "forbid"
