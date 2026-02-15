@@ -1748,7 +1748,7 @@ Each entry below includes the document name, purpose, bottom-line takeaway, and 
 | Category | What it covers | Jump |
 |---|---|---|
 | Extension Ecosystem | extension architecture, corpus, catalogs, conformance, compatibility | [Go](#1-extension-ecosystem) |
-| Core Ops and UX | governance, CI/QA ops, keybindings, prompts, packaging, model/config UX | [Go](#2-core-ops-and-ux) |
+| Core Ops and UX | governance, CI/QA ops, keybindings, prompts, packaging, model/config UX, drop-in migration/certification | [Go](#2-core-ops-and-ux) |
 | Provider Subsystem | provider audits, setup contracts, parity and remediation artifacts | [Go](#3-provider-subsystem) |
 | QA, Schemas, Security, Platform | release/QA runbooks, schemas, security baselines, platform guides | [Go](#4-qa-schemas-security-and-platform) |
 
@@ -1812,6 +1812,9 @@ Each entry below includes the document name, purpose, bottom-line takeaway, and 
 - `docs/models.md` - Purpose: model catalog behavior, selection, and overrides. Bottom line: model resolution logic is documented here. Link: [View](docs/models.md)
 - `docs/non-mock-rubric.json` - Purpose: rubric defining non-mock testing expectations. Bottom line: use this to gate real-behavior evidence quality. Link: [View](docs/non-mock-rubric.json)
 - `docs/packages.md` - Purpose: package installation and package-content conventions. Bottom line: package usage and structure are defined here. Link: [View](docs/packages.md)
+- `docs/dropin-certification-contract.json` - Purpose: strict drop-in certification contract and gate thresholds. Bottom line: release claims must satisfy this contract. Link: [View](docs/dropin-certification-contract.json)
+- `docs/dropin-parity-gap-ledger.json` - Purpose: machine-readable ledger of known drop-in parity gaps and severity. Bottom line: unresolved critical/high gaps block strict replacement messaging. Link: [View](docs/dropin-parity-gap-ledger.json)
+- `docs/integrator-migration-playbook.md` - Purpose: operator/integrator migration and rollback playbook for moving from TypeScript Pi to Rust Pi. Bottom line: use this to run staged, evidence-backed migrations. Link: [View](docs/integrator-migration-playbook.md)
 - `docs/parity-certification.json` - Purpose: machine-readable parity certification snapshot. Bottom line: parity claims are justified by this artifact. Link: [View](docs/parity-certification.json)
 - `docs/program-governance.md` - Purpose: governance model for roadmap, gates, and ownership. Bottom line: governance decisions and responsibilities are defined here. Link: [View](docs/program-governance.md)
 - `docs/prompt-templates.md` - Purpose: prompt template system and usage guide. Bottom line: reusable prompt behaviors are managed via this doc. Link: [View](docs/prompt-templates.md)
