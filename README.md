@@ -336,6 +336,16 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/ma
 
 # Pin a release tag
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash -s -- --version v0.1.0
+
+# Install from explicit artifact URL + checksum URL
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | \
+  bash -s -- \
+    --artifact-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.1.0/pi-linux-amd64.tar.xz" \
+    --checksum-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.1.0/SHA256SUMS"
+
+# Skip completion setup (CI/non-interactive minimal install)
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | \
+  bash -s -- --yes --no-completions
 ```
 
 The installer is idempotent and supports a migration path from TypeScript Pi:
@@ -343,6 +353,15 @@ The installer is idempotent and supports a migration path from TypeScript Pi:
 - Prompt to install Rust Pi as canonical `pi`
 - Preserve old CLI behind `legacy-pi`
 - Record state for clean uninstall/restore
+
+Notable installer flags:
+- `--offline`: skip network preflight checks (install still needs network unless using local artifacts/source cache)
+- `--artifact-url`: force a specific release artifact URL
+- `--checksum` / `--checksum-url`: override checksum source for explicit artifacts
+- `--sigstore-bundle-url`: override Sigstore bundle URL used by `cosign verify-blob`
+- `--completions bash|zsh|fish`: force shell completion install target
+- `--no-completions`: disable completion installation
+- `--no-verify`: skip checksum + signature verification (testing only)
 
 ### Distribution Compatibility Contract (Packaging/Invocation Scope)
 
