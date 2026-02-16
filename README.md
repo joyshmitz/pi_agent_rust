@@ -361,7 +361,13 @@ Notable installer flags:
 - `--sigstore-bundle-url`: override Sigstore bundle URL used by `cosign verify-blob`
 - `--completions auto|off|bash|zsh|fish`: force shell completion install target (`off` is equivalent to `--no-completions`)
 - `--no-completions`: disable completion installation
+- `--no-agent-skills`: skip automatic installation of the `pi-agent-rust` skill into `~/.claude/skills/` and `~/.codex/skills/`
 - `--no-verify`: skip checksum + signature verification (testing only)
+- `--artifact-url` without `--version` uses a synthetic tag for release mode only; if the artifact download fails, install exits instead of attempting source fallback
+
+By default, the installer also installs a `pi-agent-rust` skill for both Claude Code and Codex CLI:
+- Claude Code: `~/.claude/skills/pi-agent-rust/SKILL.md`
+- Codex CLI: `~/.codex/skills/pi-agent-rust/SKILL.md` (or `$CODEX_HOME/skills/pi-agent-rust/SKILL.md` if `CODEX_HOME` is set)
 
 Installer regression harness (options + checksum + signature + completions):
 
