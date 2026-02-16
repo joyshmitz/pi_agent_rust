@@ -359,7 +359,7 @@ Notable installer flags:
 - `--artifact-url`: force a specific release artifact URL
 - `--checksum` / `--checksum-url`: override checksum source for explicit artifacts
 - `--sigstore-bundle-url`: override Sigstore bundle URL used by `cosign verify-blob`
-- `--completions bash|zsh|fish`: force shell completion install target
+- `--completions auto|off|bash|zsh|fish`: force shell completion install target (`off` is equivalent to `--no-completions`)
 - `--no-completions`: disable completion installation
 - `--no-verify`: skip checksum + signature verification (testing only)
 
