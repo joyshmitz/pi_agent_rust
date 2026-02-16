@@ -363,6 +363,12 @@ Notable installer flags:
 - `--no-completions`: disable completion installation
 - `--no-verify`: skip checksum + signature verification (testing only)
 
+Installer regression harness (options + checksum + signature + completions):
+
+```bash
+bash tests/installer_regression.sh
+```
+
 ### Distribution Compatibility Contract (Packaging/Invocation Scope)
 
 For drop-in adoption, packaging and invocation compatibility follows this contract:
