@@ -1318,6 +1318,20 @@ strip = true         # Remove symbol tables
 
 Compare to Node.js: the `node` binary alone is 80MB+, before any application code.
 
+### Benchmark Evidence vs Shipping Artifacts
+
+Pi separates performance evidence artifacts from distributable release artifacts:
+
+- **Benchmark evidence artifacts** (PERF-3X and certification inputs) are produced by
+  `scripts/perf/orchestrate.sh` and `scripts/bench_extension_workloads.sh`, and must carry
+  run provenance (`correlation_id`) plus profile labels (for example `build_profile=perf`).
+- **Shipping artifacts** (end-user binaries) are built with Cargo `release` profile and
+  distributed via GitHub Releases + installer paths.
+
+Policy implication: release/size artifacts alone are not valid evidence for global performance
+claims. Performance claims must cite benchmark evidence bundles with reproducible provenance.
+See `docs/testing-policy.md` and `docs/releasing.md` for normative policy details.
+
 ### Allocator Strategy for Benchmarks
 
 Shipping builds default to the platform allocator. For allocator experiments, Pi
