@@ -146,7 +146,7 @@ harness = false
 tikv-jemallocator = { version = "0.6", optional = true }
 
 [features]
-default = ["image-resize", "clipboard"]
+default = ["image-resize", "clipboard", "jemalloc"]
 image-resize = ["image"]
 clipboard = ["dep:clipboard", "dep:arboard"]
 wasm-host = ["dep:wasmtime"]
@@ -156,7 +156,7 @@ fuzzing = []
 jemalloc = ["tikv-jemallocator"]
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
