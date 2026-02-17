@@ -466,6 +466,15 @@ Interactive file references:
 | `--list-models [PATTERN]` | List available models (optional fuzzy filter) |
 | `--export <PATH>` | Export session file to HTML |
 
+Additional high-leverage flags:
+
+- `--provider <NAME>` to force a provider for a single run
+- `--mode text|json|rpc` to switch print output format
+- `--extension-policy safe|balanced|permissive` to tune extension permissions
+- `--repair-policy off|suggest|auto-safe|auto-strict` to control extension auto-repair behavior
+- `--session-durability strict|balanced|throughput` to pick persistence behavior
+- `--list-providers` to print provider aliases and credential env keys
+
 ### Subcommands
 
 ```bash
@@ -478,6 +487,29 @@ pi list                            # List user + project packages from settings
 # Configuration
 pi config                          # Show settings paths + precedence
 ```
+
+More utility subcommands:
+
+```bash
+# Extension catalog index + discovery
+pi update-index
+pi search "git"
+pi info pi-search-agent
+
+# Environment and extension diagnostics
+pi doctor
+pi doctor --only sessions --format json
+pi doctor ./path/to/extension --policy safe --fix
+
+# Session storage migration (JSONL -> v2 sidecar store)
+pi migrate ~/.pi/agent/sessions --dry-run
+pi migrate ~/.pi/agent/sessions
+```
+
+- `update-index` refreshes extension index metadata used by `search` and `info`.
+- `search` and `info` let you discover and inspect extension metadata without leaving the CLI.
+- `doctor` checks config, directories, auth, shell setup, sessions, and extension compatibility.
+- `migrate` validates or creates the v2 session sidecar format for faster resume on larger histories.
 
 ---
 
@@ -1059,6 +1091,25 @@ Extensions run in an embedded QuickJS runtime (`rquickjs` crate) and communicate
 
 **Deduplication**: Each hostcall's parameters are canonicalized (object keys sorted, structure normalized) and SHA-256 hashed. Identical requests within a short window can be deduplicated to avoid redundant tool executions.
 
+**Fast lane vs compatibility lane**: Pi has two execution lanes for hostcalls:
+
+- **Fast lane** is used when the call shape matches known safe patterns (for example common `tool` and `session` operations). This avoids extra allocation and parsing work.
+- **Compatibility lane** is the fallback for uncommon or partially-specified calls.
+- Both lanes still enforce the same capability policy and permission checks.
+
+For observability, each call is tagged with a stable lane key (for example `tool|tool.read|filesystem` or `tool|fallback|filesystem`) so latency and failure trends can be grouped consistently.
+
+**Built-in consistency guard (shadow dual execution)**: Pi can sample a small subset of read-only hostcalls, execute them through both lanes, and compare canonical output fingerprints. If divergence crosses a configured budget, Pi automatically backs off the fast lane for a period. This gives performance wins without silently changing behavior.
+
+**Adaptive dispatch mode under load**: Pi can switch between:
+
+- `sequential_fast_path` for simpler/low-contention workloads
+- `interleaved_batching` when contention and queue pressure rise
+
+Mode changes are gated by sample coverage and risk checks, so Pi does not switch based on thin or cherry-picked evidence.
+
+**Runtime telemetry for debugging and tuning**: Pi records structured hostcall telemetry (`pi.ext.hostcall_telemetry.v1`) with lane choice, fallback reason, dispatch latency share, marshalling path, and optimization hit/miss fields. This is used by perf reports and reliability diagnostics.
+
 **Auto-repair pipeline**: When an extension fails to load or produces runtime errors, Pi's repair system can automatically fix common issues:
 
 | Repair Mode | Behavior |
@@ -1071,6 +1122,16 @@ Extensions run in an embedded QuickJS runtime (`rquickjs` crate) and communicate
 **Compatibility scanner**: Before loading, Pi statically analyzes extension source code for imports, `require()` calls, and forbidden patterns (`eval`, `Function()`, `process.binding`, `dlopen`). The scan produces a capability evidence ledger that informs policy decisions.
 
 **Environment variable filtering**: Extensions calling `pi.env()` hit a blocklist that denies access to API keys, credentials, tokens, and private keys. The filter blocks exact matches (`ANTHROPIC_API_KEY`, `AWS_SECRET_ACCESS_KEY`), suffix patterns (`*_API_KEY`, `*_SECRET`, `*_TOKEN`), and prefix patterns (`AWS_SECRET_*`, `AWS_SESSION_*`). Only `PI_*` variables are unconditionally allowed.
+
+### Extension Runtime Decision Logic (Plain English)
+
+The extension runtime includes a few small decision engines so behavior stays stable as workload patterns change:
+
+- **Value-of-information planner (VOI)**: Ranks candidate probes by "expected learning per millisecond" and picks the best set under a strict overhead budget. Stale or low-value candidates are skipped with explicit reasons.
+- **Shard load controller**: Adjusts routing weights, batch budgets, and backoff/help factors based on queue pressure, latency, and starvation risk. Damping and oscillation guards prevent overreaction.
+- **Policy safety evaluator**: Replays historical samples with multiple estimators and only approves a policy when sample support is strong, uncertainty is low, and predicted regret stays within limit.
+
+These pieces are intentionally conservative: if confidence is weak, Pi holds steady instead of making an aggressive switch.
 
 ### Interactive TUI Architecture
 
@@ -1203,6 +1264,34 @@ CREATE TABLE sessions (
 
 **Staleness-based reindexing**: If the index is older than a configurable threshold, Pi runs a full re-scan of the sessions directory to catch files created by other instances or manual edits. The re-scan keeps the index accurate without a centralized daemon.
 
+### Session Store V2 Sidecar (Large Session Fast-Path)
+
+Pi also supports a v2 sidecar store next to JSONL sessions for faster resume and stronger corruption checks on long histories.
+
+**What it adds:**
+
+- Segmented append log files (instead of one ever-growing JSONL file)
+- Offset index rows for direct seeks and fast tail reads
+- Periodic checkpoints and a manifest snapshot
+- Migration ledger entries for auditability
+
+**How resume works:**
+
+1. If a v2 sidecar exists and is fresh, Pi opens from the sidecar index + segments.
+2. If sidecar data is stale relative to the source JSONL, Pi falls back to JSONL parsing.
+3. If index data is missing/corrupt but segments are valid, Pi rebuilds the index.
+
+**Integrity strategy:**
+
+- Segment frames carry payload and chain hashes.
+- Index rows store byte offsets plus CRC32C checksums.
+- Validation checks offset bounds, checksum matches, and frame/index alignment before trusting the sidecar.
+
+**CLI support:**
+
+- `pi migrate <path> --dry-run` validates migration without writing.
+- `pi migrate <path>` performs JSONL-to-v2 migration and verifies parity.
+
 ### Authentication & Credential Management
 
 Beyond simple API keys, Pi supports OAuth, AWS credential chains, and service key exchange. Credentials are stored in `~/.pi/agent/auth.json` with file-locked access to prevent corruption from concurrent instances.
@@ -1323,6 +1412,23 @@ CLI tools have different performance requirements than servers or GUI applicatio
 
 This difference compounds with usage frequency. A developer invoking `pi` 50 times per day saves 15-45 minutes per week in startup latency alone.
 
+### Extreme Optimization Playbook
+
+Pi is optimized more like a low-latency engine than a typical CLI app. We intentionally apply aggressive optimization at multiple layers, not just "compile with `--release` and hope."
+
+Where the speed comes from:
+
+- **Startup path kept minimal**: no JS runtime bootstrap, no module graph loading, no JIT warmup.
+- **Hot hostcall specialization**: common extension hostcalls use typed fast paths; uncommon shapes fall back to compatibility paths.
+- **Adaptive dispatch under load**: hostcall scheduling can switch modes when contention rises, then switch back when pressure drops.
+- **Fast-path safety guardrails**: sampled shadow dual-execution checks ensure optimizations do not silently change behavior.
+- **Low-allocation rendering**: TUI render buffers and markdown render results are cached/reused instead of rebuilt every frame.
+- **Fast resume internals**: session indexing plus the v2 sidecar layout avoid expensive full-history scans on resume.
+- **Bounded growth controls**: compaction and truncation keep token/context growth and tool-output payload growth from degrading responsiveness over long sessions.
+- **Measurement-first culture**: perf artifacts are schema-validated and claim-gated in CI, so optimization work is driven by evidence and regressions are caught early.
+
+This is why Pi can stay responsive even with heavy streaming, tool usage, large session histories, and extension workloads running at the same time.
+
 ### Binary Size Optimization
 
 The release profile aggressively optimizes for size:
@@ -1362,6 +1468,40 @@ Pi separates performance evidence artifacts from distributable release artifacts
 Policy implication: release/size artifacts alone are not valid evidence for global performance
 claims. Performance claims must cite benchmark evidence bundles with reproducible provenance.
 See `docs/testing-policy.md` and `docs/releasing.md` for normative policy details.
+
+### Extension Workload Hotspot Profiling
+
+Pi includes a dedicated workload harness for extension runtime bottlenecks:
+
+```bash
+cargo run --bin ext_workloads -- \
+  --out artifacts/perf/ext_workloads.jsonl \
+  --matrix-out artifacts/perf/ext_hostcall_hotspot_matrix.json \
+  --trace-out artifacts/perf/ext_hostcall_bridge_trace.jsonl
+```
+
+This harness does more than raw timing:
+
+- Breaks hostcall cost into six stages: `marshal`, `queue`, `schedule`, `policy`, `execute`, `io`
+- Produces a hotspot matrix (`pi.ext.hostcall_hotspot_matrix.v1`) for quick bottleneck ranking
+- Produces bridge trace events (`pi.ext.hostcall_trace.v1`) for per-call debugging
+- Measures how stage pairs interact and verifies full stage-pair coverage
+- Generates a VOI scheduler plan (`pi.ext.voi_scheduler.v1`) to recommend the next highest-value experiments under a fixed overhead budget
+
+In plain terms: it helps answer "what should we optimize next?" with data, not guesswork.
+
+### Claim-Integrity Gates for Performance Reporting
+
+Pi's perf pipeline includes strict evidence checks so global speed claims cannot be based on partial or stale data.
+
+- `scripts/perf/orchestrate.sh` generates artifacts tied to a shared `correlation_id` for the same run.
+- `scripts/e2e/run_all.sh` validates required schemas, freshness, and `correlation_id` alignment before considering claims valid.
+- Key release-facing artifacts include:
+  - `pi.perf.extension_benchmark_stratification.v1`
+  - `pi.perf.phase1_matrix_validation.v1`
+  - `pi.claim_integrity.evidence_adjudication_matrix.v1`
+
+If the evidence set is incomplete or contradictory, the claim-integrity gate stays closed and reports exactly why.
 
 ### Allocator Strategy for Benchmarks
 
