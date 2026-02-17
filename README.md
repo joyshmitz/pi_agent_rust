@@ -1636,6 +1636,21 @@ Policy implication: release/size artifacts alone are not valid evidence for glob
 claims. Performance claims must cite benchmark evidence bundles with reproducible provenance.
 See `docs/testing-policy.md` and `docs/releasing.md` for normative policy details.
 
+### Fast Loop vs Definitive Benchmarks
+
+For day-to-day implementation, use targeted checks to keep iteration fast. Reserve definitive
+benchmark conclusions for integration boundaries where full evidence is regenerated.
+
+- **Fast loop (non-authoritative):** file-scoped `cargo fmt --check` and targeted `cargo test --test ...`.
+- **Definitive pass (authoritative):** offload heavy runs with `rch exec -- ...`, then require
+  updated evidence artifacts:
+  - `tests/perf/reports/phase1_matrix_validation.json`
+  - `tests/full_suite_gate/full_suite_verdict.json`
+  - `tests/full_suite_gate/certification_verdict.json`
+  - `tests/full_suite_gate/extension_remediation_backlog.json`
+
+This keeps inner loops responsive while preserving strict claim-integrity at release time.
+
 ### Extension Workload Hotspot Profiling
 
 Pi includes a dedicated workload harness for extension runtime bottlenecks:
