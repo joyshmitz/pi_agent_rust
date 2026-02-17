@@ -5,7 +5,7 @@
 <h1 align="center">pi_agent_rust</h1>
 
 <p align="center">
-  <strong>pi_agent_rust — High-performance AI coding agent CLI written in Rust</strong>
+  <strong>pi_agent_rust - High-performance AI coding agent CLI written in Rust</strong>
 </p>
 
 <p align="center">
@@ -28,6 +28,11 @@
   </a>
 </p>
 
+```bash
+# Install latest release
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash
+```
+
 ---
 
 ## The Problem
@@ -40,7 +45,7 @@ You want an AI coding assistant in your terminal, but existing tools are:
 
 ## The Solution
 
-**pi_agent_rust** is a from-scratch Rust port of [Pi Agent](https://github.com/badlogic/pi) by [Mario Zechner](https://github.com/badlogic) (made with his blessing!). Single binary, instant startup, rock-solid streaming, and 7 battle-tested built-in tools.
+**pi_agent_rust** is a from-scratch Rust port of [Pi Agent](https://github.com/badlogic/pi) by [Mario Zechner](https://github.com/badlogic) (made with his blessing!). Single binary, instant startup, stable streaming, and 7 built-in tools.
 
 Rather than a direct line-by-line translation, this port builds on two purpose-built Rust libraries:
 - **[asupersync](https://github.com/Dicklesworthstone/asupersync)**: A structured concurrency async runtime with built-in HTTP, TLS, and SQLite
@@ -62,12 +67,35 @@ pi -p "What does this error mean?" < error.log
 | Feature | Pi (Rust) | Typical TS/Python CLI |
 |---------|-----------|----------------------|
 | **Startup** | <100ms | 500ms-2s |
-| **Binary size** | ~15MB | 100MB+ (with runtime) |
+| **Binary size** | <22MB (CI-gated budget) | 100MB+ (with runtime) |
 | **Memory (idle)** | <50MB | 200MB+ |
 | **Streaming** | Native SSE parser | Library-dependent |
 | **Tool execution** | Process tree management | Basic subprocess |
 | **Sessions** | JSONL with branching | Varies |
 | **Unsafe code** | Forbidden | N/A |
+
+## Quick Example
+
+```bash
+# 1) Start an interactive session
+pi
+
+# 2) Ask a codebase question
+pi "Summarize the architecture in src/"
+
+# 3) Attach a file inline
+pi @src/main.rs "Explain startup flow"
+
+# 4) Run single-shot mode for scripting
+pi -p "List likely regression risks for this diff"
+
+# 5) Continue your last project session
+pi --continue
+
+# 6) Inspect available models/providers
+pi --list-models
+pi --list-providers
+```
 
 ---
 
@@ -227,8 +255,7 @@ Pi runs in three modes, each suited to different workflows:
 Pi runs legacy JS/TS extensions **without Node or Bun**, using an embedded
 QuickJS runtime with capability-gated host connectors:
 
-- **187 of 223 extensions pass** automated conformance tests unmodified
-- **100% pass rate** for simple single-file extensions; **98.4%** for official upstream
+- Compatibility metrics are tracked in [docs/ext-compat.md](docs/ext-compat.md) and `tests/ext_conformance/reports/pipeline/`
 - **Sub-100ms cold load** (P95), **sub-1ms warm load** (P99)
 - Node API shims for `fs`, `path`, `os`, `crypto`, `child_process`, `url`, and more
 - Capability-based security: extensions call explicit connectors (`tool/exec/http/session/ui`) with audit logging
@@ -297,8 +324,8 @@ This project validates extension compatibility with a two-track pipeline:
 These runs compile many crates and can be disk-heavy. Point Cargo artifacts and temp files to a large volume:
 
 ```bash
-export CARGO_TARGET_DIR="/data/projects/pi_agent_rust/.cargo-target/${USER:-agent}"
-export TMPDIR="/data/projects/pi_agent_rust/.tmp/${USER:-agent}"
+export CARGO_TARGET_DIR="/data/tmp/pi_agent_rust/${USER:-agent}"
+export TMPDIR="/data/tmp/pi_agent_rust/${USER:-agent}/tmp"
 mkdir -p "$CARGO_TARGET_DIR" "$TMPDIR"
 ```
 
@@ -311,15 +338,13 @@ cargo run --bin ext_full_validation --
 
 ### Latest run snapshot (2026-02-14)
 
-- `ext_unvendored_fetch_run` (777 unvendored):
-  - `fetched=761`, `cached=3`, `fetchFailed=13` (764 local sources available)
-- `ext_full_validation`:
-  - Stage summary: `passed=8`, `failed=1`, `skipped=1`
-  - Vendored conformance: `195/223` pass (`87.4%`)
-  - Provider compatibility cells: `750/750` pass (`100.0%`) after self-contained extension artifact fixes.
-  - Scenario suite: `25/25` pass
-  - Auto-repair sweep: `220` clean pass, `2` repaired pass (`monorepo_escape`), `1` still failing (`community/nicobailon-interview-tool`, missing `form/index.html` asset).
-  - Reality check: provider compatibility is fully green, but the full extension pipeline is not yet 100% green.
+From `tests/ext_conformance/reports/pipeline/full_validation_report.md`
+(generated `2026-02-14T05:46:49Z`):
+
+- Stage summary: `passed=4`, `failed=5`, `skipped=1`
+- Corpus counts: `vendored=223`, `unvendored=777`, `totalCandidates=1000`
+- Verdict breakdown: `harness_gap=216`, `needs_review=7`, `not_extension=1`, `not_tested_unvendored=776`
+- The report indicates active harness gaps; treat compatibility percentages as in-progress until failed stages are cleared.
 
 ---
 
@@ -421,7 +446,7 @@ cargo build --release
 
 Pi has minimal runtime dependencies:
 - `fd`: Required for the `find` tool (install via `apt install fd-find` or `brew install fd`)
-- `rg`: Optional, improves grep performance (install via `apt install ripgrep` or `brew install ripgrep`)
+- `rg`: Required for the `grep` tool (install via `apt install ripgrep` or `brew install ripgrep`)
 
 ### Uninstall
 
@@ -459,10 +484,10 @@ Interactive file references:
 | `-s, --session <PATH>` | Open specific session file |
 | `--no-session` | Don't persist conversation |
 | `-p, --print` | Single response, no interaction |
-| `--model <MODEL>` | Model to use (default: claude-sonnet-4-20250514) |
+| `--model <MODEL>` | Model to use (auto-select fallback: `anthropic/claude-opus-4-5`, then `openai/gpt-5.1-codex`, then `google/gemini-2.5-pro`) |
 | `--thinking <LEVEL>` | Thinking level: off/minimal/low/medium/high/xhigh |
 | `--tools <TOOLS>` | Comma-separated tool list |
-| `--api-key <KEY>` | API key (or use ANTHROPIC_API_KEY) |
+| `--api-key <KEY>` | API key (or use provider-specific env vars such as `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) |
 | `--list-models [PATTERN]` | List available models (optional fuzzy filter) |
 | `--export <PATH>` | Export session file to HTML |
 
@@ -520,7 +545,7 @@ Pi reads configuration from `~/.pi/agent/settings.json`:
 ```json
 {
   "default_provider": "anthropic",
-  "default_model": "claude-sonnet-4-20250514",
+  "default_model": "claude-opus-4-5",
   "default_thinking_level": "medium",
 
   "compaction": {
@@ -643,7 +668,7 @@ Current native providers in `src/providers/` are `anthropic`, `openai`, `openai_
 2. **Streaming-first**: Custom SSE parser, no blocking on responses
 3. **Process tree management**: `sysinfo` crate ensures no orphaned processes
 4. **Structured errors**: `thiserror` with specific error types per component
-5. **Size-optimized release**: LTO + strip + opt-level=z for lean binaries
+5. **Speed-oriented release profile**: LTO + strip + `opt-level = 3` for runtime performance
 
 ### asupersync Context vs TypeScript Pi (pi-mono)
 
@@ -713,7 +738,7 @@ This is a second comparison pass focused on high-impact architectural deltas and
 | Area | Original pi-mono (`packages/coding-agent`) | `pi_agent_rust` | Why this divergence exists |
 |------|---------------------------------------------|------------------|----------------------------|
 | **Distribution model** | npm package (`npm install -g @mariozechner/pi-coding-agent`) | Single Rust binary (`pi`) | Remove Node runtime dependency and improve startup/deployment portability |
-| **Execution surfaces** | Interactive + print + JSON mode + RPC + SDK | Interactive + print + JSON mode + RPC (SDK parity tracked in `bd-c9usa`) | Strict drop-in parity remains the target and is release-gated; JSON/RPC/SDK parity claims are conditioned on certification artifacts |
+| **Execution surfaces** | Interactive + print + JSON mode + RPC + SDK | Interactive + print + JSON mode + RPC (+ Rust SDK documented in `docs/sdk.md`) | Strict drop-in parity remains release-gated; JSON/RPC/SDK claims must be backed by certification artifacts |
 | **Default built-in tool posture** | Defaults to `read/write/edit/bash` (others available) | Seven built-ins treated as first-class (`read/write/edit/bash/grep/find/ls`) | Keep common code-navigation and shell workflows available without extra configuration |
 | **Extension trust model** | Extension/package model documented as full system access | Embedded runtime with capability-gated hostcalls and policy profiles | Reduce ambient authority and make extension behavior auditable/deny-by-default |
 | **Session architecture emphasis** | JSONL tree session model and branch navigation | JSONL v3 tree + explicit session index (SQLite sidecar) + optional SQLite session backend | Faster resume/lookups at scale and safer multi-instance coordination |
@@ -724,7 +749,7 @@ This is a second comparison pass focused on high-impact architectural deltas and
 Practical consequence of these deltas:
 - Extension/package workflows are compatible across both implementations.
 - The non-negotiable goal is strict drop-in replacement for pi-mono across all use cases.
-- Strict drop-in replacement language is allowed only when `docs/dropin-certification-contract.json` gates pass and `docs/dropin-certification-verdict.json` reports `overall_verdict = CERTIFIED`.
+- Strict drop-in replacement language is release-gated by `docs/dropin-certification-contract.json` and open-gap status in `docs/dropin-parity-gap-ledger.json`.
 - `docs/parity-certification.json` is an informational snapshot and does not override release-gate policy for strict replacement claims.
 
 ### Algorithmic Mechanics: pi-mono Baseline vs Rust Implementation
@@ -763,6 +788,120 @@ The sections above compare mechanics. This section calls out concrete features p
 ---
 
 ## Deep Dive: Core Algorithms
+
+### Math-Driven Decision Systems
+
+Pi deliberately uses advanced math where it improves runtime behavior or benchmark confidence. The goal is not “fancy formulas in docs”; it is safer policy decisions, faster recovery from workload shifts, and more trustworthy performance attribution.
+
+### Regime-Shift Detection (CUSUM + BOCPD)
+
+In the extension dispatcher, Pi combines CUSUM and Bayesian online change-point detection to detect load-regime changes early (for example when hostcall traffic suddenly spikes or stalls).
+
+$$
+S_t^+ = \max\left(0,\;S_{t-1}^+ + (-z_t - k)\right), \quad
+S_t^- = \max\left(0,\;S_{t-1}^- + (z_t - k)\right)
+$$
+
+$$
+H(r)=\frac{1}{\lambda}, \quad
+P(r_t=0 \mid x_{1:t}) \propto \sum_r P(r_{t-1}=r)\,H(r)\,P(x_t \mid r)
+$$
+
+Intuition: CUSUM catches persistent drift; BOCPD catches sudden regime changes without brittle fixed thresholds.
+
+### Conformal Prediction Envelope
+
+Pi tracks nonconformity scores (absolute residuals from the running mean) and treats out-of-interval events as anomalies.
+
+$$
+q = \text{score}_{\lceil (n+1)\cdot \text{confidence} \rceil - 1}, \quad
+\text{anomaly if } |x_t - \mu_t| > q
+$$
+
+Intuition: thresholds adapt from recent behavior instead of hard-coding one static latency cutoff.
+
+### PAC-Bayes Safety Bound
+
+Pi’s safety envelope includes a PAC-Bayes-kl bound over extension outcomes, and can veto aggressive optimization when the bound is too high.
+
+$$
+\mathrm{kl}(\hat q \,\|\, q_{\text{bound}})\;\le\;\frac{\mathrm{KL}(Q\|P)+\ln\!\left(2\sqrt{n}/\delta\right)}{n}
+$$
+
+Intuition: this gives an explicit uncertainty-aware ceiling on true error risk before allowing more aggressive runtime behavior.
+
+### Off-Policy Evaluation (IPS/WIS/DR + ESS + Regret Gate)
+
+Before approving policy moves, Pi evaluates candidate behavior from trace data:
+
+$$
+w_i=\frac{\pi(a_i\mid x_i)}{\mu(a_i\mid x_i)}, \quad
+\hat V_{\text{IPS}}=\frac{1}{n}\sum_i w_i r_i
+$$
+
+$$
+\hat V_{\text{WIS}}=\frac{\sum_i w_i r_i}{\sum_i w_i}, \quad
+\hat V_{\text{DR}}=\frac{1}{n}\sum_i\left(\hat r_i + w_i(r_i-\hat r_i)\right)
+$$
+
+$$
+N_{\text{eff}}=\frac{(\sum_i w_i)^2}{\sum_i w_i^2}, \quad
+\Delta_{\text{regret}}=\bar r_{\text{baseline}}-\hat V_{\text{DR}}
+$$
+
+Intuition: Pi fails closed if sample support is weak, uncertainty is high, or estimated regret is above threshold.
+
+### VOI-Driven Experiment Selection
+
+The VOI planner prioritizes probes that provide the most expected learning under a strict overhead budget.
+
+$$
+\text{priority}_i \propto \frac{\text{utility}_i}{\text{overhead}_i}
+$$
+
+Intuition: run only the experiments that are likely to change decisions; skip stale or low-value probes.
+
+### Weighted Bottleneck Attribution (Benchmarking)
+
+For phase-1 matrix benchmarking, Pi computes stage attribution weighted by realistic workload size (`session_messages`) and reports confidence intervals.
+
+$$
+\text{weighted\_contribution}_s
+=
+\frac{\sum_i w_i\,m_{i,s}}{\sum_i w_i\,t_i}\cdot 100,
+\quad w_i=\text{session\_messages}_i
+$$
+
+$$
+n_{\text{eff}}=\frac{(\sum_i w_i)^2}{\sum_i w_i^2}, \quad
+\mathrm{CI}_{95}=\mu \pm 1.96\sqrt{\frac{\sigma^2}{n_{\text{eff}}}}
+$$
+
+Intuition: prioritize what dominates real end-to-end latency, not just isolated microbench hotspots.
+
+### Online Convex Control + Regret Tracking
+
+Pi also includes an online tuner path for batch/time-slice controls with explicit rollback behavior:
+
+$$
+\tau_{t+1}
+=
+\mathrm{clip}\!\left(\tau_t - \eta\nabla_{\tau}\mathcal{L}_t,\;\tau_{\min},\tau_{\max}\right)
+$$
+
+Intuition: the system adapts continuously, but if instantaneous loss exceeds a rollback threshold it immediately returns to a safer profile.
+
+### Math At a Glance
+
+| Technique | Where in Pi | Why it helps |
+|----------|-------------|--------------|
+| CUSUM + BOCPD | Extension dispatcher regime detector | Detects traffic regime shifts early and robustly |
+| Conformal intervals | Safety envelope | Adaptive anomaly gating without static magic numbers |
+| PAC-Bayes bound | Safety envelope veto path | Fails closed when uncertainty/risk is too high |
+| IPS/WIS/DR + ESS | Off-policy evaluator | Approves policy changes only with adequate support |
+| VOI planning | Experiment scheduler | Uses overhead budget on highest-value probes |
+| Weighted attribution + CI | Phase-1 perf matrix reports | Ranks optimization work by realistic user impact |
+| OCO + regret rollback | Runtime controller | Adapts under load while bounding unsafe drift |
 
 ### SSE Streaming Parser
 
@@ -1410,7 +1549,7 @@ CLI tools have different performance requirements than servers or GUI applicatio
 | JIT warmup | 50-100ms | 0ms (AOT compiled) |
 | **Total** | **360-910ms** | **~10ms** |
 
-This difference compounds with usage frequency. A developer invoking `pi` 50 times per day saves 15-45 minutes per week in startup latency alone.
+This difference compounds with usage frequency, especially in short iterative terminal workflows.
 
 ### Extreme Optimization Playbook
 
@@ -1429,31 +1568,59 @@ Where the speed comes from:
 
 This is why Pi can stay responsive even with heavy streaming, tool usage, large session histories, and extension workloads running at the same time.
 
-### Binary Size Optimization
+### Optimization Catalog (Code + Commit History)
 
-The release profile aggressively optimizes for size:
+This catalog reflects a long sequence of changes across runtime, storage, streaming, and UI.
+
+Concrete engineering work in this codebase includes:
+
+| Area | What we built | Why it matters |
+|------|---------------|----------------|
+| Extension dispatch core | Typed hostcall opcode fast paths, compatibility fallback lane, zero-copy payload arena, canonical-hash shortcuts, interned operation paths | Cuts per-call overhead on the hottest extension operations while preserving correctness fallback paths |
+| Registry/policy lookup | Immutable policy snapshots with O(1) capability checks, plus RCU-style metadata snapshots for extension registry/tool metadata | Removes repeated dynamic lookup overhead in hot authorization/dispatch paths |
+| Queueing + concurrency | Core-pinned SPSC reactor mesh, S3-FIFO-inspired admission with fairness guards, BRAVO-style fallback behavior | Improves tail latency under contention instead of only optimizing median latency |
+| Batched execution | AMAC-style interleaved batch executor with stall-aware toggling | Avoids head-of-line stalls when many independent hostcalls are in flight |
+| IO specialization | io_uring lane policy + telemetry and compatibility fallback | Routes IO-heavy calls to a specialized lane when safe and beneficial |
+| Runtime startup for extensions | QuickJS pre-warm path, warm isolate/bytecode cache behavior, and startup pipeline parallelization | Lowers cold-start overhead before the first real extension workload |
+| JS bridge/scheduler path | Pending-job fast-path tuning and bridge-level dispatch cleanup in hot extension loops | Reduces overhead between JS requests and Rust execution |
+| Adaptive control loops | Regime-shift detection (CUSUM/BOCPD), budget controllers, VOI-based experiment planner, mean-field load controller, off-policy evaluation gates | Lets runtime behavior adapt to workload shifts without blind tuning |
+| Fast-path safety | Shadow dual-execution sampling with automatic rollback/backoff on divergence | Prevents speed work from silently changing semantics |
+| Trace-level optimization | Hostcall superinstruction compiler + tier-2 trace-JIT path | Fuses repeated opcode traces and lowers repeated dispatch overhead |
+| Tool execution strategy | Dynamic read-only tool classification + parallel tool execution paths | Increases throughput when multiple tool calls can safely run together |
+| Session write path | Write-behind autosave queue, durability modes, incremental append, checkpointed rewrite strategy, single-buffer append serialization | Keeps interaction fast while still supporting stronger durability when needed |
+| Session index path | Async coalesced index updates, pending-drain hot-path tuning, and reduced allocation/boxing overhead | Keeps resume/discovery metadata updates off the interactive hot path |
+| Session resume path | Session Store V2 sidecar (segmented log + offset index), O(index+tail) open path, stale-sidecar detection, migration/rollback tooling | Avoids full-file rescans on large histories and improves recovery behavior |
+| Long-session maintenance | Background compaction/snapshot workers with quotas + lazy hydration paths | Controls session growth and keeps long-running workspaces responsive |
+| Compaction internals | Binary-search cut-point logic, serialization helper extraction, and zero-allocation-oriented cleanup on compaction paths | Lowers compaction overhead and keeps compaction from becoming a pause source |
+| Streaming internals | SSE parser event-type interning, scanned-byte tracking (`scanned_len`), UTF-8 recovery hardening | Reduces repeated scanning/allocation during token streaming and improves resilience |
+| Provider/message memory path | Zero-copy request context migration (`Cow`), `Arc`-based message/result sharing, clone elimination in stream end paths | Removes hot-path cloning and allocation churn in core agent/provider loops |
+| TUI rendering path | Message render cache, conversation-prefix cache, reusable render buffers, viewport/render-path refactors, Criterion perf gates | Reduces redraw cost and jitter while streaming long outputs |
+| Startup/resource loading | Parallelized skill/prompt/theme loading plus precomputed tool definitions/command names | Moves heavy initialization off the critical path to improve time-to-interaction |
+| Allocator/build profile | jemalloc default for allocation-heavy paths, speed-oriented release profile, strict artifact validation for perf claims | Improves runtime consistency and prevents benchmark/reporting drift |
+| Perf governance | Scenario matrix, claim-integrity gates, strict no-data fail behavior, variance/confidence artifacts, reproducible orchestration bundles | Makes performance claims auditable and regression detection automatic |
+| Hostcall marshalling planner | `HostcallRewriteEngine` uses a small cost model to pick fast opcode fusion only when it is clearly cheaper and unambiguous; otherwise it stays on the canonical path and records fallback reason | Gains speed on hot marshalling shapes without risking silent semantic drift from ambiguous rewrites |
+| Tool text-processing hot path | `truncate_head`/`truncate_tail` use lazy line traversal and `memchr` line counting; normalization switched to a single-pass transform instead of chained string rewrites | Large file/tool outputs avoid unnecessary intermediate allocations and stay responsive |
+| JS bridge regex and parser micro-paths | Frequent regex checks in the extension JS bridge are `OnceLock`-cached; hot bridge calls avoid repeated setup work | Cuts repeated per-call overhead in extension-heavy sessions |
+| CLI/autocomplete process-spawn reduction | `fd`/`rg` availability checks are cached, and autocomplete file-index refresh runs in background with stale-update dropping | Keeps completion and command handling quick even in very large repositories |
+| Session identity/index micro-optimizations | O(1) entry-id cache, single-pass metadata finalization, and append-path cleanups replace multi-pass/copy-heavy behavior | Reduces overhead on append/save/rebuild when sessions become large |
+| Benchmark-driven rollback discipline | Candidate micro-optimizations are benchmarked and can be reverted when real workloads regress (for example, a newline-scan `memchr` swap in SSE was rolled back) | Prevents "optimizations" that look fast in theory but slow down real usage |
+
+Optimization spans algorithms, execution lanes, memory movement, queue discipline, storage layout, and validation policy as one system.
+
+### Release Profile and Binary Size Gate
+
+The shipping release profile is tuned for runtime speed:
 
 ```toml
 [profile.release]
-opt-level = "z"      # Size optimization (not speed)
+opt-level = 3        # Maximum speed optimization
 lto = true           # Link-time optimization across all crates
 codegen-units = 1    # Single codegen unit (slower compile, better optimization)
 panic = "abort"      # No unwinding machinery
 strip = true         # Remove symbol tables
 ```
 
-**Size breakdown (approximate):**
-
-| Component | Contribution |
-|-----------|-------------|
-| Core binary logic | ~3MB |
-| HTTP + TLS (rustls) | ~5MB |
-| serde + JSON | ~1MB |
-| clap (CLI) | ~1MB |
-| Other dependencies | ~3MB |
-| **Total (stripped)** | **~13-15MB** |
-
-Compare to Node.js: the `node` binary alone is 80MB+, before any application code.
+Binary size is still explicitly budgeted in CI via `binary_size_release`, with the current release threshold set to `22.0 MB`.
 
 ### Benchmark Evidence vs Shipping Artifacts
 
@@ -1706,7 +1873,7 @@ environment with no ambient OS access:
 
 1. **No Node/Bun required**: QuickJS + Pi-provided shims for common Node APIs
 2. **Capability-based security**: each host connector call is policy-checked and logged
-3. **Conformance-tested**: 187 of 223 known extensions pass automated tests
+3. **Conformance-tested**: status is tracked in `docs/ext-compat.md` and `tests/ext_conformance/reports/pipeline/`
 4. **Sub-100ms load times**: extensions load in <100ms (P95) with no JIT warmup
 
 Policy preset quick-start:
@@ -1790,7 +1957,7 @@ A: This is an authorized Rust port of [Pi Agent](https://github.com/badlogic/pi)
 A: Startup time matters when you're in a terminal all day. Rust gives us <100ms startup vs 500ms+ for Node.js. Plus, no runtime dependencies to manage.
 
 **Q: Can I use providers beyond Anthropic (OpenAI/Gemini/Cohere/Azure/Bedrock/Vertex/Copilot/GitLab)?**
-A: Yes. Native providers include OpenAI (Chat + Responses), Gemini, Cohere, Azure OpenAI, Amazon Bedrock, Vertex AI, GitHub Copilot, and GitLab Duo. Set the provider-specific credentials (for example `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `COHERE_API_KEY`, `AZURE_OPENAI_API_KEY`, AWS credentials for Bedrock, `GITHUB_COPILOT_API_KEY`/`GITHUB_TOKEN`, or `GITLAB_TOKEN`/`GITLAB_API_KEY`) and select via `--provider`/`--model`.
+A: Yes. Native providers include OpenAI (Chat + Responses), Gemini, Cohere, Azure OpenAI, Amazon Bedrock, Vertex AI, GitHub Copilot, and GitLab Duo. Pi also supports many OpenAI-compatible presets (for example Groq, OpenRouter, Mistral, Together, DeepSeek, Cerebras, DeepInfra, Alibaba/Qwen, and Moonshot/Kimi). Set provider credentials and choose via `--provider`/`--model`; run `pi --list-providers` to see the current canonical IDs and env keys.
 
 **Q: How do sessions work?**
 A: Each session is a JSONL file with message entries. Sessions are per-project (based on working directory) and support branching via parent references.
@@ -1817,7 +1984,7 @@ A: Pi maintains a SQLite index of all session files. When you run `pi -c`, it qu
 A: Every hostcall from an extension is checked against the active capability policy before execution. Dangerous capabilities (`exec`, `env`) are denied by default under the `safe` policy, require a user prompt under `balanced`, and are allowed under `permissive`. Denied calls return an error to the extension's Promise. Pi also blocks extensions from reading sensitive environment variables (API keys, credentials, tokens) regardless of policy.
 
 **Q: Does Pi work with self-hosted or proxied LLMs?**
-A: Yes. Point any provider at a custom base URL via `models.json` or `--base-url`. Pi normalizes the URL path per API type and applies compat config overrides for any field name or feature differences. This works with vLLM, Ollama, LiteLLM, and similar OpenAI-compatible servers.
+A: Yes. Point any provider at a custom base URL via `models.json`. Pi normalizes URL paths per API type and applies compatibility overrides for field-name and feature differences. This works with vLLM, Ollama, LiteLLM, and similar OpenAI-compatible servers.
 
 ---
 
@@ -1828,7 +1995,7 @@ A: Yes. Point any provider at a custom base URL via `models.json` or `--base-url
 | **Language** | Rust | TypeScript | Python | Electron |
 | **Startup** | <100ms | ~1s | ~2s | ~5s |
 | **Memory** | <50MB | ~200MB | ~150MB | ~500MB |
-| **Providers** | Anthropic + OpenAI/Responses + Gemini/Cohere + Azure/Bedrock/Vertex + Copilot/GitLab | Anthropic | Many | Many |
+| **Providers** | Anthropic + OpenAI/Responses + Gemini/Cohere + Azure/Bedrock/Vertex + Copilot/GitLab + OpenAI-compatible presets | Anthropic | Many | Many |
 | **Tools** | 7 built-in | Many | File-focused | IDE-integrated |
 | **Sessions** | JSONL tree | Proprietary | Git-based | Proprietary |
 | **Open source** | Yes | Yes | Yes | No |
@@ -2023,10 +2190,10 @@ Each entry below includes the document name, purpose, bottom-line takeaway, and 
 - `docs/models.md` - Purpose: model catalog behavior, selection, and overrides. Bottom line: model resolution logic is documented here. Link: [View](docs/models.md)
 - `docs/non-mock-rubric.json` - Purpose: rubric defining non-mock testing expectations. Bottom line: use this to gate real-behavior evidence quality. Link: [View](docs/non-mock-rubric.json)
 - `docs/packages.md` - Purpose: package installation and package-content conventions. Bottom line: package usage and structure are defined here. Link: [View](docs/packages.md)
-- `docs/dropin-certification-contract.json` - Purpose: strict drop-in certification contract and gate thresholds. Bottom line: strict replacement messaging is allowed only when this contract is satisfied and the verdict artifact is `CERTIFIED`. Link: [View](docs/dropin-certification-contract.json)
+- `docs/dropin-certification-contract.json` - Purpose: strict drop-in certification contract and gate thresholds. Bottom line: strict replacement messaging is controlled by this contract and its hard gates. Link: [View](docs/dropin-certification-contract.json)
 - `docs/dropin-parity-gap-ledger.json` - Purpose: machine-readable ledger of known drop-in parity gaps and severity. Bottom line: unresolved critical/high gaps block strict replacement messaging. Link: [View](docs/dropin-parity-gap-ledger.json)
 - `docs/integrator-migration-playbook.md` - Purpose: operator/integrator migration and rollback playbook for moving from TypeScript Pi to Rust Pi. Bottom line: use this to run staged, evidence-backed migrations. Link: [View](docs/integrator-migration-playbook.md)
-- `docs/parity-certification.json` - Purpose: machine-readable parity progress snapshot. Bottom line: informational status only; strict replacement release claims are controlled by the drop-in contract plus verdict artifact. Link: [View](docs/parity-certification.json)
+- `docs/parity-certification.json` - Purpose: machine-readable parity progress snapshot. Bottom line: informational status only; strict replacement release claims remain controlled by the drop-in contract and parity-gap closure status. Link: [View](docs/parity-certification.json)
 - `docs/program-governance.md` - Purpose: governance model for roadmap, gates, and ownership. Bottom line: governance decisions and responsibilities are defined here. Link: [View](docs/program-governance.md)
 - `docs/prompt-templates.md` - Purpose: prompt template system and usage guide. Bottom line: reusable prompt behaviors are managed via this doc. Link: [View](docs/prompt-templates.md)
 - `docs/sdk.md` - Purpose: SDK cookbook and migration guide for embedding Pi programmatically. Bottom line: use this for copy/paste Rust equivalents of TypeScript SDK workflows. Link: [View](docs/sdk.md)
