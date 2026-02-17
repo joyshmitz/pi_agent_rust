@@ -1641,8 +1641,8 @@ See `docs/testing-policy.md` and `docs/releasing.md` for normative policy detail
 For day-to-day implementation, use targeted checks to keep iteration fast. Reserve definitive
 benchmark conclusions for integration boundaries where full evidence is regenerated.
 
-- **Fast loop (non-authoritative):** file-scoped `cargo fmt --check` and targeted `cargo test --test ...`.
-- **Definitive pass (authoritative):** offload heavy runs with `rch exec -- ...`, then require
+- **Fast loop (non-authoritative):** file-scoped `cargo fmt --check` and targeted test replays (`rch exec -- cargo test --test ...` when compilation is non-trivial).
+- **Definitive pass (authoritative):** offload heavy runs with strict remote gating (`rch exec -- ...` or script wrappers with `--require-rch`), then require
   updated evidence artifacts:
   - `tests/perf/reports/phase1_matrix_validation.json`
   - `tests/full_suite_gate/full_suite_verdict.json`
@@ -2022,10 +2022,10 @@ A: Yes. Point any provider at a custom base URL via `models.json`. Pi normalizes
 ### Building
 
 ```bash
-cargo build           # Debug build
-cargo build --release # Release build (optimized)
-cargo test           # Run tests
-cargo clippy         # Lint check
+rch exec -- cargo build           # Debug build (remote offload)
+rch exec -- cargo build --release # Release build (optimized, remote offload)
+rch exec -- cargo test            # Run tests (remote offload)
+rch exec -- cargo clippy          # Lint check (remote offload)
 ```
 
 ### Testing
@@ -2036,19 +2036,23 @@ cargo clippy         # Lint check
 ./scripts/e2e/run_all.sh --profile ci
 ./scripts/e2e/run_all.sh --rerun-from tests/e2e_results/<timestamp>/summary.json --skip-unit
 
+# Fast smoke/extension quality wrappers with strict remote enforcement
+./scripts/smoke.sh --require-rch
+./scripts/ext_quality_pipeline.sh --require-rch
+
 # Multi-agent safety: with CODEX_THREAD_ID set, run_all defaults
 # CARGO_TARGET_DIR to target/agents/<CODEX_THREAD_ID> unless overridden.
 # Set CARGO_TARGET_DIR explicitly if you want a custom shared or isolated target.
 
 # All tests
-cargo test
+rch exec -- cargo test
 
 # Specific module
-cargo test tools::tests
-cargo test sse::tests
+rch exec -- cargo test tools::tests
+rch exec -- cargo test sse::tests
 
 # Conformance tests
-cargo test conformance
+rch exec -- cargo test conformance
 ```
 
 ### Release & Publishing
