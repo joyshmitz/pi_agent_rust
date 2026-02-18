@@ -9,6 +9,9 @@
 </p>
 
 <p align="center">
+  <a href="#why-should-you-care">Why Should You Care?</a> •
+  <a href="#tldr-piopenclaw-users">TL;DR</a> •
+  <a href="#benchmark-methodology-and-claim-integrity">Methodology</a> •
   <a href="#quick-start">Quick Start</a> •
   <a href="#features">Features</a> •
   <a href="#installation">Installation</a> •
@@ -61,6 +64,77 @@ pi --continue
 # Single-shot mode (no session)
 pi -p "What does this error mean?" < error.log
 ```
+
+## Why Should You Care?
+
+If you already use Pi Agent, especially through OpenClaw, this project keeps the core workflow while upgrading the engine under the hood:
+
+- **Substantially faster in realistic end-to-end flows** (not synthetic microbenchmarks)
+- **Dramatically smaller memory footprint** in long-running sessions
+- **Materially stronger security model** for extension/tool execution
+
+Security is a first-class design goal here, not a bolt-on:
+
+- Capability-gated hostcalls (`tool`/`exec`/`http`/`session`/`ui`/`events`)
+- Policy + runtime risk + quota enforcement on the execution path
+- Structured concurrency via `asupersync` for more predictable cancellation/lifecycle behavior
+- Auditable runtime signals/ledgers for extension behavior
+
+## TL;DR (Pi/OpenClaw Users)
+
+These are the realistic secure-path numbers that matter most (large-session, end-to-end behavior):
+
+| Scenario | Rust total | Legacy Node total | Legacy Bun total | Rust advantage |
+|---|---:|---:|---:|---:|
+| Realistic 1M session | 250.29 ms | 1,238.67 ms | 700.52 ms | `4.95x` faster than Node, `2.80x` faster than Bun |
+| Realistic 5M session | 1,382.12 ms | 5,974.67 ms | 2,959.42 ms | `4.32x` faster than Node, `2.14x` faster than Bun |
+
+| Scenario | Rust RSS | Legacy Node RSS | Legacy Bun RSS | Rust memory advantage |
+|---|---:|---:|---:|---:|
+| Realistic 1M session | 67,572 KB | 820,380 KB | 875,092 KB | `12.14x` lower than Node, `12.95x` lower than Bun |
+| Realistic 5M session | 268,844 KB | 2,173,096 KB | 3,057,908 KB | `8.08x` lower than Node, `11.37x` lower than Bun |
+
+Resume/open responsiveness is also much better at scale:
+
+| Scenario | Rust open | Legacy Node open | Legacy Bun open | Rust advantage |
+|---|---:|---:|---:|---:|
+| 1M session resume | 17.59 ms | 119.76 ms | 50.83 ms | `6.81x` faster than Node, `2.89x` faster than Bun |
+| 5M session resume | 58.68 ms | 396.41 ms | 155.63 ms | `6.76x` faster than Node, `2.65x` faster than Bun |
+
+Bottom line: for real Pi/OpenClaw usage, the Rust version is now meaningfully faster, massively more memory-efficient, and substantially more secure on the execution path.
+
+<sub>Data source: `BENCHMARK_COMPARISON_BETWEEN_RUST_VERSION_AND_ORIGINAL__GPT.md` (latest secure-path refresh, 2026-02-18).</sub>
+
+## Benchmark Methodology and Claim Integrity
+
+The benchmarks cited above are intentionally designed to be realistic, reproducible, and hard to game.
+
+What we measured:
+
+- **Matched-state workloads**: resume a large session and append the same 10 messages.
+- **Realistic E2E workloads**: resume + append + extension activity + slash-style state changes + forks + exports + compactions.
+- **Scale levels**: from `100k` up to `5M` token-class session states.
+- **Startup/readiness**: command-level readiness (`--help`, `--version`) separately from long-session workflows.
+
+How we kept comparisons fair:
+
+- **Two scopes** in the benchmark report:
+  - apples-to-apples (`pi_agent_rust` vs legacy `coding-agent`)
+  - apples-to-oranges (legacy stack components included where legacy behavior is outsourced)
+- **Release-mode binaries** and repeated runs per matrix cell.
+- **No paid-provider noise** in core latency/footprint tables (provider-call costs are excluded from these core comparisons).
+
+How we kept claims honest:
+
+- **Security controls stayed on** during secure-path measurements (no policy/risk/quota bypasses for speed claims).
+- **Raw artifacts are preserved** (JSON/trace/time outputs) and called out in the benchmark report.
+- **Blockers are explicitly disclosed**: when direct legacy reruns were blocked by missing workspace deps, we state that and compare against prior validated legacy artifacts instead of pretending reruns succeeded.
+- **Interpretation notes are explicit**: the report distinguishes baseline sections vs fresh reruns so readers can see exactly which values came from which run set.
+- **Reproducibility over marketing**: methodology, caveats, and known limits are included alongside wins.
+
+If you want full details, see:
+
+- `BENCHMARK_COMPARISON_BETWEEN_RUST_VERSION_AND_ORIGINAL__GPT.md` (methodology + results + caveats + raw artifact paths)
 
 ## Why Pi?
 
@@ -380,7 +454,7 @@ The installer is idempotent and supports a migration path from TypeScript Pi:
 - Record state for clean uninstall/restore
 
 Notable installer flags:
-- `--offline`: skip network preflight checks (install still needs network unless using local artifacts/source cache)
+- `--offline [TARBALL]`: enforce offline mode; optional local artifact path (`.tar.gz`, `.tar.xz`, `.zip`, or raw binary)
 - `--artifact-url`: force a specific release artifact URL
 - `--checksum` / `--checksum-url`: override checksum source for explicit artifacts
 - `--sigstore-bundle-url`: override Sigstore bundle URL used by `cosign verify-blob`
@@ -388,11 +462,17 @@ Notable installer flags:
 - `--no-completions`: disable completion installation
 - `--no-agent-skills`: skip automatic installation of the `pi-agent-rust` skill into `~/.claude/skills/` and `~/.codex/skills/`
 - `--no-verify`: skip checksum + signature verification (testing only)
-- `--artifact-url` without `--version` uses a synthetic tag for release mode only; if the artifact download fails, install exits instead of attempting source fallback
+- `--artifact-url` without `--version` uses a synthetic tag for release mode only; if artifact download fails, install exits instead of attempting source fallback
+- Installer honors `HTTPS_PROXY` / `HTTP_PROXY` for all network fetches
 
 By default, the installer also installs a `pi-agent-rust` skill for both Claude Code and Codex CLI:
 - Claude Code: `~/.claude/skills/pi-agent-rust/SKILL.md`
 - Codex CLI: `~/.codex/skills/pi-agent-rust/SKILL.md` (or `$CODEX_HOME/skills/pi-agent-rust/SKILL.md` if `CODEX_HOME` is set)
+
+It also auto-configures pre-tool hooks when supported:
+- Claude Code: merges `PreToolUse` `Bash` hook into `settings.json`
+- Gemini CLI: merges `BeforeTool` `run_shell_command` hook into `settings.json`
+- Codex CLI: reported as unsupported (no pre-exec hook API)
 
 Installer regression harness (options + checksum + signature + completions):
 
@@ -454,8 +534,8 @@ Pi has minimal runtime dependencies:
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/uninstall.sh" | bash
 ```
 
-By default, uninstall removes installer-managed Rust binaries/aliases and
-restores a migrated TypeScript `pi` if one was preserved.
+By default, uninstall removes installer-managed Rust binaries/aliases, skill directories,
+and Claude/Gemini hook entries, then restores a migrated TypeScript `pi` if one was preserved.
 
 ---
 
