@@ -1721,6 +1721,7 @@ mod tests {
         let provider = handle.session().agent.provider();
         assert_eq!(provider.name(), "openai");
         assert_eq!(provider.model_id(), "gpt-4o");
+        // gpt-4o is non-reasoning, so Low is clamped to Off.
         assert_eq!(
             handle.session().agent.stream_options().thinking_level,
             Some(crate::model::ThinkingLevel::Off)
