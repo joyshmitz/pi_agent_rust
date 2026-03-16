@@ -8,13 +8,31 @@
  * MUST be run from the pi-mono root (for node_modules resolution).
  */
 
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 // Resolve pi-mono root relative to this script's location
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const PI_MONO_ROOT = path.resolve(__dirname, "../../../legacy_pi_mono_code/pi-mono");
+
+function resolvePiMonoRoot(): string {
+	const candidates = [
+		process.env.PI_MONO_ROOT,
+		"/data/projects/pi-mono",
+		path.resolve(__dirname, "../../../legacy_pi_mono_code/pi-mono"),
+	].filter((value): value is string => Boolean(value));
+
+	for (const candidate of candidates) {
+		if (fs.existsSync(candidate)) {
+			return path.resolve(candidate);
+		}
+	}
+
+	throw new Error(`Unable to resolve pi-mono root; checked: ${candidates.join(", ")}`);
+}
+
+const PI_MONO_ROOT = resolvePiMonoRoot();
 
 // Import directly from the built loader to avoid pulling in the full package
 // (which transitively requires AWS/Smithy/etc)

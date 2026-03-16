@@ -9,8 +9,15 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ARTIFACTS="${1:-$SCRIPT_DIR/../artifacts}"
 HARNESS="$SCRIPT_DIR/load_extension.ts"
-PI_MONO_ROOT="$SCRIPT_DIR/../../../legacy_pi_mono_code/pi-mono"
 BUN="/home/ubuntu/.bun/bin/bun"
+
+if [[ -n "${PI_MONO_ROOT:-}" ]]; then
+    PI_MONO_ROOT="$PI_MONO_ROOT"
+elif [[ -d "/data/projects/pi-mono" ]]; then
+    PI_MONO_ROOT="/data/projects/pi-mono"
+else
+    PI_MONO_ROOT="$SCRIPT_DIR/../../../legacy_pi_mono_code/pi-mono"
+fi
 
 export NODE_PATH="$PI_MONO_ROOT/node_modules"
 

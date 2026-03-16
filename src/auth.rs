@@ -1713,11 +1713,14 @@ pub fn start_oauth_callback_server_random_port() -> Result<(OAuthCallbackServer,
         ))
     })?;
 
-    let port = listener.local_addr().map_err(|e| {
-        Error::auth(format!(
-            "Failed to get local address of OAuth callback listener: {e}"
-        ))
-    })?.port();
+    let port = listener
+        .local_addr()
+        .map_err(|e| {
+            Error::auth(format!(
+                "Failed to get local address of OAuth callback listener: {e}"
+            ))
+        })?
+        .port();
 
     let redirect_uri = format!("http://localhost:{port}/callback");
 

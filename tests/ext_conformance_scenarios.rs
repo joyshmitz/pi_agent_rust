@@ -3419,6 +3419,13 @@ fn ts_default_mock_spec() -> PathBuf {
 }
 
 fn pi_mono_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("PI_MONO_ROOT") {
+        return PathBuf::from(root);
+    }
+    let fork_root = PathBuf::from("/data/projects/pi-mono");
+    if fork_root.exists() {
+        return fork_root;
+    }
     project_root().join("legacy_pi_mono_code/pi-mono")
 }
 

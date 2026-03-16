@@ -1485,30 +1485,36 @@ pub mod normalization {
     pub struct NormalizationContext {
         /// Absolute path to the pi_agent_rust repository root.
         pub project_root: String,
-        /// Absolute path to `legacy_pi_mono_code/pi-mono`.
+        /// Absolute path to the resolved pi-mono checkout.
         pub pi_mono_root: String,
         /// Working directory used during the conformance run.
         pub cwd: String,
+    }
+
+    fn default_pi_mono_root(project_root: &Path) -> PathBuf {
+        if let Some(root) = std::env::var_os("PI_MONO_ROOT") {
+            return PathBuf::from(root);
+        }
+
+        let fork_root = PathBuf::from("/data/projects/pi-mono");
+        if fork_root.exists() {
+            return fork_root;
+        }
+
+        project_root.join("legacy_pi_mono_code").join("pi-mono")
     }
 
     impl NormalizationContext {
         /// Build from a working directory, auto-detecting project roots.
         #[must_use]
         pub fn from_cwd(cwd: &Path) -> Self {
-            let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            let project_root_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .canonicalize()
-                .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
-                .display()
-                .to_string();
-            let pi_mono_root = PathBuf::from(&project_root)
-                .join("legacy_pi_mono_code")
-                .join("pi-mono")
+                .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+            let project_root = project_root_path.display().to_string();
+            let pi_mono_root = default_pi_mono_root(&project_root_path)
                 .canonicalize()
-                .unwrap_or_else(|_| {
-                    PathBuf::from(&project_root)
-                        .join("legacy_pi_mono_code")
-                        .join("pi-mono")
-                })
+                .unwrap_or_else(|_| default_pi_mono_root(&project_root_path))
                 .display()
                 .to_string();
             let cwd = cwd

@@ -13,18 +13,48 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { fileURLToPath } from "node:url";
-
-import { discoverAndLoadExtensions } from "../legacy_pi_mono_code/pi-mono/packages/coding-agent/dist/core/extensions/loader.js";
-import { ExtensionRunner } from "../legacy_pi_mono_code/pi-mono/packages/coding-agent/dist/core/extensions/runner.js";
-import { wrapRegisteredTools } from "../legacy_pi_mono_code/pi-mono/packages/coding-agent/dist/core/extensions/wrapper.js";
-import { AuthStorage } from "../legacy_pi_mono_code/pi-mono/packages/coding-agent/dist/core/auth-storage.js";
-import { ModelRegistry } from "../legacy_pi_mono_code/pi-mono/packages/coding-agent/dist/core/model-registry.js";
-import { SessionManager } from "../legacy_pi_mono_code/pi-mono/packages/coding-agent/dist/core/session-manager.js";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, "..");
+
+function resolvePiMonoRoot() {
+	const candidates = [
+		process.env.PI_MONO_ROOT,
+		"/data/projects/pi-mono",
+		path.join(ROOT, "legacy_pi_mono_code/pi-mono"),
+	].filter(Boolean);
+
+	for (const candidate of candidates) {
+		if (fs.existsSync(candidate)) {
+			return path.resolve(candidate);
+		}
+	}
+
+	throw new Error(`Unable to resolve pi-mono root; checked: ${candidates.join(", ")}`);
+}
+
+const PI_MONO_ROOT = resolvePiMonoRoot();
+const loaderRoot = path.join(PI_MONO_ROOT, "packages/coding-agent/dist/core");
+const { discoverAndLoadExtensions } = await import(
+	pathToFileURL(path.join(loaderRoot, "extensions/loader.js")).href,
+);
+const { ExtensionRunner } = await import(
+	pathToFileURL(path.join(loaderRoot, "extensions/runner.js")).href,
+);
+const { wrapRegisteredTools } = await import(
+	pathToFileURL(path.join(loaderRoot, "extensions/wrapper.js")).href,
+);
+const { AuthStorage } = await import(
+	pathToFileURL(path.join(loaderRoot, "auth-storage.js")).href,
+);
+const { ModelRegistry } = await import(
+	pathToFileURL(path.join(loaderRoot, "model-registry.js")).href,
+);
+const { SessionManager } = await import(
+	pathToFileURL(path.join(loaderRoot, "session-manager.js")).href,
+);
 
 function nowNs() {
 	return process.hrtime.bigint();
@@ -331,4 +361,3 @@ async function main() {
 }
 
 await main();
-

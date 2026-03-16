@@ -360,7 +360,7 @@ pub(crate) fn enqueue_session_index_snapshot_update(
     let sessions_root = sessions_root.to_path_buf();
     let path = path.to_path_buf();
     let header = header.clone();
-    
+
     std::thread::spawn(move || {
         if let Err(err) = SessionIndex::for_sessions_root(&sessions_root).index_session_snapshot(
             &path,

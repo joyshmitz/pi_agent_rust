@@ -25,6 +25,19 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+fn default_pi_mono_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("PI_MONO_ROOT") {
+        return PathBuf::from(root);
+    }
+
+    let fork_root = PathBuf::from("/data/projects/pi-mono");
+    if fork_root.exists() {
+        return fork_root;
+    }
+
+    PathBuf::from("legacy_pi_mono_code/pi-mono")
+}
+
 #[derive(Debug, Serialize)]
 struct LegacyFixtureFile {
     schema: String,
@@ -98,8 +111,8 @@ struct Args {
     #[arg(long, default_value = "docs/extension-sample.json")]
     manifest: PathBuf,
 
-    /// Path to pinned legacy `pi-mono/` repo root
-    #[arg(long, default_value = "legacy_pi_mono_code/pi-mono")]
+    /// Path to the legacy `pi-mono/` repo root.
+    #[arg(long, default_value_os_t = default_pi_mono_root())]
     pi_mono_root: PathBuf,
 
     /// Output directory for capture artifacts (defaults to target/ for git-ignore)
