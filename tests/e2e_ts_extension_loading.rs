@@ -13,6 +13,7 @@ mod common;
 
 use pi::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle};
 use pi::extensions_js::PiJsRuntimeConfig;
+use pi::package_manager::{PackageManager, ResolveExtensionSourcesOptions};
 use pi::tools::ToolRegistry;
 use serde_json::Value;
 use std::sync::Arc;
@@ -662,6 +663,130 @@ fn ts_load_spec_with_package_json() {
     // name and version from package.json
     assert_eq!(spec.name, "my-ts-ext");
     assert_eq!(spec.version, "2.1.0");
+
+    write_jsonl_artifacts(&harness);
+}
+
+fn create_doom_like_package(
+    harness: &common::TestHarness,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let package_json = br#"{
+  "name": "doom-like-ext",
+  "version": "0.1.0",
+  "private": true,
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}"#;
+    let package_root = harness.temp_dir().join("doom-like-ext");
+    let package_json_path = harness.create_file("doom-like-ext/package.json", package_json);
+    let entry_path = harness.create_file(
+        "doom-like-ext/index.ts",
+        br#"
+import { bundled } from "./wad-finder.js";
+
+export default function init(pi: any): void {
+  pi.registerCommand("doom-inline-check", {
+    description: "Verify doom-style helper modules load from package manifests",
+    handler: async (): Promise<{ display: string }> => ({ display: bundled })
+  });
+}
+"#,
+    );
+    let helper_path = harness.create_file(
+        "doom-like-ext/wad-finder.ts",
+        br#"import { dirname, join } from "node:path"; import { fileURLToPath } from "node:url"; const __dirname = dirname(fileURLToPath(import.meta.url)); export const bundled = join(__dirname, "doom1.wad");
+"#,
+    );
+    harness.record_artifact("doom-like-ext/package.json", &package_json_path);
+    harness.record_artifact("doom-like-ext/index.ts", &entry_path);
+    harness.record_artifact("doom-like-ext/wad-finder.ts", &helper_path);
+    (package_root, entry_path)
+}
+
+#[test]
+fn ts_package_manifest_loads_doom_style_helper_out_of_box() {
+    let harness =
+        common::TestHarness::new("ts_package_manifest_loads_doom_style_helper_out_of_box");
+    let cwd = harness.temp_dir().to_path_buf();
+    let (package_root, entry_path) = create_doom_like_package(&harness);
+
+    let resolved = common::run_async({
+        let package_manager = PackageManager::new(cwd.clone());
+        let sources = vec![package_root.display().to_string()];
+        async move {
+            package_manager
+                .resolve_extension_sources(
+                    &sources,
+                    ResolveExtensionSourcesOptions {
+                        local: false,
+                        temporary: true,
+                    },
+                )
+                .await
+        }
+    })
+    .expect("resolve doom-like package");
+
+    assert_eq!(
+        resolved.extensions.len(),
+        1,
+        "expected one resolved extension"
+    );
+    assert_eq!(
+        resolved.extensions[0].path, entry_path,
+        "package manifest should resolve index.ts as the entrypoint"
+    );
+
+    let spec = JsExtensionLoadSpec::from_entry_path(&resolved.extensions[0].path)
+        .expect("load spec from resolved package entry");
+    let manager = ExtensionManager::new();
+    let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+    let js_config = PiJsRuntimeConfig {
+        cwd: cwd.display().to_string(),
+        ..Default::default()
+    };
+
+    let runtime = common::run_async({
+        let manager = manager.clone();
+        let tools = Arc::clone(&tools);
+        async move {
+            JsExtensionRuntimeHandle::start(js_config, tools, manager)
+                .await
+                .expect("start js runtime")
+        }
+    });
+    manager.set_js_runtime(runtime);
+
+    common::run_async({
+        let manager = manager.clone();
+        async move {
+            manager
+                .load_js_extensions(vec![spec])
+                .await
+                .expect("load doom-like package extension");
+        }
+    });
+
+    assert!(
+        manager.has_command("doom-inline-check"),
+        "doom-like package command should register from the manifest entry"
+    );
+
+    let result =
+        common::run_async(
+            async move { manager.execute_command("doom-inline-check", "", 5000).await },
+        )
+        .expect("execute doom-like package command");
+    let bundled = result
+        .get("display")
+        .and_then(|value| value.as_str())
+        .expect("display text");
+    let normalized = bundled.replace('\\', "/");
+    assert!(
+        normalized.ends_with("/doom1.wad"),
+        "expected doom-style helper to resolve bundled path, got {bundled}"
+    );
 
     write_jsonl_artifacts(&harness);
 }

@@ -62,6 +62,10 @@ impl CliTestHarness {
 
         // Fully isolate global/project state for determinism.
         env.insert(
+            "HOME".to_string(),
+            env_root.join("home").display().to_string(),
+        );
+        env.insert(
             "PI_CODING_AGENT_DIR".to_string(),
             env_root.join("agent").display().to_string(),
         );
@@ -107,10 +111,17 @@ impl CliTestHarness {
 
     #[cfg(unix)]
     fn global_settings_path(&self) -> PathBuf {
-        self.env
-            .get("PI_CONFIG_PATH")
-            .map(PathBuf::from)
-            .expect("PI_CONFIG_PATH set by CliTestHarness::new")
+        self.env.get("PI_CONFIG_PATH").map_or_else(
+            || {
+                PathBuf::from(
+                    self.env
+                        .get("PI_CODING_AGENT_DIR")
+                        .expect("PI_CODING_AGENT_DIR must be set"),
+                )
+                .join("settings.json")
+            },
+            PathBuf::from,
+        )
     }
 
     #[cfg(unix)]
@@ -156,6 +167,7 @@ impl CliTestHarness {
             )
     }
 
+    #[allow(clippy::too_many_lines)]
     fn run_with_stdin(&self, args: &[&str], stdin: Option<&[u8]>) -> CliResult {
         self.harness
             .log()
@@ -173,6 +185,12 @@ impl CliTestHarness {
 
         let start = Instant::now();
         let mut command = Command::new(&self.binary_path);
+        command.env_remove("ANTHROPIC_API_KEY");
+        command.env_remove("OPENAI_API_KEY");
+        command.env_remove("GEMINI_API_KEY");
+        command.env_remove("GROQ_API_KEY");
+        command.env_remove("KIMI_API_KEY");
+        command.env_remove("AZURE_OPENAI_API_KEY");
         command
             .args(args)
             .envs(self.env.clone())
@@ -338,6 +356,7 @@ fn resolve_roots_for_cli_harness(harness: &CliTestHarness) -> ResolveRoots {
     );
 
     ResolveRoots {
+        project_settings_enabled: true,
         global_settings_path: harness.global_settings_path(),
         project_settings_path: harness.project_settings_path(),
         global_base_dir,
@@ -395,6 +414,7 @@ fn count_jsonl_files(path: &Path) -> usize {
             .and_then(OsStr::to_str)
             .is_some_and(|ext| ext == "jsonl")
         {
+            println!("FOUND JSONL: {}", entry_path.display());
             count += 1;
         }
     }
@@ -596,9 +616,12 @@ fn e2e_cli_explain_extension_policy_outputs_remediation() {
         payload["dangerous_capability_opt_in"]["config_example"]["extensionPolicy"]["allowDangerous"],
         true
     );
-    assert_eq!(payload["migration_guardrails"]["default_profile"], "safe");
+    assert_eq!(
+        payload["migration_guardrails"]["default_profile"],
+        "permissive"
+    );
     assert!(
-        payload["migration_guardrails"]["opt_in_cli"]["balanced_prompt_mode"]
+        payload["migration_guardrails"]["override_cli"]["balanced_prompt_mode"]
             .as_str()
             .is_some_and(|value| value.contains("--extension-policy balanced"))
     );
@@ -656,9 +679,10 @@ fn e2e_cli_explain_extension_policy_supports_legacy_standard_alias() {
 }
 
 #[test]
-fn e2e_cli_explain_extension_policy_default_is_safe_with_guardrails() {
-    let harness =
-        CliTestHarness::new("e2e_cli_explain_extension_policy_default_is_safe_with_guardrails");
+fn e2e_cli_explain_extension_policy_default_is_permissive_with_guardrails() {
+    let harness = CliTestHarness::new(
+        "e2e_cli_explain_extension_policy_default_is_permissive_with_guardrails",
+    );
     let result = harness.run(&["--explain-extension-policy"]);
 
     assert_exit_code(&harness.harness, &result, 0);
@@ -666,10 +690,13 @@ fn e2e_cli_explain_extension_policy_default_is_safe_with_guardrails() {
 
     let payload: serde_json::Value =
         serde_json::from_str(&result.stdout).expect("explain output should be valid JSON");
-    assert_eq!(payload["requested_profile"], "safe");
-    assert_eq!(payload["effective_profile"], "safe");
+    assert_eq!(payload["requested_profile"], "permissive");
+    assert_eq!(payload["effective_profile"], "permissive");
     assert_eq!(payload["profile_source"], "default");
-    assert_eq!(payload["migration_guardrails"]["default_profile"], "safe");
+    assert_eq!(
+        payload["migration_guardrails"]["default_profile"],
+        "permissive"
+    );
     assert_eq!(
         payload["migration_guardrails"]["active_default_profile"],
         true
@@ -1039,7 +1066,8 @@ fn e2e_cli_config_show_reports_empty_packages_when_none_configured() {
 
 #[test]
 fn e2e_cli_config_show_lists_discovered_package_resources() {
-    let harness = CliTestHarness::new("e2e_cli_config_show_lists_discovered_package_resources");
+    let mut harness = CliTestHarness::new("e2e_cli_config_show_lists_discovered_package_resources");
+    harness.env.remove("PI_CONFIG_PATH");
 
     let package_root = harness.harness.create_dir("config-ui-pkg");
     fs::create_dir_all(package_root.join("extensions")).expect("create package extensions");
@@ -1098,6 +1126,78 @@ fn e2e_cli_config_show_lists_discovered_package_resources() {
     assert_contains(&harness.harness, &result.stdout, "skills/demo/SKILL.md");
     assert_contains(&harness.harness, &result.stdout, "prompts/welcome.md");
     assert_contains(&harness.harness, &result.stdout, "themes/night.json");
+}
+
+#[test]
+fn e2e_cli_config_show_surfaces_invalid_package_settings() {
+    let mut harness = CliTestHarness::new("e2e_cli_config_show_surfaces_invalid_package_settings");
+    harness.env.remove("PI_CONFIG_PATH");
+    let project_settings = harness.harness.temp_dir().join(".pi").join("settings.json");
+    fs::create_dir_all(
+        project_settings
+            .parent()
+            .expect("project settings parent must exist"),
+    )
+    .expect("create project settings dir");
+    fs::write(&project_settings, "{ invalid json\n").expect("write malformed project settings");
+    harness
+        .harness
+        .record_artifact("config.invalid.project.settings.json", &project_settings);
+
+    let result = harness.run(&["config", "--show"]);
+
+    assert_eq!(
+        result.exit_code, 1,
+        "expected invalid package settings to fail config --show\nstdout:\n{}\nstderr:\n{}",
+        result.stdout, result.stderr
+    );
+    assert_contains(
+        &harness.harness,
+        &result.stderr,
+        "Invalid JSON in settings file",
+    );
+    assert_contains(
+        &harness.harness,
+        &result.stderr,
+        &project_settings.display().to_string(),
+    );
+}
+
+#[test]
+fn e2e_cli_config_without_tty_surfaces_invalid_package_settings() {
+    let mut harness =
+        CliTestHarness::new("e2e_cli_config_without_tty_surfaces_invalid_package_settings");
+    harness.env.remove("PI_CONFIG_PATH");
+    let project_settings = harness.harness.temp_dir().join(".pi").join("settings.json");
+    fs::create_dir_all(
+        project_settings
+            .parent()
+            .expect("project settings parent must exist"),
+    )
+    .expect("create project settings dir");
+    fs::write(&project_settings, "{ invalid json\n").expect("write malformed project settings");
+    harness.harness.record_artifact(
+        "config.invalid.project.settings.plain.json",
+        &project_settings,
+    );
+
+    let result = harness.run(&["config"]);
+
+    assert_eq!(
+        result.exit_code, 1,
+        "expected invalid package settings to fail plain config\nstdout:\n{}\nstderr:\n{}",
+        result.stdout, result.stderr
+    );
+    assert_contains(
+        &harness.harness,
+        &result.stderr,
+        "Invalid JSON in settings file",
+    );
+    assert_contains(
+        &harness.harness,
+        &result.stderr,
+        &project_settings.display().to_string(),
+    );
 }
 
 #[test]
@@ -1337,7 +1437,8 @@ fn e2e_cli_list_subcommand_works_offline() {
 #[cfg(unix)]
 #[test]
 fn e2e_cli_packages_install_list_remove_offline() {
-    let harness = CliTestHarness::new("e2e_cli_packages_install_list_remove_offline");
+    let mut harness = CliTestHarness::new("e2e_cli_packages_install_list_remove_offline");
+    harness.env.remove("PI_CONFIG_PATH");
 
     harness.harness.section("install local (project)");
     harness.harness.create_dir("local-pkg");
@@ -1443,8 +1544,10 @@ fn e2e_cli_packages_install_list_remove_offline() {
 
 #[cfg(unix)]
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_cli_packages_update_respects_pinning_offline() {
-    let harness = CliTestHarness::new("e2e_cli_packages_update_respects_pinning_offline");
+    let mut harness = CliTestHarness::new("e2e_cli_packages_update_respects_pinning_offline");
+    harness.env.remove("PI_CONFIG_PATH");
 
     let git = |cwd: &Path, args: &[&str]| -> String {
         let output = Command::new("git")
@@ -2029,7 +2132,7 @@ fn e2e_cli_theme_flag_valid_builtin() {
 #[test]
 fn e2e_cli_theme_flag_invalid_path() {
     let harness = CliTestHarness::new("e2e_cli_theme_flag_invalid_path");
-    let result = harness.run(&["--theme", "nonexistent.json", "--version"]);
+    let result = harness.run(&["--theme", "nonexistent.json", "hello"]);
     assert_exit_code(&harness.harness, &result, 2);
     let combined = format!("{}\n{}", result.stdout, result.stderr);
     assert_contains_case_insensitive(&harness.harness, &combined, "theme file not found");
@@ -2194,6 +2297,103 @@ fn build_anthropic_response_chunks(text: &str) -> Vec<String> {
     ]
 }
 
+fn build_anthropic_response_chunks_from_parts(text_parts: &[&str]) -> Vec<String> {
+    let message_start = json!({
+        "type": "message_start",
+        "message": {
+            "model": "claude-sonnet-4-5",
+            "id": "msg_mock_e2e_001",
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "stop_reason": null,
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": 10,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 1,
+                "service_tier": "standard"
+            }
+        }
+    });
+    let content_start = json!({
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {"type": "text", "text": ""}
+    });
+    let content_stop = json!({
+        "type": "content_block_stop",
+        "index": 0
+    });
+    let message_delta = json!({
+        "type": "message_delta",
+        "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+        "usage": {
+            "input_tokens": 10,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "output_tokens": text_parts.len().max(1)
+        }
+    });
+
+    let mut chunks = vec![
+        format!("event: message_start\ndata: {message_start}\n\n"),
+        format!("event: content_block_start\ndata: {content_start}\n\n"),
+    ];
+
+    for (idx, text) in text_parts.iter().enumerate() {
+        if idx % 4 == 1 {
+            chunks.push("event: ping\ndata: {\"type\": \"ping\"}\n\n".to_string());
+        }
+        let content_delta = json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": text}
+        });
+        chunks.push(format!(
+            "event: content_block_delta\ndata: {content_delta}\n\n"
+        ));
+    }
+
+    chunks.push(format!(
+        "event: content_block_stop\ndata: {content_stop}\n\n"
+    ));
+    chunks.push(format!("event: message_delta\ndata: {message_delta}\n\n"));
+    chunks.push("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string());
+    chunks
+}
+
+fn split_ascii_chunks(chunks: &[String], fragment_sizes: &[usize]) -> Vec<String> {
+    assert!(
+        !fragment_sizes.is_empty(),
+        "fragment_sizes must contain at least one size"
+    );
+    assert!(
+        fragment_sizes.iter().all(|size| *size > 0),
+        "fragment_sizes must be positive"
+    );
+
+    let joined = chunks.concat();
+    assert!(
+        joined.is_ascii(),
+        "test-only chunk fragmentation currently expects ASCII payloads"
+    );
+
+    let bytes = joined.as_bytes();
+    let mut offset = 0usize;
+    let mut idx = 0usize;
+    let mut fragments = Vec::new();
+    while offset < bytes.len() {
+        let size = fragment_sizes[idx % fragment_sizes.len()];
+        let end = (offset + size).min(bytes.len());
+        fragments.push(joined[offset..end].to_string());
+        offset = end;
+        idx += 1;
+    }
+    fragments
+}
+
 /// Create a VCR cassette file and configure the harness for VCR playback.
 ///
 /// Writes a cassette JSON to a temp directory, then sets the `VCR_MODE`,
@@ -2206,10 +2406,18 @@ fn setup_vcr_anthropic(
     request_body: &serde_json::Value,
     response_text: &str,
 ) {
+    let chunks = build_anthropic_response_chunks(response_text);
+    setup_vcr_anthropic_with_chunks(harness, cassette_name, request_body, &chunks);
+}
+
+fn setup_vcr_anthropic_with_chunks(
+    harness: &mut CliTestHarness,
+    cassette_name: &str,
+    request_body: &serde_json::Value,
+    chunks: &[String],
+) {
     let cassette_dir = harness.harness.temp_path("vcr-cassettes");
     fs::create_dir_all(&cassette_dir).expect("create cassette dir");
-
-    let chunks = build_anthropic_response_chunks(response_text);
     let cassette = json!({
         "version": "1.0",
         "test_name": cassette_name,
@@ -2472,6 +2680,23 @@ fn parse_json_mode_stdout_lines(stdout: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+fn collect_json_mode_text_deltas(lines: &[serde_json::Value]) -> Vec<String> {
+    lines
+        .iter()
+        .filter(|value| value["type"] == "message_update")
+        .filter_map(|value| {
+            let event = value.get("assistantMessageEvent")?;
+            if event.get("type").and_then(serde_json::Value::as_str) != Some("text_delta") {
+                return None;
+            }
+            event
+                .get("delta")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_lines)]
 fn assert_json_mode_lifecycle_shape(lines: &[serde_json::Value]) {
     assert!(
@@ -2669,6 +2894,121 @@ fn e2e_cli_json_mode_print_flag_emits_header_and_events() {
 
     let lines = parse_json_mode_stdout_lines(&result.stdout);
     assert_json_mode_lifecycle_shape(&lines);
+}
+
+#[test]
+fn e2e_cli_json_mode_fragmented_sse_chunks_preserve_delta_text() {
+    let mut harness =
+        CliTestHarness::new("e2e_cli_json_mode_fragmented_sse_chunks_preserve_delta_text");
+
+    let response_parts = vec![
+        "seg-00|", "seg-01|", "seg-02|", "seg-03|", "seg-04|", "seg-05|", "seg-06|", "seg-07|",
+        "seg-08|", "seg-09|", "seg-10|", "seg-11|",
+    ];
+    let expected_text = response_parts.concat();
+    let request_body = json!({
+        "model": "claude-sonnet-4-5",
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Handle fragmented SSE frames."}]}
+        ],
+        "system": expected_system_prompt("JSON mode fragmented SSE test."),
+        "max_tokens": 8192,
+        "stream": true
+    });
+    let chunks = build_anthropic_response_chunks_from_parts(&response_parts);
+    let fragmented = split_ascii_chunks(&chunks, &[1, 2, 5, 3, 8, 13, 21]);
+    setup_vcr_anthropic_with_chunks(
+        &mut harness,
+        "e2e_json_mode_fragmented_sse_chunks",
+        &request_body,
+        &fragmented,
+    );
+
+    let mut args: Vec<&str> = vec![
+        "--mode",
+        "json",
+        "-p",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+    ];
+    args.extend_from_slice(PRINT_MODE_ISOLATION_FLAGS);
+    args.extend_from_slice(&[
+        "--system-prompt",
+        "JSON mode fragmented SSE test.",
+        "Handle fragmented SSE frames.",
+    ]);
+
+    let result = harness.run(&args);
+    assert_exit_code(&harness.harness, &result, 0);
+
+    let lines = parse_json_mode_stdout_lines(&result.stdout);
+    assert_json_mode_lifecycle_shape(&lines);
+    let deltas = collect_json_mode_text_deltas(&lines);
+    assert_eq!(deltas, response_parts);
+    assert_eq!(deltas.concat(), expected_text);
+}
+
+#[test]
+fn e2e_cli_json_mode_high_volume_stream_preserves_event_count_and_order() {
+    let mut harness =
+        CliTestHarness::new("e2e_cli_json_mode_high_volume_stream_preserves_event_count_and_order");
+
+    let response_parts = (0..128)
+        .map(|idx| format!("chunk-{idx:03}|"))
+        .collect::<Vec<_>>();
+    let expected_text = response_parts.concat();
+    let part_refs = response_parts
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let request_body = json!({
+        "model": "claude-sonnet-4-5",
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Stream a lot of tiny JSON mode deltas."}]}
+        ],
+        "system": expected_system_prompt("JSON mode throughput regression test."),
+        "max_tokens": 8192,
+        "stream": true
+    });
+    let chunks = build_anthropic_response_chunks_from_parts(&part_refs);
+    setup_vcr_anthropic_with_chunks(
+        &mut harness,
+        "e2e_json_mode_high_volume_stream",
+        &request_body,
+        &chunks,
+    );
+
+    let mut args: Vec<&str> = vec![
+        "--mode",
+        "json",
+        "-p",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+    ];
+    args.extend_from_slice(PRINT_MODE_ISOLATION_FLAGS);
+    args.extend_from_slice(&[
+        "--system-prompt",
+        "JSON mode throughput regression test.",
+        "Stream a lot of tiny JSON mode deltas.",
+    ]);
+
+    let result = harness.run(&args);
+    assert_exit_code(&harness.harness, &result, 0);
+
+    let lines = parse_json_mode_stdout_lines(&result.stdout);
+    assert_json_mode_lifecycle_shape(&lines);
+    let deltas = collect_json_mode_text_deltas(&lines);
+    assert_eq!(
+        deltas.len(),
+        response_parts.len(),
+        "high-volume JSON mode should emit one text_delta per SSE delta"
+    );
+    assert_eq!(deltas, response_parts);
+    assert_eq!(deltas.concat(), expected_text);
 }
 
 #[test]
@@ -2964,12 +3304,21 @@ fn e2e_cli_specific_tools_enables_subset() {
     assert_contains(&harness.harness, &result.stdout, "tools");
 }
 
-/// Default tools (read,bash,edit,write) should be enabled when no --tools/--no-tools flag.
+/// Default built-in tools should be enabled when no --tools/--no-tools flag.
 #[test]
 fn e2e_cli_default_tools_when_no_flag() {
     let mut harness = CliTestHarness::new("e2e_cli_default_tools_when_no_flag");
     let system_prompt = "Test default tools.";
-    let expected_tools = ["read", "bash", "edit", "write"];
+    let expected_tools = [
+        "read",
+        "bash",
+        "edit",
+        "write",
+        "grep",
+        "find",
+        "ls",
+        "hashline_edit",
+    ];
 
     let request_body = json!({
         "model": "claude-sonnet-4-5",

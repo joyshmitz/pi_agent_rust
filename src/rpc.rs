@@ -20,11 +20,15 @@ use crate::compaction::{
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::error_hints;
-use crate::extensions::{ExtensionManager, ExtensionUiRequest, ExtensionUiResponse};
+use crate::extensions::{
+    EXTENSION_EVENT_TIMEOUT_MS, ExtensionEventName, ExtensionManager, ExtensionUiRequest,
+    ExtensionUiResponse,
+};
 use crate::model::{
     ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent, UserMessage,
 };
-use crate::models::ModelEntry;
+use crate::models::{ModelEntry, model_requires_configured_credential, normalize_api_key_opt};
+use crate::provider_metadata::provider_ids_match;
 use crate::providers;
 use crate::resources::ResourceLoader;
 use crate::session::SessionMessage;
@@ -40,7 +44,7 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[derive(Clone)]
 pub struct RpcOptions {
@@ -130,20 +134,125 @@ fn build_user_message(text: &str, images: &[ImageContent]) -> Message {
             timestamp,
         });
     }
-    let mut blocks = vec![ContentBlock::Text(TextContent::new(text.to_string()))];
-    for image in images {
-        blocks.push(ContentBlock::Image(image.clone()));
-    }
+    let blocks = build_prompt_content_blocks(text, images);
     Message::User(UserMessage {
         content: UserContent::Blocks(blocks),
         timestamp,
     })
 }
 
+fn build_prompt_content_blocks(text: &str, images: &[ImageContent]) -> Vec<ContentBlock> {
+    let mut blocks = Vec::new();
+    if !text.trim().is_empty() {
+        blocks.push(ContentBlock::Text(TextContent::new(text.to_string())));
+    }
+    for image in images {
+        blocks.push(ContentBlock::Image(image.clone()));
+    }
+    blocks
+}
+
 fn is_extension_command(message: &str, expanded: &str) -> bool {
     // Extension commands start with `/` but are not expanded by the resource loader
     // (skills and prompt templates are expanded before queueing/sending).
     message.trim_start().starts_with('/') && message == expanded
+}
+
+fn parse_extension_command_line(message: &str) -> Option<(String, String)> {
+    let trimmed = message.trim_start();
+    let stripped = trimmed.strip_prefix('/')?;
+    let (command, args) = stripped
+        .split_once(char::is_whitespace)
+        .unwrap_or((stripped, ""));
+    let command = command.trim();
+    if command.is_empty() {
+        return None;
+    }
+    Some((command.to_string(), args.trim_start().to_string()))
+}
+
+fn resolve_extension_command(
+    message: &str,
+    expanded: &str,
+    manager: Option<&ExtensionManager>,
+) -> Option<(String, String)> {
+    if !is_extension_command(message, expanded) {
+        return None;
+    }
+
+    let manager = manager?;
+    let (command_name, args) = parse_extension_command_line(message)?;
+    manager
+        .has_command(&command_name)
+        .then_some((command_name, args))
+}
+
+fn rpc_agent_event_handler(
+    out_tx: std::sync::mpsc::Sender<String>,
+    runtime_handle: RuntimeHandle,
+    extensions: Option<ExtensionManager>,
+) -> impl Fn(AgentEvent) + Send + Sync + 'static {
+    let coalescer = extensions.map(crate::extensions::EventCoalescer::new);
+
+    move |event: AgentEvent| {
+        let serialized = if let AgentEvent::AgentEnd {
+            messages, error, ..
+        } = &event
+        {
+            json!({
+                "type": "agent_end",
+                "messages": messages,
+                "error": error,
+            })
+            .to_string()
+        } else {
+            serde_json::to_string(&event).unwrap_or_else(|err| {
+                json!({
+                    "type": "event_serialize_error",
+                    "error": err.to_string(),
+                })
+                .to_string()
+            })
+        };
+        let _ = out_tx.send(serialized);
+        if let Some(coalescer) = &coalescer {
+            coalescer.dispatch_agent_event_lazy(&event, &runtime_handle);
+        }
+    }
+}
+
+async fn rpc_dispatch_session_before_switch(
+    manager: Option<ExtensionManager>,
+    reason: &str,
+    target_session_file: Option<&str>,
+) -> bool {
+    let Some(manager) = manager else {
+        return false;
+    };
+
+    let payload = target_session_file.map_or_else(
+        || json!({ "reason": reason }),
+        |target_session_file| json!({ "reason": reason, "targetSessionFile": target_session_file }),
+    );
+
+    manager
+        .dispatch_cancellable_event(
+            ExtensionEventName::SessionBeforeSwitch,
+            Some(payload),
+            EXTENSION_EVENT_TIMEOUT_MS,
+        )
+        .await
+        .unwrap_or(false)
+}
+
+async fn rpc_dispatch_session_switch_event(manager: Option<ExtensionManager>, payload: Value) {
+    let Some(manager) = manager else {
+        return;
+    };
+
+    let _ = manager
+        .dispatch_event(ExtensionEventName::SessionSwitch, Some(payload))
+        .await;
 }
 
 fn try_send_line_with_backpressure(tx: &mpsc::Sender<String>, mut line: String) -> bool {
@@ -171,6 +280,8 @@ struct RpcSharedState {
     auto_retry_enabled: bool,
 }
 
+const MAX_RPC_PENDING_MESSAGES: usize = 128;
+
 impl RpcSharedState {
     fn new(config: &Config) -> Self {
         Self {
@@ -187,12 +298,22 @@ impl RpcSharedState {
         self.steering.len() + self.follow_up.len()
     }
 
-    fn push_steering(&mut self, message: Message) {
+    fn push_steering(&mut self, message: Message) -> Result<()> {
+        if self.pending_count() >= MAX_RPC_PENDING_MESSAGES {
+            return Err(Error::session(
+                "Steering queue is full (Do you have too many pending commands?)",
+            ));
+        }
         self.steering.push_back(message);
+        Ok(())
     }
 
-    fn push_follow_up(&mut self, message: Message) {
+    fn push_follow_up(&mut self, message: Message) -> Result<()> {
+        if self.pending_count() >= MAX_RPC_PENDING_MESSAGES {
+            return Err(Error::session("Follow-up queue is full"));
+        }
         self.follow_up.push_back(message);
+        Ok(())
     }
 
     fn pop_steering(&mut self) -> Vec<Message> {
@@ -222,12 +343,7 @@ struct RpcUiBridgeState {
     queue: VecDeque<ExtensionUiRequest>,
 }
 
-pub async fn run_stdio(mut session: AgentSession, options: RpcOptions) -> Result<()> {
-    session.agent.set_queue_modes(
-        options.config.steering_queue_mode(),
-        options.config.follow_up_queue_mode(),
-    );
-
+pub async fn run_stdio(session: AgentSession, options: RpcOptions) -> Result<()> {
     let (in_tx, in_rx) = mpsc::channel::<String>(1024);
     let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
 
@@ -240,7 +356,7 @@ pub async fn run_stdio(mut session: AgentSession, options: RpcOptions) -> Result
             match reader.read_line(&mut line) {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
-                    let line_to_send = std::mem::take(&mut line);
+                    let line_to_send = line.clone();
                     // Retry loop to handle backpressure (channel full) without dropping input.
                     // Stop when the receiver side has closed so this thread does not spin forever.
                     if !try_send_line_with_backpressure(&in_tx, line_to_send) {
@@ -281,7 +397,8 @@ pub async fn run(
     in_rx: mpsc::Receiver<String>,
     out_tx: std::sync::mpsc::Sender<String>,
 ) -> Result<()> {
-    let cx = AgentCx::for_request();
+    let cx = AgentCx::for_current_or_request();
+    let _current = asupersync::Cx::set_current(Some(cx.cx().clone()));
     let session_handle = Arc::clone(&session.session);
     let session = Arc::new(Mutex::new(session));
     let shared_state = Arc::new(Mutex::new(RpcSharedState::new(&options.config)));
@@ -301,6 +418,10 @@ pub async fn run(
             .lock(&cx)
             .await
             .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+        guard.set_queue_modes(
+            options.config.steering_queue_mode(),
+            options.config.follow_up_queue_mode(),
+        );
         let steering_fetcher = move || -> BoxFuture<'static, Vec<Message>> {
             let steering_state = Arc::clone(&steering_state);
             let steering_cx = steering_cx.clone();
@@ -321,7 +442,7 @@ pub async fn run(
                     .map_or_else(|_| Vec::new(), |mut state| state.pop_follow_up())
             })
         };
-        guard.agent.set_message_fetchers(
+        guard.agent.register_message_fetchers(
             Some(Arc::new(steering_fetcher)),
             Some(Arc::new(follow_fetcher)),
         );
@@ -360,6 +481,7 @@ pub async fn run(
         let manager_ui = (*manager).clone();
         let runtime_handle_ui = options.runtime_handle.clone();
         options.runtime_handle.spawn(async move {
+            const MAX_UI_PENDING_REQUESTS: usize = 64;
             let cx = AgentCx::for_request();
             while let Ok(request) = extension_ui_rx.recv(&cx).await {
                 if request.expects_response() {
@@ -370,8 +492,16 @@ pub async fn run(
                         if guard.active.is_none() {
                             guard.active = Some(request.clone());
                             true
-                        } else {
+                        } else if guard.queue.len() < MAX_UI_PENDING_REQUESTS {
                             guard.queue.push_back(request.clone());
+                            false
+                        } else {
+                            drop(guard);
+                            let _ = manager_ui.respond_ui(ExtensionUiResponse {
+                                id: request.id.clone(),
+                                value: None,
+                                cancelled: true,
+                            });
                             false
                         }
                     };
@@ -449,27 +579,22 @@ pub async fn run(
                     };
 
                 let expanded = options.resources.expand_input(&message);
+                let extension_command =
+                    resolve_extension_command(&message, &expanded, rpc_extension_manager.as_ref());
 
                 if is_streaming.load(Ordering::SeqCst) {
-                    let queued = {
-                        let mut state = shared_state
-                            .lock(&cx)
-                            .await
-                            .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-                        match streaming_behavior {
-                            Some(StreamingBehavior::Steer) => {
-                                state.push_steering(build_user_message(&expanded, &images));
-                                true
-                            }
-                            Some(StreamingBehavior::FollowUp) => {
-                                state.push_follow_up(build_user_message(&expanded, &images));
-                                true
-                            }
-                            None => false,
-                        }
-                    };
+                    if extension_command.is_some() {
+                        let resp = response_error(
+                            id,
+                            "prompt",
+                            "Extension commands are not allowed while agent is streaming"
+                                .to_string(),
+                        );
+                        let _ = out_tx.send(resp);
+                        continue;
+                    }
 
-                    if !queued {
+                    if streaming_behavior.is_none() {
                         let resp = response_error(
                             id,
                             "prompt",
@@ -479,12 +604,38 @@ pub async fn run(
                         continue;
                     }
 
-                    let _ = out_tx.send(response_ok(id, "prompt", None));
+                    let queued_result = {
+                        let mut state = shared_state
+                            .lock(&cx)
+                            .await
+                            .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
+                        match streaming_behavior {
+                            Some(StreamingBehavior::Steer) => {
+                                state.push_steering(build_user_message(&expanded, &images))
+                            }
+                            Some(StreamingBehavior::FollowUp) => {
+                                state.push_follow_up(build_user_message(&expanded, &images))
+                            }
+                            None => Ok(()), // Unreachable due to check above
+                        }
+                    };
+
+                    match queued_result {
+                        Ok(()) => {
+                            let _ = out_tx.send(response_ok(id, "prompt", None));
+                        }
+                        Err(err) => {
+                            let resp = response_error_with_hints(id, "prompt", &err);
+                            let _ = out_tx.send(resp);
+                        }
+                    }
                     continue;
                 }
 
                 // Ack immediately.
                 let _ = out_tx.send(response_ok(id, "prompt", None));
+
+                is_streaming.store(true, Ordering::SeqCst);
 
                 let out_tx = out_tx.clone();
                 let session = Arc::clone(&session);
@@ -492,27 +643,47 @@ pub async fn run(
                 let is_streaming = Arc::clone(&is_streaming);
                 let is_compacting = Arc::clone(&is_compacting);
                 let abort_handle_slot = Arc::clone(&abort_handle);
-                let retry_abort = retry_abort.clone();
-                let options = options.clone();
-                let expanded = expanded.clone();
                 let runtime_handle = options.runtime_handle.clone();
-                runtime_handle.spawn(async move {
-                    let cx = AgentCx::for_request();
-                    run_prompt_with_retry(
-                        session,
-                        shared_state,
-                        is_streaming,
-                        is_compacting,
-                        abort_handle_slot,
-                        out_tx,
-                        retry_abort,
-                        options,
-                        expanded,
-                        images,
-                        cx,
-                    )
-                    .await;
-                });
+                if let Some((command_name, args)) = extension_command {
+                    let command_runtime = runtime_handle.clone();
+                    let command_cx = cx.clone();
+                    runtime_handle.spawn(async move {
+                        let _current = asupersync::Cx::set_current(Some(command_cx.cx().clone()));
+                        run_extension_command(
+                            session,
+                            is_streaming,
+                            abort_handle_slot,
+                            out_tx,
+                            command_runtime,
+                            command_name,
+                            args,
+                            command_cx,
+                        )
+                        .await;
+                    });
+                } else {
+                    let retry_abort = retry_abort.clone();
+                    let options = options.clone();
+                    let expanded = expanded.clone();
+                    let prompt_cx = cx.clone();
+                    runtime_handle.spawn(async move {
+                        let _current = asupersync::Cx::set_current(Some(prompt_cx.cx().clone()));
+                        run_prompt_with_retry(
+                            session,
+                            shared_state,
+                            is_streaming,
+                            is_compacting,
+                            abort_handle_slot,
+                            out_tx,
+                            retry_abort,
+                            options,
+                            expanded,
+                            images,
+                            prompt_cx,
+                        )
+                        .await;
+                    });
+                }
             }
 
             "steer" => {
@@ -538,16 +709,26 @@ pub async fn run(
                 }
 
                 if is_streaming.load(Ordering::SeqCst) {
-                    shared_state
+                    let result = shared_state
                         .lock(&cx)
                         .await
                         .map_err(|err| Error::session(format!("state lock failed: {err}")))?
                         .push_steering(build_user_message(&expanded, &[]));
-                    let _ = out_tx.send(response_ok(id, "steer", None));
+
+                    match result {
+                        Ok(()) => {
+                            let _ = out_tx.send(response_ok(id, "steer", None));
+                        }
+                        Err(err) => {
+                            let _ = out_tx.send(response_error_with_hints(id, "steer", &err));
+                        }
+                    }
                     continue;
                 }
 
                 let _ = out_tx.send(response_ok(id, "steer", None));
+
+                is_streaming.store(true, Ordering::SeqCst);
 
                 let out_tx = out_tx.clone();
                 let session = Arc::clone(&session);
@@ -559,8 +740,9 @@ pub async fn run(
                 let options = options.clone();
                 let expanded = expanded.clone();
                 let runtime_handle = options.runtime_handle.clone();
+                let prompt_cx = cx.clone();
                 runtime_handle.spawn(async move {
-                    let cx = AgentCx::for_request();
+                    let _current = asupersync::Cx::set_current(Some(prompt_cx.cx().clone()));
                     run_prompt_with_retry(
                         session,
                         shared_state,
@@ -572,7 +754,7 @@ pub async fn run(
                         options,
                         expanded,
                         Vec::new(),
-                        cx,
+                        prompt_cx,
                     )
                     .await;
                 });
@@ -601,16 +783,26 @@ pub async fn run(
                 }
 
                 if is_streaming.load(Ordering::SeqCst) {
-                    shared_state
+                    let result = shared_state
                         .lock(&cx)
                         .await
                         .map_err(|err| Error::session(format!("state lock failed: {err}")))?
                         .push_follow_up(build_user_message(&expanded, &[]));
-                    let _ = out_tx.send(response_ok(id, "follow_up", None));
+
+                    match result {
+                        Ok(()) => {
+                            let _ = out_tx.send(response_ok(id, "follow_up", None));
+                        }
+                        Err(err) => {
+                            let _ = out_tx.send(response_error_with_hints(id, "follow_up", &err));
+                        }
+                    }
                     continue;
                 }
 
                 let _ = out_tx.send(response_ok(id, "follow_up", None));
+
+                is_streaming.store(true, Ordering::SeqCst);
 
                 let out_tx = out_tx.clone();
                 let session = Arc::clone(&session);
@@ -622,8 +814,9 @@ pub async fn run(
                 let options = options.clone();
                 let expanded = expanded.clone();
                 let runtime_handle = options.runtime_handle.clone();
+                let prompt_cx = cx.clone();
                 runtime_handle.spawn(async move {
-                    let cx = AgentCx::for_request();
+                    let _current = asupersync::Cx::set_current(Some(prompt_cx.cx().clone()));
                     run_prompt_with_retry(
                         session,
                         shared_state,
@@ -635,7 +828,7 @@ pub async fn run(
                         options,
                         expanded,
                         Vec::new(),
-                        cx,
+                        prompt_cx,
                     )
                     .await;
                 });
@@ -699,7 +892,8 @@ pub async fn run(
                                 SessionMessage::User { .. }
                                 | SessionMessage::Assistant { .. }
                                 | SessionMessage::ToolResult { .. }
-                                | SessionMessage::BashExecution { .. } => Some(msg.message.clone()),
+                                | SessionMessage::BashExecution { .. }
+                                | SessionMessage::Custom { .. } => Some(msg.message.clone()),
                                 _ => None,
                             },
                             _ => None,
@@ -751,7 +945,10 @@ pub async fn run(
                 let Some(entry) = options
                     .available_models
                     .iter()
-                    .find(|m| m.model.provider == provider && m.model.id == model_id)
+                    .find(|m| {
+                        provider_ids_match(&m.model.provider, provider)
+                            && m.model.id.eq_ignore_ascii_case(model_id)
+                    })
                     .cloned()
                 else {
                     let _ = out_tx.send(response_error(
@@ -762,16 +959,17 @@ pub async fn run(
                     continue;
                 };
 
-                let Some(key) = resolve_model_key(&options.auth, &entry) else {
+                let key = resolve_model_key(&options.auth, &entry);
+                if model_requires_configured_credential(&entry) && key.is_none() {
                     let err = Error::auth(format!(
-                        "No API key for {}/{}",
+                        "Missing credentials for {}/{}",
                         entry.model.provider, entry.model.id
                     ));
                     let _ = out_tx.send(response_error_with_hints(id, "set_model", &err));
                     continue;
-                };
+                }
 
-                {
+                let result: Result<()> = async {
                     let mut guard = session
                         .lock(&cx)
                         .await
@@ -784,7 +982,7 @@ pub async fn run(
                             .map(crate::extensions::ExtensionRegion::manager),
                     )?;
                     guard.agent.set_provider(provider_impl);
-                    let _ = guard.agent.stream_options_mut().api_key.replace(key);
+                    guard.agent.stream_options_mut().api_key.clone_from(&key);
                     guard
                         .agent
                         .stream_options_mut()
@@ -799,41 +997,55 @@ pub async fn run(
                         .thinking_level
                         .unwrap_or_default();
                     let clamped = entry.clamp_thinking_level(current_thinking);
-                    if clamped != current_thinking {
-                        apply_thinking_level(&mut guard, clamped).await?;
+                    apply_thinking_level(&mut guard, clamped).await?;
+                    Ok(())
+                }
+                .await;
+
+                match result {
+                    Ok(()) => {
+                        let _ = out_tx.send(response_ok(
+                            id,
+                            "set_model",
+                            Some(rpc_model_from_entry(&entry)),
+                        ));
+                    }
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(id, "set_model", &err));
                     }
                 }
-
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "set_model",
-                    Some(rpc_model_from_entry(&entry)),
-                ));
             }
 
             "cycle_model" => {
-                let (entry, thinking_level, is_scoped) = {
+                let result = async {
                     let mut guard = session
                         .lock(&cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let Some(result) = cycle_model_for_rpc(&mut guard, &options).await? else {
+                    cycle_model_for_rpc(&mut guard, &options).await
+                }
+                .await;
+
+                match result {
+                    Ok(Some((entry, thinking_level, is_scoped))) => {
+                        let _ = out_tx.send(response_ok(
+                            id,
+                            "cycle_model",
+                            Some(json!({
+                                "model": rpc_model_from_entry(&entry),
+                                "thinkingLevel": thinking_level.to_string(),
+                                "isScoped": is_scoped,
+                            })),
+                        ));
+                    }
+                    Ok(None) => {
                         let _ =
                             out_tx.send(response_ok(id.clone(), "cycle_model", Some(Value::Null)));
-                        continue;
-                    };
-                    result
-                };
-
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "cycle_model",
-                    Some(json!({
-                        "model": rpc_model_from_entry(&entry),
-                        "thinkingLevel": thinking_level.to_string(),
-                        "isScoped": is_scoped,
-                    })),
-                ));
+                    }
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(id, "cycle_model", &err));
+                    }
+                }
             }
 
             "set_thinking_level" => {
@@ -859,12 +1071,19 @@ pub async fn run(
                         .lock(&cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                    let runtime_provider = guard.agent.provider().name().to_string();
+                    let runtime_model_id = guard.agent.provider().model_id().to_string();
                     let level = {
                         let inner_session = guard.session.lock(&cx).await.map_err(|err| {
                             Error::session(format!("inner session lock failed: {err}"))
                         })?;
-                        current_model_entry(&inner_session, &options)
-                            .map_or(level, |entry| entry.clamp_thinking_level(level))
+                        current_or_runtime_model_entry(
+                            &inner_session,
+                            &runtime_provider,
+                            &runtime_model_id,
+                            &options,
+                        )
+                        .map_or(level, |entry| entry.clamp_thinking_level(level))
                     };
                     if let Err(err) = apply_thinking_level(&mut guard, level).await {
                         let _ = out_tx.send(response_error_with_hints(
@@ -884,11 +1103,19 @@ pub async fn run(
                         .lock(&cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                    let runtime_provider = guard.agent.provider().name().to_string();
+                    let runtime_model_id = guard.agent.provider().model_id().to_string();
                     let entry = {
                         let inner_session = guard.session.lock(&cx).await.map_err(|err| {
                             Error::session(format!("inner session lock failed: {err}"))
                         })?;
-                        current_model_entry(&inner_session, &options).cloned()
+                        current_or_runtime_model_entry(
+                            &inner_session,
+                            &runtime_provider,
+                            &runtime_model_id,
+                            &options,
+                        )
+                        .cloned()
                     };
                     let Some(entry) = entry else {
                         let _ =
@@ -912,7 +1139,14 @@ pub async fn run(
                         .position(|level| *level == current)
                         .unwrap_or(0);
                     let next = levels[(current_index + 1) % levels.len()];
-                    apply_thinking_level(&mut guard, next).await?;
+                    if let Err(err) = apply_thinking_level(&mut guard, next).await {
+                        let _ = out_tx.send(response_error_with_hints(
+                            id.clone(),
+                            "cycle_thinking_level",
+                            &err,
+                        ));
+                        continue;
+                    }
                     next
                 };
                 let _ = out_tx.send(response_ok(
@@ -939,12 +1173,20 @@ pub async fn run(
                     ));
                     continue;
                 };
-                let mut state = shared_state
+                let follow_up_mode = {
+                    let mut state = shared_state
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
+                    state.steering_mode = mode;
+                    state.follow_up_mode
+                };
+                let mut guard = session
                     .lock(&cx)
                     .await
-                    .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-                state.steering_mode = mode;
-                drop(state);
+                    .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                guard.set_queue_modes(mode, follow_up_mode);
+                drop(guard);
                 let _ = out_tx.send(response_ok(id, "set_steering_mode", None));
             }
 
@@ -965,12 +1207,20 @@ pub async fn run(
                     ));
                     continue;
                 };
-                let mut state = shared_state
+                let steering_mode = {
+                    let mut state = shared_state
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
+                    state.follow_up_mode = mode;
+                    state.steering_mode
+                };
+                let mut guard = session
                     .lock(&cx)
                     .await
-                    .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-                state.follow_up_mode = mode;
-                drop(state);
+                    .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                guard.set_queue_modes(steering_mode, mode);
+                drop(guard);
                 let _ = out_tx.send(response_ok(id, "set_follow_up_mode", None));
             }
 
@@ -1024,7 +1274,7 @@ pub async fn run(
                     ));
                     continue;
                 };
-                {
+                let result: Result<()> = async {
                     let mut guard = session
                         .lock(&cx)
                         .await
@@ -1036,8 +1286,19 @@ pub async fn run(
                         inner_session.append_session_info(Some(name.to_string()));
                     }
                     guard.persist_session().await?;
+                    Ok(())
                 }
-                let _ = out_tx.send(response_ok(id, "set_session_name", None));
+                .await;
+
+                match result {
+                    Ok(()) => {
+                        let _ = out_tx.send(response_ok(id, "set_session_name", None));
+                    }
+                    Err(err) => {
+                        let _ =
+                            out_tx.send(response_error_with_hints(id, "set_session_name", &err));
+                    }
+                }
             }
 
             "get_last_assistant_text" => {
@@ -1073,12 +1334,18 @@ pub async fn run(
                     })?;
                     inner.export_snapshot()
                 };
-                let path = export_html_snapshot(&snapshot, output_path.as_deref()).await?;
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "export_html",
-                    Some(json!({ "path": path })),
-                ));
+                match export_html_snapshot(&snapshot, output_path.as_deref()).await {
+                    Ok(path) => {
+                        let _ = out_tx.send(response_ok(
+                            id,
+                            "export_html",
+                            Some(json!({ "path": path })),
+                        ));
+                    }
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(id, "export_html", &err));
+                    }
+                }
             }
 
             "bash" => {
@@ -1113,16 +1380,17 @@ pub async fn run(
                 let command = command.to_string();
                 let id_clone = id.clone();
                 let runtime_handle = options.runtime_handle.clone();
+                let bash_cx = cx.clone();
 
                 runtime_handle.spawn(async move {
-                    let cx = AgentCx::for_request();
+                    let _current = asupersync::Cx::set_current(Some(bash_cx.cx().clone()));
                     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
                     let result = run_bash_rpc(&cwd, &command, abort_rx).await;
 
                     let response = match result {
                         Ok(result) => {
-                            if let Ok(mut guard) = session.lock(&cx).await {
-                                if let Ok(mut inner_session) = guard.session.lock(&cx).await {
+                            if let Ok(mut guard) = session.lock(&bash_cx).await {
+                                if let Ok(mut inner_session) = guard.session.lock(&bash_cx).await {
                                     inner_session.append_message(SessionMessage::BashExecution {
                                         command: command.clone(),
                                         output: result.output.clone(),
@@ -1153,7 +1421,7 @@ pub async fn run(
                     };
 
                     let _ = out_tx.send(response);
-                    if let Ok(mut running) = bash_state.lock(&cx).await {
+                    if let Ok(mut running) = bash_state.lock(&bash_cx).await {
                         if running.as_ref().is_some_and(|r| r.id == run_id) {
                             *running = None;
                         }
@@ -1178,7 +1446,7 @@ pub async fn run(
                     .and_then(Value::as_str)
                     .map(str::to_string);
 
-                let data = {
+                let result: Result<Value> = async {
                     let mut guard = session
                         .lock(&cx)
                         .await
@@ -1218,19 +1486,21 @@ pub async fn run(
                     })?;
 
                     is_compacting.store(true, Ordering::SeqCst);
-                    let result =
-                        compact(prep, provider, key, custom_instructions.as_deref()).await?;
+                    let compact_res =
+                        compact(prep, provider, key, custom_instructions.as_deref()).await;
                     is_compacting.store(false, Ordering::SeqCst);
-                    let details_value = compaction_details_to_value(&result.details)?;
+                    let result_data = compact_res?;
+
+                    let details_value = compaction_details_to_value(&result_data.details)?;
 
                     let messages = {
                         let mut inner_session = guard.session.lock(&cx).await.map_err(|err| {
                             Error::session(format!("inner session lock failed: {err}"))
                         })?;
                         inner_session.append_compaction(
-                            result.summary.clone(),
-                            result.first_kept_entry_id.clone(),
-                            result.tokens_before,
+                            result_data.summary.clone(),
+                            result_data.first_kept_entry_id.clone(),
+                            result_data.tokens_before,
                             Some(details_value.clone()),
                             None,
                         );
@@ -1239,28 +1509,47 @@ pub async fn run(
                     guard.persist_session().await?;
                     guard.agent.replace_messages(messages);
 
-                    json!({
-                        "summary": result.summary,
-                        "firstKeptEntryId": result.first_kept_entry_id,
-                        "tokensBefore": result.tokens_before,
+                    Ok(json!({
+                        "summary": result_data.summary,
+                        "firstKeptEntryId": result_data.first_kept_entry_id,
+                        "tokensBefore": result_data.tokens_before,
                         "details": details_value,
-                    })
-                };
+                    }))
+                }
+                .await;
 
-                let _ = out_tx.send(response_ok(id, "compact", Some(data)));
+                match result {
+                    Ok(data) => {
+                        let _ = out_tx.send(response_ok(id, "compact", Some(data)));
+                    }
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(id, "compact", &err));
+                    }
+                }
             }
 
             "new_session" => {
+                if rpc_dispatch_session_before_switch(rpc_extension_manager.clone(), "new", None)
+                    .await
+                {
+                    let _ = out_tx.send(response_ok(
+                        id,
+                        "new_session",
+                        Some(json!({ "cancelled": true })),
+                    ));
+                    continue;
+                }
+
                 let parent = parsed
                     .get("parentSession")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                {
+                let (session_id, previous_session_file) = {
                     let mut guard = session
                         .lock(&cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let (session_dir, provider, model_id, thinking_level) = {
+                    let (session_dir, provider, model_id, thinking_level, previous_session_file) = {
                         let inner_session = guard.session.lock(&cx).await.map_err(|err| {
                             Error::session(format!("inner session lock failed: {err}"))
                         })?;
@@ -1269,6 +1558,7 @@ pub async fn run(
                             inner_session.header.provider.clone(),
                             inner_session.header.model_id.clone(),
                             inner_session.header.thinking_level.clone(),
+                            inner_session.path.as_ref().map(|p| p.display().to_string()),
                         )
                     };
                     let mut new_session = if guard.save_enabled() {
@@ -1293,8 +1583,10 @@ pub async fn run(
                         *inner_session = new_session;
                     }
                     guard.agent.clear_messages();
-                    guard.agent.stream_options_mut().session_id = Some(session_id);
-                }
+                    guard.agent.stream_options_mut().session_id = Some(session_id.clone());
+
+                    (session_id, previous_session_file)
+                };
                 {
                     let mut state = shared_state
                         .lock(&cx)
@@ -1303,6 +1595,15 @@ pub async fn run(
                     state.steering.clear();
                     state.follow_up.clear();
                 }
+                rpc_dispatch_session_switch_event(
+                    rpc_extension_manager.clone(),
+                    json!({
+                        "reason": "new",
+                        "previousSessionFile": previous_session_file,
+                        "sessionId": session_id,
+                    }),
+                )
+                .await;
                 let _ = out_tx.send(response_ok(
                     id,
                     "new_session",
@@ -1320,11 +1621,31 @@ pub async fn run(
                     continue;
                 };
 
+                if rpc_dispatch_session_before_switch(
+                    rpc_extension_manager.clone(),
+                    "resume",
+                    Some(session_path),
+                )
+                .await
+                {
+                    let _ = out_tx.send(response_ok(
+                        id,
+                        "switch_session",
+                        Some(json!({ "cancelled": true })),
+                    ));
+                    continue;
+                }
+
                 let loaded = crate::session::Session::open(session_path).await;
                 match loaded {
                     Ok(new_session) => {
+                        let target_session_file = new_session
+                            .path
+                            .as_ref()
+                            .map_or_else(|| session_path.to_string(), |p| p.display().to_string());
                         let messages = new_session.to_messages_for_current_path();
                         let session_id = new_session.header.id.clone();
+                        let previous_session_file;
                         let mut guard = session
                             .lock(&cx)
                             .await
@@ -1334,21 +1655,37 @@ pub async fn run(
                                 guard.session.lock(&cx).await.map_err(|err| {
                                     Error::session(format!("inner session lock failed: {err}"))
                                 })?;
+                            previous_session_file =
+                                inner_session.path.as_ref().map(|p| p.display().to_string());
                             *inner_session = new_session;
                         }
                         guard.agent.replace_messages(messages);
-                        guard.agent.stream_options_mut().session_id = Some(session_id);
-                        let _ = out_tx.send(response_ok(
-                            id,
-                            "switch_session",
-                            Some(json!({ "cancelled": false })),
-                        ));
+                        guard.agent.stream_options_mut().session_id = Some(session_id.clone());
                         let mut state = shared_state
                             .lock(&cx)
                             .await
                             .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
                         state.steering.clear();
                         state.follow_up.clear();
+                        drop(state);
+                        drop(guard);
+
+                        rpc_dispatch_session_switch_event(
+                            rpc_extension_manager.clone(),
+                            json!({
+                                "reason": "resume",
+                                "previousSessionFile": previous_session_file,
+                                "targetSessionFile": target_session_file,
+                                "sessionId": session_id,
+                            }),
+                        )
+                        .await;
+
+                        let _ = out_tx.send(response_ok(
+                            id,
+                            "switch_session",
+                            Some(json!({ "cancelled": false })),
+                        ));
                     }
                     Err(err) => {
                         let _ = out_tx.send(response_error_with_hints(id, "switch_session", &err));
@@ -1362,84 +1699,88 @@ pub async fn run(
                     continue;
                 };
 
-                // Phase 1: Snapshot — brief lock to compute ForkPlan + extract metadata.
-                let (fork_plan, parent_path, session_dir, save_enabled, header_snapshot) = {
-                    let guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let inner = guard.session.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("inner session lock failed: {err}"))
-                    })?;
-                    let plan = inner.plan_fork_from_user_message(entry_id)?;
-                    let parent_path = inner.path.as_ref().map(|p| p.display().to_string());
-                    let session_dir = inner.session_dir.clone();
-                    let header = inner.header.clone();
-                    (plan, parent_path, session_dir, guard.save_enabled(), header)
-                    // Both locks released here.
-                };
+                let result: Result<String> =
+                    async {
+                        // Phase 1: Snapshot — brief lock to compute ForkPlan + extract metadata.
+                        let (fork_plan, parent_path, session_dir, save_enabled, header_snapshot) = {
+                            let guard = session.lock(&cx).await.map_err(|err| {
+                                Error::session(format!("session lock failed: {err}"))
+                            })?;
+                            let inner = guard.session.lock(&cx).await.map_err(|err| {
+                                Error::session(format!("inner session lock failed: {err}"))
+                            })?;
+                            let plan = inner.plan_fork_from_user_message(entry_id)?;
+                            let parent_path = inner.path.as_ref().map(|p| p.display().to_string());
+                            let session_dir = inner.session_dir.clone();
+                            let header = inner.header.clone();
+                            (plan, parent_path, session_dir, guard.save_enabled(), header)
+                            // Both locks released here.
+                        };
 
-                // Phase 2: Build new session without holding any lock.
-                let crate::session::ForkPlan {
-                    entries,
-                    leaf_id,
-                    selected_text,
-                } = fork_plan;
+                        // Phase 2: Build new session without holding any lock.
+                        let selected_text = fork_plan.selected_text.clone();
 
-                let mut new_session = if save_enabled {
-                    crate::session::Session::create_with_dir(session_dir)
-                } else {
-                    crate::session::Session::in_memory()
-                };
-                new_session.header.parent_session = parent_path;
-                new_session
-                    .header
-                    .provider
-                    .clone_from(&header_snapshot.provider);
-                new_session
-                    .header
-                    .model_id
-                    .clone_from(&header_snapshot.model_id);
-                new_session
-                    .header
-                    .thinking_level
-                    .clone_from(&header_snapshot.thinking_level);
-                new_session.entries = entries;
-                new_session.leaf_id = leaf_id;
-                new_session.ensure_entry_ids();
+                        let mut new_session = if save_enabled {
+                            crate::session::Session::create_with_dir(session_dir)
+                        } else {
+                            crate::session::Session::in_memory()
+                        };
+                        new_session.header.parent_session = parent_path;
+                        new_session
+                            .header
+                            .provider
+                            .clone_from(&header_snapshot.provider);
+                        new_session
+                            .header
+                            .model_id
+                            .clone_from(&header_snapshot.model_id);
+                        new_session
+                            .header
+                            .thinking_level
+                            .clone_from(&header_snapshot.thinking_level);
+                        new_session.init_from_fork_plan(fork_plan);
 
-                let messages = new_session.to_messages_for_current_path();
-                let session_id = new_session.header.id.clone();
+                        let messages = new_session.to_messages_for_current_path();
+                        let session_id = new_session.header.id.clone();
 
-                // Phase 3: Swap — brief lock to install the new session.
-                {
-                    let mut guard = session
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let mut inner = guard.session.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("inner session lock failed: {err}"))
-                    })?;
-                    *inner = new_session;
-                    drop(inner);
-                    guard.agent.replace_messages(messages);
-                    guard.agent.stream_options_mut().session_id = Some(session_id);
+                        // Phase 3: Swap — brief lock to install the new session.
+                        {
+                            let mut guard = session.lock(&cx).await.map_err(|err| {
+                                Error::session(format!("session lock failed: {err}"))
+                            })?;
+                            let mut inner = guard.session.lock(&cx).await.map_err(|err| {
+                                Error::session(format!("inner session lock failed: {err}"))
+                            })?;
+                            *inner = new_session;
+                            drop(inner);
+                            guard.agent.replace_messages(messages);
+                            guard.agent.stream_options_mut().session_id = Some(session_id);
+                        }
+
+                        {
+                            let mut state = shared_state.lock(&cx).await.map_err(|err| {
+                                Error::session(format!("state lock failed: {err}"))
+                            })?;
+                            state.steering.clear();
+                            state.follow_up.clear();
+                        }
+
+                        Ok(selected_text)
+                    }
+                    .await;
+
+                match result {
+                    Ok(selected_text) => {
+                        let _ = out_tx.send(response_ok(
+                            id,
+                            "fork",
+                            Some(json!({ "text": selected_text, "cancelled": false })),
+                        ));
+                    }
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(id, "fork", &err));
+                    }
                 }
-
-                {
-                    let mut state = shared_state
-                        .lock(&cx)
-                        .await
-                        .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-                    state.steering.clear();
-                    state.follow_up.clear();
-                }
-
-                let _ = out_tx.send(response_ok(
-                    id,
-                    "fork",
-                    Some(json!({ "text": selected_text, "cancelled": false })),
-                ));
             }
 
             "get_fork_messages" => {
@@ -1570,6 +1911,18 @@ pub async fn run(
         }
     }
 
+    // Explicitly shut down extension runtimes before the session drops.
+    // Move the region out under lock, then await shutdown after releasing
+    // the lock so we don't hold the session mutex across an async wait.
+    let extension_region = session
+        .lock(&cx)
+        .await
+        .ok()
+        .and_then(|mut guard| guard.extensions.take());
+    if let Some(ext) = extension_region {
+        ext.shutdown().await;
+    }
+
     Ok(())
 }
 
@@ -1591,6 +1944,7 @@ async fn run_prompt_with_retry(
     images: Vec<ImageContent>,
     cx: AgentCx,
 ) {
+    let _current = asupersync::Cx::set_current(Some(cx.cx().clone()));
     retry_abort.store(false, Ordering::SeqCst);
     is_streaming.store(true, Ordering::SeqCst);
 
@@ -1601,6 +1955,12 @@ async fn run_prompt_with_retry(
     let mut final_error_hints: Option<Value> = None;
 
     loop {
+        if retry_count > 0 && cx.checkpoint().is_err() {
+            final_error = Some("Retry aborted".to_string());
+            final_error_hints = None;
+            break;
+        }
+
         let (abort_handle, abort_signal) = AbortHandle::new();
         if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &cx).await {
             *guard = Some(abort_handle);
@@ -1621,48 +1981,15 @@ async fn run_prompt_with_retry(
                 }
             };
             let extensions = guard.extensions.as_ref().map(|r| r.manager().clone());
-            let runtime_for_events_handler = runtime_for_events.clone();
-            let event_tx = out_tx.clone();
-            let coalescer = extensions
-                .as_ref()
-                .map(|m| crate::extensions::EventCoalescer::new(m.clone()));
-            let event_handler = move |event: AgentEvent| {
-                let serialized = if let AgentEvent::AgentEnd {
-                    messages, error, ..
-                } = &event
-                {
-                    json!({
-                        "type": "agent_end",
-                        "messages": messages,
-                        "error": error,
-                    })
-                    .to_string()
-                } else {
-                    serde_json::to_string(&event).unwrap_or_else(|err| {
-                        json!({
-                            "type": "event_serialize_error",
-                            "error": err.to_string(),
-                        })
-                        .to_string()
-                    })
-                };
-                let _ = event_tx.send(serialized);
-                // Route non-lifecycle events through the coalescer for
-                // batched/coalesced dispatch with lazy serialization.
-                if let Some(coal) = &coalescer {
-                    coal.dispatch_agent_event_lazy(&event, &runtime_for_events_handler);
-                }
-            };
+            let event_handler =
+                rpc_agent_event_handler(out_tx.clone(), runtime_for_events, extensions);
 
             if images.is_empty() {
                 guard
                     .run_text_with_abort(message.clone(), Some(abort_signal), event_handler)
                     .await
             } else {
-                let mut blocks = vec![ContentBlock::Text(TextContent::new(message.clone()))];
-                for image in &images {
-                    blocks.push(ContentBlock::Image(image.clone()));
-                }
+                let blocks = build_prompt_content_blocks(&message, &images);
                 guard
                     .run_with_content_with_abort(blocks, Some(abort_signal), event_handler)
                     .await
@@ -1690,9 +2017,16 @@ async fn run_prompt_with_retry(
                         let context_window = if let Ok(guard) =
                             OwnedMutexGuard::lock(Arc::clone(&session), &cx).await
                         {
+                            let runtime_provider = guard.agent.provider().name().to_string();
+                            let runtime_model_id = guard.agent.provider().model_id().to_string();
                             guard.session.lock(&cx).await.map_or(None, |inner| {
-                                current_model_entry(&inner, &options)
-                                    .map(|e| e.model.context_window)
+                                current_or_runtime_model_entry(
+                                    &inner,
+                                    &runtime_provider,
+                                    &runtime_model_id,
+                                    &options,
+                                )
+                                .map(|e| e.model.context_window)
                             })
                         } else {
                             None
@@ -1746,16 +2080,31 @@ async fn run_prompt_with_retry(
 
         let delay = Duration::from_millis(delay_ms as u64);
         let start = std::time::Instant::now();
+        let mut retry_cancelled = false;
         while start.elapsed() < delay {
             if retry_abort.load(Ordering::SeqCst) {
+                retry_cancelled = true;
                 break;
             }
-            sleep(wall_now(), Duration::from_millis(50)).await;
+            if cx.checkpoint().is_err() {
+                retry_cancelled = true;
+                break;
+            }
+            let now = cx
+                .cx()
+                .timer_driver()
+                .map_or_else(wall_now, |timer| timer.now());
+            sleep(now, Duration::from_millis(50)).await;
         }
 
-        if retry_abort.load(Ordering::SeqCst) {
+        if retry_cancelled || retry_abort.load(Ordering::SeqCst) {
             final_error = Some("Retry aborted".to_string());
             break;
+        }
+
+        // Revert the failed user message before retrying to prevent context duplication.
+        if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
+            let _ = guard.revert_last_user_message().await;
         }
     }
 
@@ -1790,6 +2139,75 @@ async fn run_prompt_with_retry(
         .is_ok_and(|state| state.auto_compaction_enabled);
     if auto_compaction_enabled {
         maybe_auto_compact(session, options, is_compacting, out_tx).await;
+    }
+}
+
+async fn run_extension_command(
+    session: Arc<Mutex<AgentSession>>,
+    is_streaming: Arc<AtomicBool>,
+    abort_handle_slot: Arc<Mutex<Option<AbortHandle>>>,
+    out_tx: std::sync::mpsc::Sender<String>,
+    runtime_handle: RuntimeHandle,
+    command_name: String,
+    args: String,
+    cx: AgentCx,
+) {
+    let _current = asupersync::Cx::set_current(Some(cx.cx().clone()));
+    is_streaming.store(true, Ordering::SeqCst);
+
+    let (abort_handle, abort_signal) = AbortHandle::new();
+    if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &cx).await {
+        *guard = Some(abort_handle);
+    } else {
+        is_streaming.store(false, Ordering::SeqCst);
+        return;
+    }
+
+    let result = {
+        let mut guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
+            Ok(guard) => guard,
+            Err(err) => {
+                let err = Error::session(format!("session lock failed: {err}"));
+                let mut payload = json!({
+                    "type": "agent_end",
+                    "messages": [],
+                    "error": err.to_string(),
+                });
+                payload["errorHints"] = error_hints_value(&err);
+                let _ = out_tx.send(event(&payload));
+                is_streaming.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+        let extensions = guard
+            .extensions
+            .as_ref()
+            .map(|region| region.manager().clone());
+        let event_handler = rpc_agent_event_handler(out_tx.clone(), runtime_handle, extensions);
+        guard
+            .execute_extension_command_with_abort(
+                &command_name,
+                &args,
+                EXTENSION_EVENT_TIMEOUT_MS,
+                Some(abort_signal),
+                event_handler,
+            )
+            .await
+    };
+
+    if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &cx).await {
+        *guard = None;
+    }
+    is_streaming.store(false, Ordering::SeqCst);
+
+    if let Err(err) = result {
+        let mut payload = json!({
+            "type": "agent_end",
+            "messages": [],
+            "error": err.to_string(),
+        });
+        payload["errorHints"] = error_hints_value(&err);
+        let _ = out_tx.send(event(&payload));
     }
 }
 
@@ -1944,7 +2362,7 @@ fn rpc_parse_extension_ui_response(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    if cancelled {
+    if cancelled && active.method != "custom" {
         return Ok(ExtensionUiResponse {
             id: active.id.clone(),
             value: None,
@@ -2019,6 +2437,38 @@ fn rpc_parse_extension_ui_response(
             Ok(ExtensionUiResponse {
                 id: active.id.clone(),
                 value: Some(value.clone()),
+                cancelled: false,
+            })
+        }
+        "custom" => {
+            if let Some(value) = parsed.get("value").filter(|value| !value.is_null()) {
+                return Ok(ExtensionUiResponse {
+                    id: active.id.clone(),
+                    value: Some(value.clone()),
+                    cancelled: false,
+                });
+            }
+
+            let mut payload = serde_json::Map::new();
+            if let Some(key) = parsed.get("key").and_then(Value::as_str) {
+                payload.insert("key".to_string(), Value::String(key.to_string()));
+            }
+            if let Some(width) = parsed.get("width").and_then(Value::as_u64) {
+                payload.insert("width".to_string(), Value::from(width));
+            }
+            if let Some(close) = parsed
+                .get("cancelled")
+                .or_else(|| parsed.get("closed"))
+                .and_then(Value::as_bool)
+            {
+                payload.insert("closed".to_string(), Value::Bool(close));
+            }
+            if payload.is_empty() {
+                return Err("custom requires `value`, `key`, `width`, or `cancelled`".to_string());
+            }
+            Ok(ExtensionUiResponse {
+                id: active.id.clone(),
+                value: Some(Value::Object(payload)),
                 cancelled: false,
             })
         }
@@ -2133,6 +2583,42 @@ mod ui_bridge_tests {
         let resp = rpc_parse_extension_ui_response(&val, &active).expect("notify ok");
         assert!(!resp.cancelled);
         assert!(resp.value.is_none());
+    }
+
+    #[test]
+    fn parse_custom_accepts_value_passthrough() {
+        let active = ExtensionUiRequest::new("req-1", "custom", json!({}));
+        let val = json!({"requestId":"req-1","value":{"key":"w","width":88}});
+        let resp = rpc_parse_extension_ui_response(&val, &active).expect("custom value");
+        assert_eq!(resp.value, Some(json!({"key":"w","width":88})));
+        assert!(!resp.cancelled);
+    }
+
+    #[test]
+    fn parse_custom_accepts_key_width_fields() {
+        let active = ExtensionUiRequest::new("req-1", "custom", json!({}));
+        let val = json!({"requestId":"req-1","key":"q","width":120});
+        let resp = rpc_parse_extension_ui_response(&val, &active).expect("custom key+width");
+        assert_eq!(resp.value, Some(json!({"key":"q","width":120})));
+        assert!(!resp.cancelled);
+    }
+
+    #[test]
+    fn parse_custom_preserves_cancelled_and_width_as_payload() {
+        let active = ExtensionUiRequest::new("req-1", "custom", json!({}));
+        let val = json!({"requestId":"req-1","width":120,"cancelled":true});
+        let resp = rpc_parse_extension_ui_response(&val, &active).expect("custom cancelled+width");
+        assert_eq!(resp.value, Some(json!({"width":120,"closed":true})));
+        assert!(!resp.cancelled);
+    }
+
+    #[test]
+    fn parse_custom_treats_null_value_as_absent_for_close_payloads() {
+        let active = ExtensionUiRequest::new("req-1", "custom", json!({}));
+        let val = json!({"requestId":"req-1","value":null,"cancelled":true});
+        let resp = rpc_parse_extension_ui_response(&val, &active).expect("custom null+cancelled");
+        assert_eq!(resp.value, Some(json!({"closed":true})));
+        assert!(!resp.cancelled);
     }
 
     #[test]
@@ -2622,6 +3108,418 @@ mod retry_tests {
             );
         });
     }
+
+    #[test]
+    fn rpc_cancelled_agent_cx_aborts_retry_timeline() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let provider = Arc::new(AlwaysErrorProvider);
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let inner_session = Arc::new(Mutex::new(Session::in_memory()));
+            let agent_session = AgentSession::new(
+                agent,
+                inner_session,
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+
+            let session = Arc::new(Mutex::new(agent_session));
+
+            let mut config = Config::default();
+            config.retry = Some(crate::config::RetrySettings {
+                enabled: Some(true),
+                max_retries: Some(3),
+                base_delay_ms: Some(100),
+                max_delay_ms: Some(100),
+            });
+
+            let mut shared = RpcSharedState::new(&config);
+            shared.auto_compaction_enabled = false;
+            let shared_state = Arc::new(Mutex::new(shared));
+
+            let is_streaming = Arc::new(AtomicBool::new(false));
+            let is_compacting = Arc::new(AtomicBool::new(false));
+            let abort_handle_slot: Arc<Mutex<Option<AbortHandle>>> = Arc::new(Mutex::new(None));
+            let retry_abort = Arc::new(AtomicBool::new(false));
+            let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+
+            let auth_path = tempfile::tempdir()
+                .expect("tempdir")
+                .path()
+                .join("auth.json");
+            let auth = AuthStorage::load(auth_path).expect("auth load");
+
+            let options = RpcOptions {
+                config,
+                resources: ResourceLoader::empty(false),
+                available_models: Vec::new(),
+                scoped_models: Vec::new(),
+                auth,
+                runtime_handle,
+            };
+
+            let retry_cx = asupersync::Cx::for_testing();
+            let cancel_cx = retry_cx.clone();
+            let cancel_thread = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                cancel_cx.set_cancel_requested(true);
+            });
+
+            run_prompt_with_retry(
+                session,
+                shared_state,
+                is_streaming,
+                is_compacting,
+                abort_handle_slot,
+                out_tx,
+                retry_abort,
+                options,
+                "hello".to_string(),
+                Vec::new(),
+                AgentCx::from_cx(retry_cx),
+            )
+            .await;
+            cancel_thread.join().expect("cancel thread join");
+
+            let mut timeline = Vec::new();
+            let mut last_agent_end_error = None::<String>;
+
+            for line in out_rx.try_iter() {
+                let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                let Some(kind) = value.get("type").and_then(Value::as_str) else {
+                    continue;
+                };
+                timeline.push(kind.to_string());
+                if kind == "agent_end" {
+                    last_agent_end_error = value
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                }
+            }
+
+            let retry_start_idx = timeline
+                .iter()
+                .position(|kind| kind == "auto_retry_start")
+                .expect("missing auto_retry_start");
+            let retry_end_idx = timeline
+                .iter()
+                .position(|kind| kind == "auto_retry_end")
+                .expect("missing auto_retry_end");
+            let agent_end_idx = timeline
+                .iter()
+                .rposition(|kind| kind == "agent_end")
+                .expect("missing agent_end");
+
+            assert!(
+                retry_start_idx < retry_end_idx && retry_end_idx < agent_end_idx,
+                "unexpected retry timeline ordering: {timeline:?}"
+            );
+            assert_eq!(
+                last_agent_end_error.as_deref(),
+                Some("Retry aborted"),
+                "expected retry-abort terminal error, timeline: {timeline:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn rpc_prompt_command_inherits_cancelled_context_from_run() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let provider = Arc::new(AlwaysErrorProvider);
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let agent_session = AgentSession::new(
+                agent,
+                Arc::new(asupersync::sync::Mutex::new(Session::in_memory())),
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+
+            let mut config = Config::default();
+            config.retry = Some(crate::config::RetrySettings {
+                enabled: Some(true),
+                max_retries: Some(10),
+                base_delay_ms: Some(100),
+                max_delay_ms: Some(100),
+            });
+
+            let auth_path = tempfile::tempdir()
+                .expect("tempdir")
+                .path()
+                .join("auth.json");
+            let auth = AuthStorage::load(auth_path).expect("auth load");
+            let options = RpcOptions {
+                config,
+                resources: ResourceLoader::empty(false),
+                available_models: Vec::new(),
+                scoped_models: Vec::new(),
+                auth,
+                runtime_handle,
+            };
+
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+            let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+            let out_rx = Arc::new(std::sync::Mutex::new(out_rx));
+
+            let ambient_cx = asupersync::Cx::for_testing();
+            let cancel_cx = ambient_cx.clone();
+            let _current = asupersync::Cx::set_current(Some(ambient_cx));
+
+            let client_out_rx = Arc::clone(&out_rx);
+            let client = async move {
+                let send_cx = asupersync::Cx::for_testing();
+                in_tx
+                    .send(
+                        &send_cx,
+                        r#"{"id":"1","type":"prompt","message":"hello"}"#.to_string(),
+                    )
+                    .await
+                    .expect("send prompt command");
+
+                let ack_wait = async {
+                    loop {
+                        let recv_result = {
+                            let rx = client_out_rx.lock().expect("lock rpc output receiver");
+                            rx.try_recv()
+                        };
+
+                        match recv_result {
+                            Ok(line) => {
+                                let value: Value =
+                                    serde_json::from_str(&line).expect("parse rpc output");
+                                if value.get("type").and_then(Value::as_str) == Some("response") {
+                                    break value;
+                                }
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                panic!("prompt(cancel-inherit): output channel disconnected")
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                asupersync::time::sleep(
+                                    asupersync::time::wall_now(),
+                                    Duration::from_millis(5),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                };
+                futures::pin_mut!(ack_wait);
+                let ack = asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    Duration::from_secs(1),
+                    ack_wait,
+                )
+                .await;
+                let ack = ack.expect("prompt acknowledgement");
+                assert_eq!(ack["command"], "prompt");
+                assert_eq!(ack["success"], true, "prompt should be accepted: {ack}");
+
+                let cancel_thread = std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(20));
+                    cancel_cx.set_cancel_requested(true);
+                });
+
+                let retry_abort_wait = async {
+                    let mut timeline = Vec::new();
+                    loop {
+                        let recv_result = {
+                            let rx = client_out_rx.lock().expect("lock rpc output receiver");
+                            rx.try_recv()
+                        };
+
+                        match recv_result {
+                            Ok(line) => {
+                                let value: Value =
+                                    serde_json::from_str(&line).expect("parse rpc output");
+                                let Some(kind) = value.get("type").and_then(Value::as_str) else {
+                                    continue;
+                                };
+                                timeline.push(kind.to_string());
+                                if kind == "agent_end" {
+                                    let agent_end_error = value
+                                        .get("error")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_string);
+                                    if agent_end_error.as_deref() == Some("Retry aborted") {
+                                        break (timeline, agent_end_error);
+                                    }
+                                }
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                panic!("prompt(cancel-inherit): output channel disconnected")
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                asupersync::time::sleep(
+                                    asupersync::time::wall_now(),
+                                    Duration::from_millis(5),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                };
+                futures::pin_mut!(retry_abort_wait);
+                let (timeline, last_agent_end_error) = asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    Duration::from_secs(1),
+                    retry_abort_wait,
+                )
+                .await
+                .expect("cancelled prompt should finish before timeout");
+
+                cancel_thread.join().expect("cancel thread join");
+                let retry_start_idx = timeline
+                    .iter()
+                    .position(|kind| kind == "auto_retry_start")
+                    .expect("missing auto_retry_start");
+                let retry_end_idx = timeline
+                    .iter()
+                    .position(|kind| kind == "auto_retry_end")
+                    .expect("missing auto_retry_end");
+                let agent_end_idx = timeline
+                    .iter()
+                    .rposition(|kind| kind == "agent_end")
+                    .expect("missing agent_end");
+                assert!(
+                    retry_start_idx < retry_end_idx && retry_end_idx < agent_end_idx,
+                    "unexpected retry timeline ordering: {timeline:?}"
+                );
+                assert_eq!(
+                    last_agent_end_error.as_deref(),
+                    Some("Retry aborted"),
+                    "expected retry-abort terminal error, timeline: {timeline:?}"
+                );
+
+                drop(in_tx);
+            };
+
+            let (server_result, ()) =
+                futures::future::join(run(agent_session, options, in_rx, out_tx), client).await;
+            assert!(server_result.is_ok(), "rpc server error: {server_result:?}");
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn run_bash_rpc_cancelled_context_kills_process_tree() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let marker = tmp.path().join("leaked_child.txt");
+
+            let ambient_cx = asupersync::Cx::for_testing();
+            let cancel_cx = ambient_cx.clone();
+            let _current = asupersync::Cx::set_current(Some(ambient_cx));
+
+            let cancel_thread = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                cancel_cx.set_cancel_requested(true);
+            });
+
+            let (_abort_tx, abort_rx) = oneshot::channel();
+            let result = run_bash_rpc(
+                tmp.path(),
+                "(sleep 3; echo leaked > leaked_child.txt) & sleep 10",
+                abort_rx,
+            )
+            .await
+            .expect("cancelled rpc bash should return a result");
+
+            cancel_thread.join().expect("cancel thread");
+
+            assert!(
+                result.cancelled,
+                "expected cancelled rpc bash result: {result:?}"
+            );
+
+            std::thread::sleep(std::time::Duration::from_secs(4));
+            assert!(
+                !marker.exists(),
+                "background child was not terminated on RPC cancellation"
+            );
+        });
+    }
+
+    #[test]
+    fn rpc_spill_file_abandon_clears_path_and_unlinks_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let spill_path = tmp.path().join("partial-rpc-bash.log");
+        std::fs::write(&spill_path, b"partial output").expect("write spill file");
+
+        let mut temp_file = None;
+        let mut temp_file_path = Some(spill_path.clone());
+        let mut spill_failed = false;
+
+        abandon_bash_rpc_spill_file(&mut temp_file, &mut temp_file_path, &mut spill_failed);
+
+        assert!(spill_failed);
+        assert!(temp_file.is_none());
+        assert!(temp_file_path.is_none());
+        assert!(
+            !spill_path.exists(),
+            "abandoned RPC spill files should not be left behind"
+        );
+    }
+
+    #[test]
+    fn rpc_spill_file_hard_limit_abandons_partial_spill_file() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let spill_path = tmp.path().join("hard-limit-rpc-bash.log");
+            std::fs::write(&spill_path, b"partial output").expect("write spill file");
+
+            let spill_file = asupersync::fs::OpenOptions::new()
+                .append(true)
+                .open(&spill_path)
+                .await
+                .expect("open spill file");
+
+            let mut chunks = VecDeque::new();
+            let mut chunks_bytes = 0usize;
+            let mut total_bytes = crate::tools::BASH_FILE_LIMIT_BYTES;
+            let mut total_lines = 0usize;
+            let mut last_byte_was_newline = false;
+            let mut temp_file = Some(spill_file);
+            let mut temp_file_path = Some(spill_path.clone());
+            let mut spill_failed = false;
+
+            ingest_bash_rpc_chunk(
+                vec![b'x'],
+                &mut chunks,
+                &mut chunks_bytes,
+                &mut total_bytes,
+                &mut total_lines,
+                &mut last_byte_was_newline,
+                &mut temp_file,
+                &mut temp_file_path,
+                &mut spill_failed,
+                DEFAULT_MAX_BYTES,
+            )
+            .await;
+
+            assert!(spill_failed);
+            assert!(temp_file.is_none());
+            assert!(temp_file_path.is_none());
+            assert!(
+                !spill_path.exists(),
+                "hard-limit RPC spill files must be discarded"
+            );
+        });
+    }
 }
 
 fn should_auto_compact(tokens_before: u64, context_window: u32, reserve_tokens: u32) -> bool {
@@ -2637,17 +3535,24 @@ async fn maybe_auto_compact(
     is_compacting: Arc<AtomicBool>,
     out_tx: std::sync::mpsc::Sender<String>,
 ) {
-    let cx = AgentCx::for_request();
+    let cx = AgentCx::for_current_or_request();
     let (path_entries, context_window, reserve_tokens, settings) = {
         let Ok(guard) = session.lock(cx.cx()).await else {
             return;
         };
         let (path_entries, context_window) = {
+            let runtime_provider = guard.agent.provider().name().to_string();
+            let runtime_model_id = guard.agent.provider().model_id().to_string();
             let Ok(mut inner_session) = guard.session.lock(cx.cx()).await else {
                 return;
             };
             inner_session.ensure_entry_ids();
-            let Some(entry) = current_model_entry(&inner_session, &options) else {
+            let Some(entry) = current_or_runtime_model_entry(
+                &inner_session,
+                &runtime_provider,
+                &runtime_model_id,
+                &options,
+            ) else {
                 return;
             };
             let path_entries = inner_session
@@ -2802,10 +3707,10 @@ fn session_state(
         .as_deref()
         .zip(session.header.model_id.as_deref())
         .and_then(|(provider, model_id)| {
-            options
-                .available_models
-                .iter()
-                .find(|m| m.model.provider == provider && m.model.id == model_id)
+            options.available_models.iter().find(|m| {
+                provider_ids_match(&m.model.provider, provider)
+                    && m.model.id.eq_ignore_ascii_case(model_id)
+            })
         })
         .map(rpc_model_from_entry);
 
@@ -2866,6 +3771,10 @@ fn session_state(
     state.insert(
         "autoCompactionEnabled".to_string(),
         Value::Bool(snapshot.auto_compaction_enabled),
+    );
+    state.insert(
+        "autoRetryEnabled".to_string(),
+        Value::Bool(snapshot.auto_retry_enabled),
     );
     state.insert(
         "messageCount".to_string(),
@@ -3112,6 +4021,188 @@ struct BashRpcResult {
     full_output_path: Option<String>,
 }
 
+fn abandon_bash_rpc_spill_file(
+    temp_file: &mut Option<asupersync::fs::File>,
+    temp_file_path: &mut Option<PathBuf>,
+    spill_failed: &mut bool,
+) {
+    *spill_failed = true;
+    *temp_file = None;
+    if let Some(path) = temp_file_path.take() {
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!(
+                "Failed to remove incomplete RPC bash spill file {}: {}",
+                path.display(),
+                e
+            );
+        }
+    }
+}
+
+const fn line_count_from_newline_count(
+    total_bytes: usize,
+    newline_count: usize,
+    last_byte_was_newline: bool,
+) -> usize {
+    if total_bytes == 0 {
+        0
+    } else if last_byte_was_newline {
+        newline_count
+    } else {
+        newline_count.saturating_add(1)
+    }
+}
+
+async fn ingest_bash_rpc_chunk(
+    bytes: Vec<u8>,
+    chunks: &mut VecDeque<Vec<u8>>,
+    chunks_bytes: &mut usize,
+    total_bytes: &mut usize,
+    total_lines: &mut usize,
+    last_byte_was_newline: &mut bool,
+    temp_file: &mut Option<asupersync::fs::File>,
+    temp_file_path: &mut Option<PathBuf>,
+    spill_failed: &mut bool,
+    max_chunks_bytes: usize,
+) {
+    if bytes.is_empty() {
+        return;
+    }
+
+    *last_byte_was_newline = bytes.last().is_some_and(|byte| *byte == b'\n');
+    *total_bytes = total_bytes.saturating_add(bytes.len());
+    *total_lines = total_lines.saturating_add(memchr_iter(b'\n', &bytes).count());
+
+    // Spill to temp file if we exceed the limit
+    if *total_bytes > DEFAULT_MAX_BYTES && temp_file.is_none() && !*spill_failed {
+        let id_full = uuid::Uuid::new_v4().simple().to_string();
+        let id = &id_full[..16];
+        let path = std::env::temp_dir().join(format!("pi-rpc-bash-{id}.log"));
+
+        // Secure synchronous creation
+        let expected_inode: Option<u64> = {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+
+            match options.open(&path) {
+                Ok(file) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::MetadataExt;
+                        file.metadata().ok().map(|m| m.ino())
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        None
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to create bash temp file: {e}");
+                    None
+                }
+            }
+        };
+
+        if expected_inode.is_some() || !cfg!(unix) {
+            // Re-open async for writing
+            match asupersync::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .await
+            {
+                Ok(mut file) => {
+                    // Validate identity to prevent TOCTOU/symlink attacks
+                    let mut identity_match = true;
+                    #[cfg(unix)]
+                    if let Some(expected) = expected_inode {
+                        use std::os::unix::fs::MetadataExt;
+                        match file.metadata().await {
+                            Ok(meta) => {
+                                if meta.ino() != expected {
+                                    tracing::warn!(
+                                        "Temp file identity mismatch (possible TOCTOU attack)"
+                                    );
+                                    identity_match = false;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to stat temp file: {e}");
+                                identity_match = false;
+                            }
+                        }
+                    }
+
+                    if identity_match {
+                        // Flush existing chunks to the new file
+                        let mut failed_flush = false;
+                        for existing in chunks.iter() {
+                            use asupersync::io::AsyncWriteExt;
+                            if let Err(e) = file.write_all(existing).await {
+                                tracing::warn!("Failed to flush bash chunk to temp file: {e}");
+                                failed_flush = true;
+                                break;
+                            }
+                        }
+                        *temp_file_path = Some(path);
+                        if failed_flush {
+                            abandon_bash_rpc_spill_file(temp_file, temp_file_path, spill_failed);
+                        } else {
+                            *temp_file = Some(file);
+                        }
+                    } else {
+                        *temp_file_path = Some(path);
+                        abandon_bash_rpc_spill_file(temp_file, temp_file_path, spill_failed);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to reopen bash temp file async: {e}");
+                    *temp_file_path = Some(path);
+                    abandon_bash_rpc_spill_file(temp_file, temp_file_path, spill_failed);
+                }
+            }
+        } else {
+            *spill_failed = true;
+        }
+    }
+
+    // Write new chunk to file if we have one
+    let mut abandon_spill_file = false;
+    if let Some(file) = temp_file.as_mut() {
+        if *total_bytes <= crate::tools::BASH_FILE_LIMIT_BYTES {
+            use asupersync::io::AsyncWriteExt;
+            if let Err(e) = file.write_all(&bytes).await {
+                tracing::warn!("Failed to write bash chunk to temp file: {e}");
+                abandon_spill_file = true;
+            }
+        } else {
+            // Hard limit reached. Stop writing and close the file to release the FD.
+            if !*spill_failed {
+                tracing::warn!("Bash output exceeded hard limit; stopping file log");
+                abandon_spill_file = true;
+            }
+        }
+    }
+    if abandon_spill_file {
+        abandon_bash_rpc_spill_file(temp_file, temp_file_path, spill_failed);
+    }
+
+    // Update memory buffer
+    *chunks_bytes = chunks_bytes.saturating_add(bytes.len());
+    chunks.push_back(bytes);
+    while *chunks_bytes > max_chunks_bytes && chunks.len() > 1 {
+        if let Some(front) = chunks.pop_front() {
+            *chunks_bytes = chunks_bytes.saturating_sub(front.len());
+        }
+    }
+}
+
 async fn run_bash_rpc(
     cwd: &std::path::Path,
     command: &str,
@@ -3130,14 +4221,16 @@ async fn run_bash_rpc(
 
     fn pump_stream(
         mut reader: impl std::io::Read,
-        tx: std::sync::mpsc::Sender<StreamChunk>,
+        tx: std::sync::mpsc::SyncSender<StreamChunk>,
         kind: StreamKind,
     ) {
         let mut buf = [0u8; 8192];
         loop {
             let read = match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
                 Ok(read) => read,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
             };
             let chunk = StreamChunk {
                 kind,
@@ -3149,21 +4242,23 @@ async fn run_bash_rpc(
         }
     }
 
-    let shell = if std::path::Path::new("/bin/bash").exists() {
-        "/bin/bash"
-    } else {
-        "sh"
-    };
+    let shell = ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .unwrap_or("sh");
 
     let command = format!("trap 'code=$?; wait; exit $code' EXIT\n{command}");
 
-    let mut child = std::process::Command::new(shell)
+    let mut child = std::process::Command::new(shell);
+    child
         .arg("-c")
         .arg(&command)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    crate::tools::isolate_command_process_group(&mut child);
+    let mut child = child
         .spawn()
         .map_err(|e| Error::tool("bash", format!("Failed to spawn shell: {e}")))?;
 
@@ -3174,32 +4269,55 @@ async fn run_bash_rpc(
         return Err(Error::tool("bash", "Missing stderr".to_string()));
     };
 
-    let mut guard = crate::tools::ProcessGuard::new(child, true);
+    let mut guard =
+        crate::tools::ProcessGuard::new(child, crate::tools::ProcessCleanupMode::ProcessGroupTree);
 
-    let (tx, rx) = std::sync::mpsc::channel::<StreamChunk>();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<StreamChunk>(128);
     let tx_stdout = tx.clone();
-    let stdout_handle =
+    let _stdout_handle =
         std::thread::spawn(move || pump_stream(stdout, tx_stdout, StreamKind::Stdout));
-    let stderr_handle = std::thread::spawn(move || pump_stream(stderr, tx, StreamKind::Stderr));
+    let _stderr_handle = std::thread::spawn(move || pump_stream(stderr, tx, StreamKind::Stderr));
 
     let tick = Duration::from_millis(10);
-    let mut stdout_bytes = Vec::new();
-    let mut stderr_bytes = Vec::new();
+    let cx = asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request);
+
+    // Bounded buffer state (same logic as BashTool)
+    let mut chunks: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut chunks_bytes = 0usize;
+    let mut total_bytes = 0usize;
+    let mut total_lines = 0usize;
+    let mut last_byte_was_newline = false;
+    let mut temp_file: Option<asupersync::fs::File> = None;
+    let mut temp_file_path: Option<PathBuf> = None;
+    let max_chunks_bytes = DEFAULT_MAX_BYTES * 2;
+
     let mut cancelled = false;
+    let mut spill_failed = false;
 
     let exit_code = loop {
         while let Ok(chunk) = rx.try_recv() {
-            match chunk.kind {
-                StreamKind::Stdout => stdout_bytes.extend_from_slice(&chunk.bytes),
-                StreamKind::Stderr => stderr_bytes.extend_from_slice(&chunk.bytes),
-            }
+            ingest_bash_rpc_chunk(
+                chunk.bytes,
+                &mut chunks,
+                &mut chunks_bytes,
+                &mut total_bytes,
+                &mut total_lines,
+                &mut last_byte_was_newline,
+                &mut temp_file,
+                &mut temp_file_path,
+                &mut spill_failed,
+                max_chunks_bytes,
+            )
+            .await;
         }
 
         if !cancelled && abort_rx.try_recv().is_ok() {
             cancelled = true;
-            if let Ok(Some(status)) = guard.kill() {
-                break status.code().unwrap_or(-1);
-            }
+            let status_code = match guard.kill() {
+                Ok(Some(status)) => status.code().unwrap_or(-1),
+                _ => -1,
+            };
+            break status_code;
         }
 
         match guard.try_wait_child() {
@@ -3213,59 +4331,104 @@ async fn run_bash_rpc(
             }
         }
 
-        sleep(wall_now(), tick).await;
+        if cx.checkpoint().is_err() {
+            cancelled = true;
+            let status_code = match guard.kill() {
+                Ok(Some(status)) => status.code().unwrap_or(-1),
+                _ => -1,
+            };
+            break status_code;
+        }
+
+        let now = cx.timer_driver().map_or_else(wall_now, |timer| timer.now());
+        sleep(now, tick).await;
     };
 
-    // Drain remaining output (including anything still queued after senders drop).
-    let drain_deadline = Instant::now() + Duration::from_secs(2);
+    // Drain remaining output
+    let now_drain = cx.timer_driver().map_or_else(wall_now, |timer| timer.now());
+    let drain_deadline = now_drain + std::time::Duration::from_secs(2);
+    let mut drain_timed_out = false;
     loop {
         match rx.try_recv() {
-            Ok(chunk) => match chunk.kind {
-                StreamKind::Stdout => stdout_bytes.extend_from_slice(&chunk.bytes),
-                StreamKind::Stderr => stderr_bytes.extend_from_slice(&chunk.bytes),
-            },
+            Ok(chunk) => {
+                ingest_bash_rpc_chunk(
+                    chunk.bytes,
+                    &mut chunks,
+                    &mut chunks_bytes,
+                    &mut total_bytes,
+                    &mut total_lines,
+                    &mut last_byte_was_newline,
+                    &mut temp_file,
+                    &mut temp_file_path,
+                    &mut spill_failed,
+                    max_chunks_bytes,
+                )
+                .await;
+            }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                if Instant::now() >= drain_deadline {
+                let now = cx.timer_driver().map_or_else(wall_now, |timer| timer.now());
+                if now >= drain_deadline {
+                    drain_timed_out = true;
                     break;
                 }
-                sleep(wall_now(), tick).await;
+                if cx.checkpoint().is_err() {
+                    cancelled = true;
+                    break;
+                }
+                sleep(now, tick).await;
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
         }
     }
-    let _ = stdout_handle.join();
-    let _ = stderr_handle.join();
 
-    let mut combined = stdout_bytes;
-    combined.extend_from_slice(&stderr_bytes);
-    let full_output = String::from_utf8_lossy(&combined).to_string();
+    // Drop the receiver to close the channel.
+    // This ensures that any `tx.send()` calls in the pump threads return an error (Disconnected)
+    // instead of blocking if the channel is full.
+    // We intentionally do NOT join() the pump threads because if a background child process
+    // inherits stdout/stderr, the pipe remains open and `read()` blocks indefinitely,
+    // which would cause `join()` to hang the entire agent.
+    drop(rx);
 
-    // Write the full output to a temp file before truncation consumes the
-    // string, but only when truncation will actually be needed.
-    let total_lines = memchr_iter(b'\n', full_output.as_bytes()).count() + 1;
-    let will_truncate = total_lines > DEFAULT_MAX_LINES || full_output.len() > DEFAULT_MAX_BYTES;
-    let full_output_path = if will_truncate {
-        let id = uuid::Uuid::new_v4().simple().to_string();
-        let path = std::env::temp_dir().join(format!("pi-rpc-bash-{id}.log"));
-        asupersync::fs::write(&path, full_output.as_bytes()).await?;
-        Some(path.display().to_string())
-    } else {
-        None
-    };
+    // Explicitly drop the temp file handle to ensure any buffered data is flushed to disk
+    // before we potentially return the path to the caller.
+    drop(temp_file);
 
-    let truncation = truncate_tail(full_output, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
-    let output_text = if truncation.content.is_empty() {
+    // Construct final output from memory buffer
+    let mut combined = Vec::with_capacity(chunks_bytes);
+    for chunk in chunks {
+        combined.extend_from_slice(&chunk);
+    }
+    let tail_output = String::from_utf8_lossy(&combined).to_string();
+
+    let mut truncation = truncate_tail(tail_output, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+    if total_bytes > chunks_bytes {
+        truncation.truncated = true;
+        truncation.truncated_by = Some(crate::tools::TruncatedBy::Bytes);
+        truncation.total_bytes = total_bytes;
+        truncation.total_lines =
+            line_count_from_newline_count(total_bytes, total_lines, last_byte_was_newline);
+    } else if drain_timed_out {
+        truncation.truncated = true;
+        truncation.truncated_by = Some(crate::tools::TruncatedBy::Bytes);
+    }
+    let will_truncate = truncation.truncated;
+
+    let mut output_text = if truncation.content.is_empty() {
         "(no output)".to_string()
     } else {
         truncation.content
     };
+
+    if drain_timed_out {
+        output_text.push_str("\n... [Output truncated: drain timeout]");
+    }
 
     Ok(BashRpcResult {
         output: output_text,
         exit_code,
         cancelled,
         truncated: will_truncate,
-        full_output_path,
+        full_output_path: temp_file_path.map(|p| p.display().to_string()),
     })
 }
 
@@ -3308,12 +4471,26 @@ fn parse_prompt_images(value: Option<&Value>) -> Result<Vec<ImageContent>> {
 }
 
 fn resolve_model_key(auth: &AuthStorage, entry: &ModelEntry) -> Option<String> {
-    auth.resolve_api_key(&entry.model.provider, None)
-        .or_else(|| entry.api_key.clone())
+    normalize_api_key_opt(auth.resolve_api_key(&entry.model.provider, None))
+        .or_else(|| normalize_api_key_opt(entry.api_key.clone()))
 }
 
 fn parse_thinking_level(level: &str) -> Result<crate::model::ThinkingLevel> {
     level.parse().map_err(|err: String| Error::validation(err))
+}
+
+fn session_thinking_level(
+    session: &crate::session::Session,
+) -> Option<crate::model::ThinkingLevel> {
+    session.header.thinking_level.as_deref().and_then(|raw| {
+        raw.parse::<crate::model::ThinkingLevel>().map_or_else(
+            |_| {
+                tracing::warn!("Ignoring invalid session thinking level in RPC state: {raw}");
+                None
+            },
+            Some,
+        )
+    })
 }
 
 fn current_model_entry<'a>(
@@ -3322,32 +4499,53 @@ fn current_model_entry<'a>(
 ) -> Option<&'a ModelEntry> {
     let provider = session.header.provider.as_deref()?;
     let model_id = session.header.model_id.as_deref()?;
-    options
-        .available_models
-        .iter()
-        .find(|m| m.model.provider == provider && m.model.id == model_id)
+    model_entry_for_provider_and_id(provider, model_id, options)
+}
+
+fn current_or_runtime_model_entry<'a>(
+    session: &crate::session::Session,
+    runtime_provider: &str,
+    runtime_model_id: &str,
+    options: &'a RpcOptions,
+) -> Option<&'a ModelEntry> {
+    current_model_entry(session, options)
+        .or_else(|| model_entry_for_provider_and_id(runtime_provider, runtime_model_id, options))
+}
+
+fn model_entry_for_provider_and_id<'a>(
+    provider: &str,
+    model_id: &str,
+    options: &'a RpcOptions,
+) -> Option<&'a ModelEntry> {
+    options.available_models.iter().find(|m| {
+        provider_ids_match(&m.model.provider, provider) && m.model.id.eq_ignore_ascii_case(model_id)
+    })
 }
 
 async fn apply_thinking_level(
     guard: &mut AgentSession,
     level: crate::model::ThinkingLevel,
 ) -> Result<()> {
-    let cx = AgentCx::for_request();
+    let cx = AgentCx::for_current_or_request();
+    let level_str = level.to_string();
     {
         let mut inner_session = guard
             .session
             .lock(cx.cx())
             .await
             .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
-        inner_session.header.thinking_level = Some(level.to_string());
-        inner_session.append_thinking_level_change(level.to_string());
+        let previous = session_thinking_level(&inner_session);
+        inner_session.header.thinking_level = Some(level_str.clone());
+        if previous != Some(level) {
+            inner_session.append_thinking_level_change(level_str);
+        }
     }
     guard.agent.stream_options_mut().thinking_level = Some(level);
     guard.persist_session().await
 }
 
 async fn apply_model_change(guard: &mut AgentSession, entry: &ModelEntry) -> Result<()> {
-    let cx = AgentCx::for_request();
+    let cx = AgentCx::for_current_or_request();
     {
         let mut inner_session = guard
             .session
@@ -3443,27 +4641,57 @@ async fn cycle_model_for_rpc(
         return Ok(None);
     }
 
-    let cx = AgentCx::for_request();
+    let cx = AgentCx::for_current_or_request();
+    let runtime_provider = guard.agent.provider().name().to_string();
+    let runtime_model_id = guard.agent.provider().model_id().to_string();
     let (current_provider, current_model_id) = {
         let inner_session = guard
             .session
             .lock(cx.cx())
             .await
             .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
-        (
-            inner_session.header.provider.clone(),
-            inner_session.header.model_id.clone(),
+        current_or_runtime_model_entry(
+            &inner_session,
+            &runtime_provider,
+            &runtime_model_id,
+            options,
+        )
+        .map_or_else(
+            || {
+                (
+                    inner_session.header.provider.clone(),
+                    inner_session.header.model_id.clone(),
+                )
+            },
+            |entry| {
+                (
+                    Some(entry.model.provider.clone()),
+                    Some(entry.model.id.clone()),
+                )
+            },
         )
     };
 
     let current_index = candidates.iter().position(|entry| {
-        current_provider.as_deref() == Some(entry.model.provider.as_str())
-            && current_model_id.as_deref() == Some(entry.model.id.as_str())
+        current_provider
+            .as_deref()
+            .is_some_and(|provider| provider_ids_match(provider, &entry.model.provider))
+            && current_model_id
+                .as_deref()
+                .is_some_and(|model_id| model_id.eq_ignore_ascii_case(&entry.model.id))
     });
 
     let next_index = current_index.map_or(0, |idx| (idx + 1) % candidates.len());
 
     let next_entry = candidates[next_index].clone();
+    let key = resolve_model_key(&options.auth, &next_entry);
+    if model_requires_configured_credential(&next_entry) && key.is_none() {
+        return Err(Error::auth(format!(
+            "Missing credentials for {}/{}",
+            next_entry.model.provider, next_entry.model.id
+        )));
+    }
+
     let provider_impl = crate::providers::create_provider(
         &next_entry,
         guard
@@ -3473,13 +4701,7 @@ async fn cycle_model_for_rpc(
     )?;
     guard.agent.set_provider(provider_impl);
 
-    let key = resolve_model_key(&options.auth, &next_entry).ok_or_else(|| {
-        Error::auth(format!(
-            "No API key for {}/{}",
-            next_entry.model.provider, next_entry.model.id
-        ))
-    })?;
-    let _ = guard.agent.stream_options_mut().api_key.replace(key);
+    guard.agent.stream_options_mut().api_key.clone_from(&key);
     guard
         .agent
         .stream_options_mut()
@@ -3509,12 +4731,26 @@ async fn cycle_model_for_rpc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::{Agent, AgentConfig};
+    use crate::auth::AuthCredential;
     use crate::model::{
-        ContentBlock, ImageContent, TextContent, ThinkingLevel, UserContent, UserMessage,
+        AssistantMessage, ContentBlock, ImageContent, StopReason, TextContent, ThinkingLevel,
+        Usage, UserContent, UserMessage,
     };
-    use crate::provider::{InputType, Model, ModelCost};
+    use crate::provider::{InputType, Model, ModelCost, Provider};
+    use crate::resources::ResourceLoader;
+    use crate::session::Session;
+    use crate::tools::ToolRegistry;
+    use async_trait::async_trait;
+    use futures::stream;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::path::Path;
+    use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::sync::mpsc::{Receiver, TryRecvError};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     // -----------------------------------------------------------------------
     // Helper builders
@@ -3552,6 +4788,395 @@ mod tests {
         }
     }
 
+    fn rpc_options_with_models(available_models: Vec<ModelEntry>) -> RpcOptions {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        let auth_path = tempfile::tempdir()
+            .expect("tempdir")
+            .path()
+            .join("auth.json");
+        let auth = AuthStorage::load(auth_path).expect("auth load");
+
+        RpcOptions {
+            config: Config::default(),
+            resources: ResourceLoader::empty(false),
+            available_models,
+            scoped_models: Vec::new(),
+            auth,
+            runtime_handle,
+        }
+    }
+
+    #[derive(Debug)]
+    struct NoopProvider;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for NoopProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            let message = AssistantMessage {
+                content: Vec::new(),
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            };
+            Ok(Box::pin(stream::iter(vec![
+                Ok(crate::model::StreamEvent::Start {
+                    partial: message.clone(),
+                }),
+                Ok(crate::model::StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message,
+                }),
+            ])))
+        }
+    }
+
+    #[derive(Default)]
+    struct RpcDeadlineProbeState {
+        calls: std::sync::atomic::AtomicUsize,
+        observed_deadlines: Mutex<Vec<Option<asupersync::Time>>>,
+    }
+
+    struct RpcDeadlineProbeProvider {
+        state: Arc<RpcDeadlineProbeState>,
+    }
+
+    impl RpcDeadlineProbeProvider {
+        fn assistant_message(&self) -> AssistantMessage {
+            AssistantMessage {
+                content: Vec::new(),
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            }
+        }
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for RpcDeadlineProbeProvider {
+        fn name(&self) -> &str {
+            "deadline-probe"
+        }
+
+        fn api(&self) -> &str {
+            "deadline-probe"
+        }
+
+        fn model_id(&self) -> &str {
+            "deadline-probe-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            self.state.calls.fetch_add(1, Ordering::SeqCst);
+            let deadline = asupersync::Cx::current().and_then(|cx| cx.budget().deadline);
+            self.state
+                .observed_deadlines
+                .lock()
+                .expect("lock rpc deadline probe")
+                .push(deadline);
+
+            let message = self.assistant_message();
+            Ok(Box::pin(stream::iter(vec![
+                Ok(crate::model::StreamEvent::Start {
+                    partial: message.clone(),
+                }),
+                Ok(crate::model::StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message,
+                }),
+            ])))
+        }
+    }
+
+    fn build_test_agent_session_with_provider(
+        session: Session,
+        provider: Arc<dyn Provider>,
+    ) -> AgentSession {
+        let tools = ToolRegistry::new(&[], &std::env::current_dir().expect("current dir"), None);
+        let agent = crate::agent::Agent::new(provider, tools, crate::agent::AgentConfig::default());
+        let session = Arc::new(asupersync::sync::Mutex::new(session));
+        AgentSession::new(
+            agent,
+            session,
+            false,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        )
+    }
+
+    fn build_test_agent_session(session: Session) -> AgentSession {
+        let provider: Arc<dyn Provider> = Arc::new(NoopProvider);
+        build_test_agent_session_with_provider(session, provider)
+    }
+
+    fn build_test_rpc_options(
+        handle: &asupersync::runtime::RuntimeHandle,
+        auth_path: PathBuf,
+    ) -> RpcOptions {
+        let auth = AuthStorage::load(auth_path).expect("load auth storage");
+        RpcOptions {
+            config: Config::default(),
+            resources: ResourceLoader::empty(false),
+            available_models: Vec::new(),
+            scoped_models: Vec::new(),
+            auth,
+            runtime_handle: handle.clone(),
+        }
+    }
+
+    async fn recv_line(
+        rx: &Arc<Mutex<Receiver<String>>>,
+        label: &str,
+    ) -> std::result::Result<String, String> {
+        let start = Instant::now();
+        loop {
+            let recv_result = {
+                let rx = rx.lock().expect("lock rpc output receiver");
+                rx.try_recv()
+            };
+
+            match recv_result {
+                Ok(line) => return Ok(line),
+                Err(TryRecvError::Disconnected) => {
+                    return Err(format!("{label}: output channel disconnected"));
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+
+            if start.elapsed() > Duration::from_secs(10) {
+                return Err(format!("{label}: timed out waiting for output"));
+            }
+
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(5)).await;
+        }
+    }
+
+    fn parse_response(line: &str) -> Value {
+        serde_json::from_str(line.trim()).expect("parse JSON response")
+    }
+
+    async fn recv_response(out_rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> Value {
+        let start = Instant::now();
+
+        loop {
+            let line = recv_line(out_rx, label)
+                .await
+                .unwrap_or_else(|err| panic!("{err}"));
+            let value = parse_response(&line);
+
+            match value.get("type").and_then(Value::as_str) {
+                Some("response") => return value,
+                Some("agent_end") => {
+                    let has_error = value
+                        .get("error")
+                        .is_some_and(|error| !error.is_null() && error != "");
+                    assert!(
+                        !has_error,
+                        "{label}: unexpected agent_end error while waiting for response: {value}"
+                    );
+                }
+                _ => {}
+            }
+
+            assert!(
+                start.elapsed() <= Duration::from_secs(10),
+                "{label}: timed out waiting for RPC response"
+            );
+        }
+    }
+
+    async fn send_recv(
+        in_tx: &asupersync::channel::mpsc::Sender<String>,
+        out_rx: &Arc<Mutex<Receiver<String>>>,
+        cmd: &str,
+        label: &str,
+    ) -> Value {
+        let cx = asupersync::Cx::for_testing();
+        in_tx
+            .send(&cx, cmd.to_string())
+            .await
+            .unwrap_or_else(|_| panic!("send {label}"));
+        recv_response(out_rx, label).await
+    }
+
+    fn assert_ok(resp: &Value, command: &str) {
+        assert_eq!(resp["type"], "response", "response type for {command}");
+        assert_eq!(resp["command"], command);
+        assert_eq!(resp["success"], true, "success for {command}: {resp}");
+    }
+
+    fn assert_err(resp: &Value, command: &str) {
+        assert_eq!(resp["type"], "response", "response type for {command}");
+        assert_eq!(resp["command"], command);
+        assert_eq!(
+            resp["success"], false,
+            "expected error for {command}: {resp}"
+        );
+    }
+
+    async fn recv_ui_request(out_rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> Value {
+        let start = Instant::now();
+        loop {
+            let recv_result = {
+                let rx = out_rx.lock().expect("lock rpc output receiver");
+                rx.try_recv()
+            };
+
+            match recv_result {
+                Ok(line) => {
+                    if let Ok(val) = serde_json::from_str::<Value>(&line) {
+                        if val.get("type").and_then(Value::as_str) == Some("extension_ui_request") {
+                            return val;
+                        }
+                    }
+                }
+                Err(TryRecvError::Disconnected) => {
+                    panic!(
+                        "{label}: output channel disconnected while waiting for extension_ui_request"
+                    );
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+
+            assert!(
+                start.elapsed() <= Duration::from_secs(10),
+                "{label}: timed out waiting for extension_ui_request"
+            );
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn wait_for_custom_message(
+        in_tx: &asupersync::channel::mpsc::Sender<String>,
+        out_rx: &Arc<Mutex<Receiver<String>>>,
+        custom_type: &str,
+        label: &str,
+    ) -> Value {
+        let start = Instant::now();
+        let mut attempt = 0usize;
+
+        loop {
+            let response = send_recv(
+                in_tx,
+                out_rx,
+                &format!(r#"{{"id":"poll-{attempt}","type":"get_messages"}}"#),
+                label,
+            )
+            .await;
+            let messages = response["data"]["messages"]
+                .as_array()
+                .expect("messages array");
+            if let Some(message) = messages
+                .iter()
+                .find(|message| message["role"] == "custom" && message["customType"] == custom_type)
+            {
+                return message.clone();
+            }
+
+            assert!(
+                start.elapsed() <= Duration::from_secs(10),
+                "{label}: timed out waiting for custom message"
+            );
+            attempt = attempt.saturating_add(1);
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10)).await;
+        }
+    }
+
+    const RPC_BUSY_EXTENSION_COMMAND_EXT: &str = r#"
+export default function init(pi) {
+    pi.registerCommand("wait-confirm", {
+        description: "Block until RPC confirms",
+        handler: async () => {
+            const confirmed = await pi.ui("confirm", {
+                title: "Wait",
+                message: "Hold the command open"
+            });
+            return confirmed ? "confirmed" : "cancelled";
+        }
+    });
+}
+"#;
+
+    const RPC_QUEUE_STATE_EXTENSION_EXT: &str = r#"
+export default function init(pi) {
+    pi.registerCommand("report-queue-state", {
+        description: "Report queue modes visible to extensions",
+        handler: async () => {
+            const state = await pi.session("getState", {});
+            await pi.events("sendMessage", {
+                message: {
+                    customType: "queue-state",
+                    content: JSON.stringify({
+                        steeringMode: state.steeringMode,
+                        followUpMode: state.followUpMode
+                    }),
+                    display: false
+                },
+                options: {
+                    triggerTurn: false
+                }
+            });
+            return "reported";
+        }
+    });
+}
+"#;
+
+    #[test]
+    fn line_count_from_newline_count_matches_trailing_newline_semantics() {
+        assert_eq!(line_count_from_newline_count(0, 0, false), 0);
+        assert_eq!(line_count_from_newline_count(2, 1, true), 1);
+        assert_eq!(line_count_from_newline_count(1, 0, false), 1);
+        assert_eq!(line_count_from_newline_count(3, 1, false), 2);
+    }
+
     // -----------------------------------------------------------------------
     // parse_queue_mode
     // -----------------------------------------------------------------------
@@ -3583,6 +5208,83 @@ mod tests {
     #[test]
     fn parse_queue_mode_trims_whitespace() {
         assert_eq!(parse_queue_mode(Some("  all  ")), Some(QueueMode::All));
+    }
+
+    #[test]
+    fn provider_ids_match_accepts_aliases() {
+        assert!(provider_ids_match("openrouter", "open-router"));
+        assert!(provider_ids_match("google-gemini-cli", "gemini-cli"));
+        assert!(!provider_ids_match("openai", "anthropic"));
+    }
+
+    #[test]
+    fn resolve_model_key_prefers_stored_auth_key_over_inline_entry_key() {
+        let mut entry = dummy_entry("gpt-4o-mini", true);
+        entry.model.provider = "openai".to_string();
+        entry.auth_header = true;
+        entry.api_key = Some("dummy-test-key-12345".to_string());
+
+        let auth_path = tempfile::tempdir()
+            .expect("tempdir")
+            .path()
+            .join("auth.json");
+        let mut auth = AuthStorage::load(auth_path).expect("auth load");
+        auth.set(
+            "openai".to_string(),
+            AuthCredential::ApiKey {
+                key: "stored-auth-key".to_string(),
+            },
+        );
+
+        assert_eq!(
+            resolve_model_key(&auth, &entry).as_deref(),
+            Some("stored-auth-key")
+        );
+    }
+
+    #[test]
+    fn resolve_model_key_ignores_blank_inline_key_and_falls_back_to_auth_storage() {
+        let mut entry = dummy_entry("gpt-4o-mini", true);
+        entry.model.provider = "openai".to_string();
+        entry.auth_header = true;
+        entry.api_key = Some("   ".to_string()); // intentional blank space
+
+        let auth_path = tempfile::tempdir()
+            .expect("tempdir")
+            .path()
+            .join("auth.json");
+        let mut auth = AuthStorage::load(auth_path).expect("auth load");
+        auth.set(
+            "openai".to_string(),
+            AuthCredential::ApiKey {
+                key: "stored-auth-key".to_string(),
+            },
+        );
+
+        assert_eq!(
+            resolve_model_key(&auth, &entry).as_deref(),
+            Some("stored-auth-key")
+        );
+    }
+
+    #[test]
+    fn unknown_keyless_model_does_not_require_credentials() {
+        let mut entry = dummy_entry("dev-model", false);
+        entry.model.provider = "acme-local".to_string();
+        entry.auth_header = false;
+        entry.oauth_config = None;
+
+        assert!(!model_requires_configured_credential(&entry));
+    }
+
+    #[test]
+    fn anthropic_model_requires_credentials_even_without_auth_header() {
+        let mut entry = dummy_entry("claude-sonnet-4-6", true);
+        entry.model.provider = "anthropic".to_string();
+        entry.auth_header = false;
+        entry.oauth_config = None;
+
+        assert!(model_requires_configured_credential(&entry));
     }
 
     // -----------------------------------------------------------------------
@@ -3692,7 +5394,7 @@ mod tests {
                 content: UserContent::Text(text),
                 ..
             }) => assert_eq!(text, "hello"),
-            other => panic!("expected text user message, got {other:?}"),
+            other => unreachable!("expected different match, got: {other:?}"),
         }
     }
 
@@ -3712,7 +5414,26 @@ mod tests {
                 assert!(matches!(&blocks[0], ContentBlock::Text(_)));
                 assert!(matches!(&blocks[1], ContentBlock::Image(_)));
             }
-            other => panic!("expected blocks user message, got {other:?}"),
+            other => unreachable!("expected different match, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_user_message_image_only_omits_empty_text_block() {
+        let images = vec![ImageContent {
+            data: "base64data".to_string(),
+            mime_type: "image/png".to_string(),
+        }];
+        let msg = build_user_message("", &images);
+        match msg {
+            Message::User(UserMessage {
+                content: UserContent::Blocks(blocks),
+                ..
+            }) => {
+                assert_eq!(blocks.len(), 1);
+                assert!(matches!(&blocks[0], ContentBlock::Image(_)));
+            }
+            other => unreachable!("expected different match, got: {other:?}"),
         }
     }
 
@@ -3742,6 +5463,214 @@ mod tests {
     #[test]
     fn is_extension_command_leading_whitespace() {
         assert!(is_extension_command("  /cmd", "  /cmd"));
+    }
+
+    #[test]
+    fn rpc_busy_extension_command_rejects_follow_on_extension_prompt_without_blocking() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let cwd = temp.path().to_path_buf();
+            let ext_entry_path = cwd.join("busy-ext.mjs");
+            std::fs::write(&ext_entry_path, RPC_BUSY_EXTENSION_COMMAND_EXT)
+                .expect("write extension source");
+
+            let mut agent_session = build_test_agent_session(Session::in_memory());
+            agent_session
+                .enable_extensions(&[], &cwd, None, &[ext_entry_path])
+                .await
+                .expect("enable extensions");
+
+            let options = build_test_rpc_options(&handle, cwd.join("auth.json"));
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+            let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+            let out_rx = Arc::new(Mutex::new(out_rx));
+
+            let server =
+                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+            let first = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"1","type":"prompt","message":"/wait-confirm"}"#,
+                "prompt(wait-confirm:first)",
+            )
+            .await;
+            assert_ok(&first, "prompt");
+
+            let ui_event = recv_ui_request(&out_rx, "wait-confirm ui").await;
+            assert_eq!(ui_event["method"], "confirm");
+            let request_id = ui_event["id"]
+                .as_str()
+                .expect("ui request id should be a string")
+                .to_string();
+
+            let second = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"2","type":"prompt","message":"/wait-confirm"}"#,
+                "prompt(wait-confirm:busy)",
+            )
+            .await;
+            assert_err(&second, "prompt");
+            assert_eq!(
+                second["error"],
+                "Extension commands are not allowed while agent is streaming"
+            );
+
+            let response = json!({
+                "id": "3",
+                "type": "extension_ui_response",
+                "requestId": request_id,
+                "confirmed": true,
+            })
+            .to_string();
+            let ui_resp = send_recv(&in_tx, &out_rx, &response, "wait-confirm response").await;
+            assert_ok(&ui_resp, "extension_ui_response");
+
+            drop(in_tx);
+            let result = server.await;
+            assert!(result.is_ok(), "rpc server error: {result:?}");
+        });
+    }
+
+    #[test]
+    fn rpc_queue_mode_updates_reach_extension_session_state() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let cwd = temp.path().to_path_buf();
+            let ext_entry_path = cwd.join("queue-state-ext.mjs");
+            std::fs::write(&ext_entry_path, RPC_QUEUE_STATE_EXTENSION_EXT)
+                .expect("write extension source");
+
+            let mut agent_session = build_test_agent_session(Session::in_memory());
+            agent_session
+                .enable_extensions(&[], &cwd, None, &[ext_entry_path])
+                .await
+                .expect("enable extensions");
+
+            let options = build_test_rpc_options(&handle, cwd.join("auth.json"));
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+            let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+            let out_rx = Arc::new(Mutex::new(out_rx));
+
+            let server =
+                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+            let steering = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"1","type":"set_steering_mode","mode":"all"}"#,
+                "set_steering_mode(queue-state)",
+            )
+            .await;
+            assert_ok(&steering, "set_steering_mode");
+
+            let follow_up = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"2","type":"setFollowUpMode","mode":"all"}"#,
+                "setFollowUpMode(queue-state)",
+            )
+            .await;
+            assert_ok(&follow_up, "set_follow_up_mode");
+
+            let prompt = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"3","type":"prompt","message":"/report-queue-state"}"#,
+                "prompt(report-queue-state)",
+            )
+            .await;
+            assert_ok(&prompt, "prompt");
+
+            let message =
+                wait_for_custom_message(&in_tx, &out_rx, "queue-state", "queue-state message")
+                    .await;
+            let reported_state: Value = serde_json::from_str(
+                message["content"]
+                    .as_str()
+                    .expect("queue-state content should be string"),
+            )
+            .expect("queue-state content should be json");
+            assert_eq!(reported_state["steeringMode"], "all");
+            assert_eq!(reported_state["followUpMode"], "all");
+
+            drop(in_tx);
+            let result = server.await;
+            assert!(result.is_ok(), "rpc server error: {result:?}");
+        });
+    }
+
+    #[test]
+    fn rpc_startup_queue_modes_reach_extension_session_state() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let cwd = temp.path().to_path_buf();
+            let ext_entry_path = cwd.join("queue-state-ext.mjs");
+            std::fs::write(&ext_entry_path, RPC_QUEUE_STATE_EXTENSION_EXT)
+                .expect("write extension source");
+
+            let mut agent_session = build_test_agent_session(Session::in_memory());
+            agent_session
+                .enable_extensions(&[], &cwd, None, &[ext_entry_path])
+                .await
+                .expect("enable extensions");
+
+            let mut options = build_test_rpc_options(&handle, cwd.join("auth.json"));
+            options.config.steering_mode = Some("all".to_string());
+            options.config.follow_up_mode = Some("all".to_string());
+
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+            let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+            let out_rx = Arc::new(Mutex::new(out_rx));
+
+            let server =
+                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+            let prompt = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"1","type":"prompt","message":"/report-queue-state"}"#,
+                "prompt(report-queue-state-startup)",
+            )
+            .await;
+            assert_ok(&prompt, "prompt");
+
+            let message = wait_for_custom_message(
+                &in_tx,
+                &out_rx,
+                "queue-state",
+                "queue-state startup message",
+            )
+            .await;
+            let reported_state: Value = serde_json::from_str(
+                message["content"]
+                    .as_str()
+                    .expect("queue-state content should be string"),
+            )
+            .expect("queue-state content should be json");
+            assert_eq!(reported_state["steeringMode"], "all");
+            assert_eq!(reported_state["followUpMode"], "all");
+
+            drop(in_tx);
+            let result = server.await;
+            assert!(result.is_ok(), "rpc server error: {result:?}");
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -3936,6 +5865,42 @@ mod tests {
             auto_retry_enabled: false,
         };
         assert_eq!(snapshot.pending_count(), 0);
+    }
+
+    #[test]
+    fn shared_state_blocks_follow_up_when_steering_queue_reaches_total_cap() {
+        let config = Config::default();
+        let mut shared = RpcSharedState::new(&config);
+
+        for idx in 0..MAX_RPC_PENDING_MESSAGES {
+            shared
+                .push_steering(build_user_message(&format!("steer-{idx}"), &[]))
+                .expect("steering enqueue within total cap");
+        }
+
+        let err = shared
+            .push_follow_up(build_user_message("follow-up-overflow", &[]))
+            .expect_err("follow-up enqueue should respect total pending cap");
+        assert!(matches!(err, Error::Session(_)));
+        assert_eq!(shared.pending_count(), MAX_RPC_PENDING_MESSAGES);
+    }
+
+    #[test]
+    fn shared_state_blocks_steering_when_follow_up_queue_reaches_total_cap() {
+        let config = Config::default();
+        let mut shared = RpcSharedState::new(&config);
+
+        for idx in 0..MAX_RPC_PENDING_MESSAGES {
+            shared
+                .push_follow_up(build_user_message(&format!("follow-up-{idx}"), &[]))
+                .expect("follow-up enqueue within total cap");
+        }
+
+        let err = shared
+            .push_steering(build_user_message("steer-overflow", &[]))
+            .expect_err("steering enqueue should respect total pending cap");
+        assert!(matches!(err, Error::Session(_)));
+        assert_eq!(shared.pending_count(), MAX_RPC_PENDING_MESSAGES);
     }
 
     // -----------------------------------------------------------------------
@@ -4233,7 +6198,9 @@ mod tests {
     fn supports_xhigh_known_models() {
         assert!(dummy_entry("gpt-5.1-codex-max", true).supports_xhigh());
         assert!(dummy_entry("gpt-5.2", true).supports_xhigh());
+        assert!(dummy_entry("gpt-5.4", true).supports_xhigh());
         assert!(dummy_entry("gpt-5.2-codex", true).supports_xhigh());
+        assert!(dummy_entry("gpt-5.3-codex", true).supports_xhigh());
     }
 
     #[test]
@@ -4358,6 +6325,500 @@ mod tests {
         let cost = &value["cost"];
         assert_eq!(cost["input"], 3.0);
         assert_eq!(cost["output"], 15.0);
+    }
+
+    #[test]
+    fn current_model_entry_matches_provider_alias_and_model_case() {
+        let mut model = dummy_entry("gpt-4o-mini", true);
+        model.model.provider = "openrouter".to_string();
+        let options = rpc_options_with_models(vec![model]);
+
+        let mut session = Session::in_memory();
+        session.header.provider = Some("open-router".to_string());
+        session.header.model_id = Some("GPT-4O-MINI".to_string());
+
+        let resolved = current_model_entry(&session, &options).expect("resolve aliased model");
+        assert_eq!(resolved.model.provider, "openrouter");
+        assert_eq!(resolved.model.id, "gpt-4o-mini");
+    }
+
+    #[test]
+    fn current_or_runtime_model_entry_falls_back_when_header_is_unresolved() {
+        let mut runtime = dummy_entry("test-model", false);
+        runtime.model.provider = "test-provider".to_string();
+        let options = rpc_options_with_models(vec![runtime]);
+
+        let mut session = Session::in_memory();
+        session.header.provider = Some("missing-provider".to_string());
+        session.header.model_id = Some("missing-model".to_string());
+
+        let resolved =
+            current_or_runtime_model_entry(&session, "test-provider", "test-model", &options)
+                .expect("resolve runtime fallback");
+        assert_eq!(resolved.model.provider, "test-provider");
+        assert_eq!(resolved.model.id, "test-model");
+        assert_eq!(
+            resolved.clamp_thinking_level(ThinkingLevel::High),
+            ThinkingLevel::Off
+        );
+    }
+
+    #[test]
+    fn cycle_model_for_rpc_does_not_mutate_provider_when_credentials_are_missing() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async move {
+            let mut current = dummy_entry("gpt-4o-mini", true);
+            current.model.provider = "openai".to_string();
+            current.model.api = "openai-completions".to_string();
+            current.model.base_url = "https://api.openai.com/v1".to_string();
+            current.auth_header = true;
+
+            let next = ModelEntry {
+                model: Model {
+                    id: "cloud-model".to_string(),
+                    name: "cloud-model".to_string(),
+                    api: "openai-completions".to_string(),
+                    provider: "acme-remote".to_string(),
+                    base_url: "https://example.invalid/v1".to_string(),
+                    reasoning: true,
+                    input: vec![InputType::Text],
+                    cost: ModelCost {
+                        input: 0.0,
+                        output: 0.0,
+                        cache_read: 0.0,
+                        cache_write: 0.0,
+                    },
+                    context_window: 128_000,
+                    max_tokens: 8_192,
+                    headers: HashMap::new(),
+                },
+                api_key: None,
+                headers: HashMap::new(),
+                auth_header: true,
+                compat: None,
+                oauth_config: None,
+            };
+
+            let provider =
+                crate::providers::create_provider(&current, None).expect("create current provider");
+            let agent = Agent::new(
+                provider,
+                ToolRegistry::new(&[], Path::new("."), None),
+                AgentConfig::default(),
+            );
+
+            let mut session = Session::in_memory();
+            session.header.provider = Some(current.model.provider.clone());
+            session.header.model_id = Some(current.model.id.clone());
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::new(asupersync::sync::Mutex::new(session)),
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+
+            let options = rpc_options_with_models(vec![current.clone(), next]);
+            let err = cycle_model_for_rpc(&mut agent_session, &options)
+                .await
+                .expect_err("missing credentials should abort model cycling");
+            assert!(
+                err.to_string().contains("Missing credentials"),
+                "unexpected error: {err}"
+            );
+            assert_eq!(
+                agent_session.agent.provider().name(),
+                current.model.provider
+            );
+            assert_eq!(agent_session.agent.provider().model_id(), current.model.id);
+
+            let cx = AgentCx::for_request();
+            let session = agent_session
+                .session
+                .lock(cx.cx())
+                .await
+                .expect("session lock");
+            assert_eq!(
+                session.header.provider.as_deref(),
+                Some(current.model.provider.as_str())
+            );
+            assert_eq!(
+                session.header.model_id.as_deref(),
+                Some(current.model.id.as_str())
+            );
+        });
+    }
+
+    #[test]
+    fn cycle_model_for_rpc_uses_runtime_model_when_header_is_missing() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async move {
+            let mut current = dummy_entry("test-model", false);
+            current.model.provider = "test-provider".to_string();
+            current.model.api = "test-api".to_string();
+            current.model.base_url = "https://example.test/v1".to_string();
+
+            let mut next = dummy_entry("after-runtime", true);
+            next.api_key = Some("inline-next-key".to_string());
+            let options = rpc_options_with_models(vec![current, next.clone()]);
+
+            let mut agent_session = build_test_agent_session(Session::in_memory());
+            let result = cycle_model_for_rpc(&mut agent_session, &options)
+                .await
+                .expect("cycle should succeed")
+                .expect("should choose next model");
+
+            assert_eq!(result.0.model.provider, next.model.provider);
+            assert_eq!(result.0.model.id, next.model.id);
+            assert_eq!(agent_session.agent.provider().name(), next.model.provider);
+            assert_eq!(agent_session.agent.provider().model_id(), next.model.id);
+
+            let cx = AgentCx::for_request();
+            let session = agent_session
+                .session
+                .lock(cx.cx())
+                .await
+                .expect("session lock");
+            assert_eq!(
+                session.header.provider.as_deref(),
+                Some(next.model.provider.as_str())
+            );
+            assert_eq!(
+                session.header.model_id.as_deref(),
+                Some(next.model.id.as_str())
+            );
+        });
+    }
+
+    #[test]
+    fn apply_thinking_level_inherits_cancelled_context_when_session_lock_is_held() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let mut agent_session = build_test_agent_session(Session::in_memory());
+            let session_handle = Arc::clone(&agent_session.session);
+            let hold_cx = AgentCx::for_request();
+            let held_guard = session_handle
+                .lock(hold_cx.cx())
+                .await
+                .expect("session lock");
+
+            let ambient_cx = asupersync::Cx::for_testing();
+            ambient_cx.set_cancel_requested(true);
+            let _current = asupersync::Cx::set_current(Some(ambient_cx));
+
+            let err = {
+                let apply = apply_thinking_level(&mut agent_session, ThinkingLevel::High);
+                futures::pin_mut!(apply);
+                let inner = asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    Duration::from_millis(100),
+                    apply,
+                )
+                .await;
+                let outcome =
+                    inner.expect("cancelled thinking helper should finish before timeout");
+                outcome.expect_err("lock acquisition should honor inherited cancellation")
+            };
+            assert!(
+                err.to_string().contains("inner session lock failed"),
+                "unexpected error: {err}"
+            );
+
+            drop(held_guard);
+
+            let verify_cx = AgentCx::for_request();
+            let session = agent_session
+                .session
+                .lock(verify_cx.cx())
+                .await
+                .expect("session lock");
+            assert!(session.header.thinking_level.is_none());
+            drop(session);
+            assert!(
+                agent_session
+                    .agent
+                    .stream_options()
+                    .thinking_level
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn apply_thinking_level_canonicalizes_header_without_duplicate_history() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let mut session = Session::in_memory();
+            session.header.thinking_level = Some("HIGH".to_string());
+            let mut agent_session = build_test_agent_session(session);
+
+            apply_thinking_level(&mut agent_session, ThinkingLevel::High)
+                .await
+                .expect("apply thinking level");
+
+            let verify_cx = AgentCx::for_request();
+            let session = agent_session
+                .session
+                .lock(verify_cx.cx())
+                .await
+                .expect("session lock");
+            assert_eq!(session.header.thinking_level.as_deref(), Some("high"));
+            let thinking_changes = session
+                .entries
+                .iter()
+                .filter(|entry| {
+                    matches!(entry, crate::session::SessionEntry::ThinkingLevelChange(_))
+                })
+                .count();
+            assert_eq!(thinking_changes, 0);
+            drop(session);
+
+            assert_eq!(
+                agent_session.agent.stream_options().thinking_level,
+                Some(ThinkingLevel::High)
+            );
+        });
+    }
+
+    #[test]
+    fn rpc_set_model_persists_clamped_thinking_header_even_when_runtime_is_already_off() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let mut next = dummy_entry("llama3.2", false);
+            next.model.provider = "ollama".to_string();
+            next.model.api = "openai-completions".to_string();
+            next.model.base_url = "http://127.0.0.1:11434/v1".to_string();
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let auth_path = temp.path().join("auth.json");
+            let mut options = build_test_rpc_options(&handle, auth_path);
+            options.available_models = vec![next.clone()];
+
+            let agent_session = build_test_agent_session(Session::in_memory());
+            let session_handle = Arc::clone(&agent_session.session);
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(8);
+            let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+            let out_rx = Arc::new(Mutex::new(out_rx));
+
+            let server =
+                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+            let response = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"1","type":"set_model","provider":"ollama","modelId":"llama3.2"}"#,
+                "set_model(sync-thinking)",
+            )
+            .await;
+            assert_ok(&response, "set_model");
+
+            drop(in_tx);
+            let result = server.await;
+            assert!(result.is_ok(), "rpc server error: {result:?}");
+
+            let verify_cx = AgentCx::for_request();
+            let session = session_handle
+                .lock(verify_cx.cx())
+                .await
+                .expect("session lock");
+            assert_eq!(session.header.provider.as_deref(), Some("ollama"));
+            assert_eq!(session.header.model_id.as_deref(), Some("llama3.2"));
+            assert_eq!(session.header.thinking_level.as_deref(), Some("off"));
+            let thinking_changes = session
+                .entries
+                .iter()
+                .filter(|entry| {
+                    matches!(entry, crate::session::SessionEntry::ThinkingLevelChange(_))
+                })
+                .count();
+            assert_eq!(thinking_changes, 1);
+        });
+    }
+
+    #[test]
+    fn rpc_prompt_command_inherits_deadline_from_run() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let state = Arc::new(RpcDeadlineProbeState::default());
+            let provider: Arc<dyn Provider> = Arc::new(RpcDeadlineProbeProvider {
+                state: Arc::clone(&state),
+            });
+            let agent_session =
+                build_test_agent_session_with_provider(Session::in_memory(), provider);
+
+            let auth_path = tempfile::tempdir()
+                .expect("tempdir")
+                .path()
+                .join("auth.json");
+            let options = build_test_rpc_options(&runtime_handle, auth_path);
+
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+            let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+            let out_rx = Arc::new(Mutex::new(out_rx));
+
+            let expected_deadline = asupersync::time::wall_now() + Duration::from_secs(30);
+            let ambient_cx = AgentCx::for_request_with_budget(asupersync::Budget {
+                deadline: Some(expected_deadline),
+                ..asupersync::Budget::INFINITE
+            });
+            let _current = asupersync::Cx::set_current(Some(ambient_cx.cx().clone()));
+
+            let client_out_rx = Arc::clone(&out_rx);
+            let client = async move {
+                let response = send_recv(
+                    &in_tx,
+                    &client_out_rx,
+                    r#"{"id":"1","type":"prompt","message":"deadline please"}"#,
+                    "prompt(deadline)",
+                )
+                .await;
+                assert_eq!(response["command"], "prompt");
+                assert_eq!(
+                    response["success"], true,
+                    "prompt should succeed under inherited deadline: {response}"
+                );
+                drop(in_tx);
+            };
+
+            let (server_result, ()) =
+                futures::future::join(run(agent_session, options, in_rx, out_tx), client).await;
+            assert!(server_result.is_ok(), "rpc server error: {server_result:?}");
+            assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+            let deadlines = state
+                .observed_deadlines
+                .lock()
+                .expect("lock rpc deadline probe")
+                .clone();
+            assert_eq!(deadlines.as_slice(), &[Some(expected_deadline)]);
+        });
+    }
+
+    #[test]
+    fn cycle_model_for_rpc_inherits_cancelled_context_when_session_lock_is_held() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let current = dummy_entry("current-model", true);
+            let mut next = dummy_entry("next-model", true);
+            next.api_key = Some("inline-next-key".to_string());
+
+            let provider =
+                crate::providers::create_provider(&current, None).expect("create current provider");
+            let agent = Agent::new(
+                provider,
+                ToolRegistry::new(&[], Path::new("."), None),
+                AgentConfig::default(),
+            );
+
+            let mut session = Session::in_memory();
+            session.header.provider = Some(current.model.provider.clone());
+            session.header.model_id = Some(current.model.id.clone());
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::new(asupersync::sync::Mutex::new(session)),
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            let options = rpc_options_with_models(vec![current.clone(), next]);
+            let session_handle = Arc::clone(&agent_session.session);
+
+            let hold_cx = AgentCx::for_request();
+            let held_guard = session_handle
+                .lock(hold_cx.cx())
+                .await
+                .expect("session lock");
+
+            let ambient_cx = asupersync::Cx::for_testing();
+            ambient_cx.set_cancel_requested(true);
+            let _current = asupersync::Cx::set_current(Some(ambient_cx));
+
+            let err = {
+                let cycle = cycle_model_for_rpc(&mut agent_session, &options);
+                futures::pin_mut!(cycle);
+                let inner = asupersync::time::timeout(
+                    asupersync::time::wall_now(),
+                    Duration::from_millis(100),
+                    cycle,
+                )
+                .await;
+                let outcome = inner.expect("cancelled cycle helper should finish before timeout");
+                outcome.expect_err("lock acquisition should honor inherited cancellation")
+            };
+            assert!(
+                err.to_string().contains("inner session lock failed"),
+                "unexpected error: {err}"
+            );
+
+            drop(held_guard);
+
+            assert_eq!(
+                agent_session.agent.provider().name(),
+                current.model.provider
+            );
+            assert_eq!(agent_session.agent.provider().model_id(), current.model.id);
+
+            let verify_cx = AgentCx::for_request();
+            let session = agent_session
+                .session
+                .lock(verify_cx.cx())
+                .await
+                .expect("session lock");
+            assert_eq!(
+                session.header.provider.as_deref(),
+                Some(current.model.provider.as_str())
+            );
+            assert_eq!(
+                session.header.model_id.as_deref(),
+                Some(current.model.id.as_str())
+            );
+        });
+    }
+
+    #[test]
+    fn session_state_resolves_model_for_provider_alias() {
+        let mut model = dummy_entry("gpt-4o-mini", true);
+        model.model.provider = "openrouter".to_string();
+        let options = rpc_options_with_models(vec![model]);
+
+        let mut session = Session::in_memory();
+        session.header.provider = Some("open-router".to_string());
+        session.header.model_id = Some("gpt-4o-mini".to_string());
+
+        let snapshot = RpcStateSnapshot {
+            steering_count: 0,
+            follow_up_count: 0,
+            steering_mode: QueueMode::OneAtATime,
+            follow_up_mode: QueueMode::OneAtATime,
+            auto_compaction_enabled: false,
+            auto_retry_enabled: false,
+        };
+
+        let state = session_state(&session, &options, &snapshot, false, false);
+        assert_eq!(state["model"]["provider"], "openrouter");
+        assert_eq!(state["model"]["id"], "gpt-4o-mini");
     }
 
     // -----------------------------------------------------------------------

@@ -72,9 +72,43 @@ export default function activate(pi) {{
     )
 }
 
+fn global_buffer_ext_source(js_expr: &str) -> String {
+    format!(
+        r#"
+export default function activate(pi) {{
+  pi.on("agent_start", (event, ctx) => {{
+    let result;
+    try {{
+      result = String({js_expr});
+    }} catch (e) {{
+      result = "ERROR:" + e.message;
+    }}
+    return {{ result }};
+  }});
+}}
+"#
+    )
+}
+
 fn eval_buffer(js_expr: &str) -> String {
     let harness = common::TestHarness::new("buffer_shim");
     let source = buffer_ext_source(js_expr);
+    let mgr = load_ext(&harness, &source);
+
+    let response = common::run_async(async move {
+        mgr.dispatch_event_with_response(ExtensionEventName::AgentStart, None, 10000)
+            .await
+            .expect("dispatch agent_start")
+    });
+
+    response
+        .and_then(|v| v.get("result").and_then(|r| r.as_str()).map(String::from))
+        .unwrap_or_else(|| "NO_RESPONSE".to_string())
+}
+
+fn eval_global_buffer(js_expr: &str) -> String {
+    let harness = common::TestHarness::new("global_buffer_shim");
+    let source = global_buffer_ext_source(js_expr);
     let mgr = load_ext(&harness, &source);
 
     let response = common::run_async(async move {
@@ -305,6 +339,28 @@ fn index_of_string() {
 }
 
 #[test]
+fn index_of_negative_offset_matches_node() {
+    let result = eval_buffer(
+        r#"(() => {
+        const buf = Buffer.from("abc");
+        return [buf.indexOf("a", -1), buf.indexOf("c", -1), buf.indexOf(97, -1)].join(",");
+    })()"#,
+    );
+    assert_eq!(result, "-1,2,-1");
+}
+
+#[test]
+fn index_of_string_encoding_overload() {
+    let result = eval_buffer(
+        r#"(() => {
+        const buf = Buffer.from("hello");
+        return [buf.indexOf("6c6c", "hex"), buf.includes("6c6c", "hex")].join(",");
+    })()"#,
+    );
+    assert_eq!(result, "2,true");
+}
+
+#[test]
 fn includes_true() {
     let result = eval_buffer(r#"Buffer.from("hello world").includes("world")"#);
     assert_eq!(result, "true");
@@ -314,6 +370,17 @@ fn includes_true() {
 fn includes_false() {
     let result = eval_buffer(r#"Buffer.from("hello").includes("xyz")"#);
     assert_eq!(result, "false");
+}
+
+#[test]
+fn includes_negative_offset_matches_node() {
+    let result = eval_buffer(
+        r#"(() => {
+        const buf = Buffer.from("abc");
+        return [buf.includes("a", -1), buf.includes("c", -1)].join(",");
+    })()"#,
+    );
+    assert_eq!(result, "false,true");
 }
 
 // ─── buf.fill ──────────────────────────────────────────────────────────────
@@ -467,6 +534,18 @@ export default function activate(pi) {
 fn global_buffer_available() {
     let result = eval_buffer(r"typeof globalThis.Buffer === 'function'");
     assert_eq!(result, "true");
+}
+
+#[test]
+fn global_buffer_search_semantics_match_node() {
+    let result = eval_global_buffer(
+        r#"(() => {
+        const abc = Buffer.from("abc");
+        const hello = Buffer.from("hello");
+        return [abc.indexOf("a", -1), hello.indexOf("6c6c", "hex"), abc.includes("a", -1)].join(",");
+    })()"#,
+    );
+    assert_eq!(result, "-1,2,false");
 }
 
 // ─── Edge cases ────────────────────────────────────────────────────────────

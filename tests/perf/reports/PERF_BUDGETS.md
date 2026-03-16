@@ -1,6 +1,6 @@
 # Performance Budgets
 
-> Generated: 2026-02-17T02:36:05Z
+> Generated: 2026-03-12T02:21:00Z
 
 ## Summary
 
@@ -11,11 +11,11 @@
 | CI-enforced with data | 1 |
 | CI-enforced FAIL | 0 |
 | CI-enforced NO_DATA | 7 |
-| PASS | 3 |
+| PASS | 4 |
 | FAIL | 0 |
-| No data | 10 |
+| No data | 9 |
 
-| Failing data contracts | 8 |
+| Failing data contracts | 9 |
 
 ## Startup
 
@@ -43,7 +43,7 @@
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `event_dispatch_p99` | p99 dispatch latency | 5000 us | - | NO_DATA | No |
+| `event_dispatch_p99` | p99 dispatch latency | 5000 us | 45 | PASS | No |
 
 ## Policy
 
@@ -55,7 +55,7 @@
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `idle_memory_rss` | RSS at idle | 50 MB | 10.6 | PASS | Yes |
+| `idle_memory_rss` | RSS at idle | 50 MB | 11.3 | PASS | Yes |
 | `sustained_load_rss_growth` | RSS growth under 30s sustained load | 5 percent | 0.0 | PASS | No |
 
 ## Binary
@@ -86,8 +86,10 @@
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
 - `missing_or_stale_budget_artifact` (`protocol_parse_p99`): missing artifacts; expected one of [/data/projects/pi_agent_rust/target/criterion/ext_protocol/parse_and_validate]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
-- `missing_or_stale_e2e_matrix_evidence` (`global`): missing artifacts; expected one of [/data/projects/pi_agent_rust/target/perf/extension_benchmark_stratification.json, /data/projects/pi_agent_rust/tests/perf/reports/extension_benchmark_stratification.json]
+- `missing_or_stale_e2e_matrix_evidence` (`global`): all candidate artifacts are stale/invalid (>24.00h): /data/projects/pi_agent_rust/tests/perf/reports/extension_benchmark_stratification.json (551.26h old)
   - Remediation: Generate fresh extension_benchmark_stratification.json in the current perf run.
+- `missing_or_stale_phase1_matrix_validation_evidence` (`global`): missing artifacts; expected one of [/data/projects/pi_agent_rust/target/perf/results/phase1_matrix_validation.json, /data/projects/pi_agent_rust/tests/perf/reports/phase1_matrix_validation.json]
+  - Remediation: Generate fresh phase1_matrix_validation.json in the current perf run.
 
 ## Measurement Methodology
 

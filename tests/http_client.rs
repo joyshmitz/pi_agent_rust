@@ -130,7 +130,7 @@ fn request_builder_sends_headers_and_json_body() {
 
     let request_text = String::from_utf8_lossy(&request);
     assert!(request_text.starts_with("POST /hello HTTP/1.1\r\n"));
-    assert!(request_text.contains("Host: 127.0.0.1\r\n"));
+    assert!(request_text.contains("Host: 127.0.0.1:"));
     assert!(request_text.contains("User-Agent: pi_agent_rust/0.1\r\n"));
     assert!(request_text.contains("Content-Type: application/json\r\n"));
     assert!(request_text.contains("X-Test: 1\r\n"));
@@ -203,6 +203,42 @@ fn response_streams_chunked_body() {
 }
 
 #[test]
+fn response_204_without_content_length_returns_empty_body_without_waiting_for_close() {
+    let harness = TestHarness::new(
+        "http_client_response_204_without_content_length_returns_empty_body_without_waiting_for_close",
+    );
+
+    let server = OneShotServer::start(|mut stream, _request| {
+        let response = concat!(
+            "HTTP/1.1 204 No Content\r\n",
+            "Connection: keep-alive\r\n",
+            "\r\n"
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write response");
+        stream.flush().expect("flush response");
+        thread::sleep(Duration::from_secs(1));
+    });
+
+    let url = server.url("/no-content");
+    let body = common::run_async(async move {
+        let response = Client::new()
+            .get(&url)
+            .timeout(Duration::from_millis(500))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(response.status(), 204);
+        response.text().await.expect("empty text")
+    });
+
+    server.join();
+    assert_eq!(body, "");
+    write_logs_artifact(&harness);
+}
+
+#[test]
 fn malformed_header_line_is_error() {
     let harness = TestHarness::new("http_client_malformed_header_line_is_error");
 
@@ -229,6 +265,74 @@ fn malformed_header_line_is_error() {
         message.contains("Invalid HTTP header line"),
         "unexpected error: {message}"
     );
+    write_logs_artifact(&harness);
+}
+
+#[test]
+fn invalid_content_length_is_error() {
+    let harness = TestHarness::new("http_client_invalid_content_length_is_error");
+
+    let server = OneShotServer::start(|mut stream, _request| {
+        let response = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Content-Length: nope\r\n",
+            "Connection: keep-alive\r\n",
+            "\r\n"
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write response");
+        stream.flush().expect("flush response");
+        thread::sleep(Duration::from_secs(1));
+    });
+
+    let url = server.url("/invalid-content-length");
+    let err = common::run_async(async move {
+        Client::new()
+            .get(&url)
+            .timeout(Duration::from_millis(500))
+            .send()
+            .await
+            .err()
+            .expect("expected invalid content-length error")
+    });
+
+    server.join();
+    let message = err.to_string();
+    assert!(
+        message.contains("Invalid HTTP Content-Length header"),
+        "unexpected error: {message}"
+    );
+    write_logs_artifact(&harness);
+}
+
+#[test]
+fn coalesced_identical_content_length_is_accepted() {
+    let harness = TestHarness::new("http_client_coalesced_identical_content_length_is_accepted");
+
+    let server = OneShotServer::start(|mut stream, _request| {
+        let response = concat!(
+            "HTTP/1.1 200 OK\r\n",
+            "Content-Length: 5, 5\r\n",
+            "Connection: keep-alive\r\n",
+            "\r\n",
+            "hello"
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write response");
+        stream.flush().expect("flush response");
+    });
+
+    let url = server.url("/coalesced-content-length");
+    let body = common::run_async(async move {
+        let response = Client::new().get(&url).send().await.expect("send");
+        assert_eq!(response.status(), 200);
+        response.text().await.expect("text")
+    });
+
+    server.join();
+    assert_eq!(body, "hello");
     write_logs_artifact(&harness);
 }
 

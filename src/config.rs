@@ -126,7 +126,7 @@ pub struct Config {
 /// ```json
 /// {
 ///   "extensionPolicy": {
-///     "profile": "safe",
+///     "defaultPermissive": true,
 ///     "allowDangerous": false
 ///   }
 /// }
@@ -134,9 +134,12 @@ pub struct Config {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExtensionPolicyConfig {
-    /// Policy profile: "safe" (default), "balanced", or "permissive".
+    /// Policy profile: "safe", "balanced", or "permissive".
     /// Legacy alias "standard" is also accepted.
     pub profile: Option<String>,
+    /// Toggle the fallback profile when `profile` is omitted.
+    #[serde(alias = "defaultPermissive")]
+    pub default_permissive: Option<bool>,
     /// Allow dangerous capabilities (exec, env). Overrides profile's deny list.
     #[serde(alias = "allowDangerous")]
     pub allow_dangerous: Option<bool>,
@@ -315,8 +318,26 @@ impl Config {
     /// Load configuration from global and project settings.
     pub fn load() -> Result<Self> {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let config_path = std::env::var_os("PI_CONFIG_PATH").map(PathBuf::from);
+        let config_path = Self::config_path_override_from_env(&cwd);
         Self::load_with_roots(config_path.as_deref(), &Self::global_dir(), &cwd)
+    }
+
+    /// Resolve a config override path relative to the supplied cwd.
+    #[must_use]
+    pub(crate) fn resolve_config_override_path(path: &Path, cwd: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd.join(path)
+        }
+    }
+
+    /// Resolve the `PI_CONFIG_PATH` override relative to the supplied cwd.
+    #[must_use]
+    pub fn config_path_override_from_env(cwd: &Path) -> Option<PathBuf> {
+        std::env::var_os("PI_CONFIG_PATH")
+            .map(PathBuf::from)
+            .map(|path| Self::resolve_config_override_path(&path, cwd))
     }
 
     /// Get the global configuration directory.
@@ -395,7 +416,7 @@ impl Config {
         cwd: &std::path::Path,
     ) -> Result<Self> {
         if let Some(path) = config_path {
-            let config = Self::load_from_path(path)?;
+            let config = Self::load_from_path(&Self::resolve_config_override_path(path, cwd))?;
             config.emit_queue_mode_diagnostics();
             return Ok(config);
         }
@@ -481,7 +502,7 @@ impl Config {
             images: merge_images(base.images, other.images),
 
             // Markdown rendering
-            markdown: other.markdown.or(base.markdown),
+            markdown: merge_markdown(base.markdown, other.markdown),
 
             // Terminal Display
             terminal: merge_terminal(base.terminal, other.terminal),
@@ -630,7 +651,8 @@ impl Config {
     /// 1. `cli_override` (from `--extension-policy` flag)
     /// 2. `PI_EXTENSION_POLICY` environment variable
     /// 3. `extension_policy.profile` from settings.json
-    /// 4. Default: "safe"
+    /// 4. `extension_policy.default_permissive` from settings.json
+    /// 5. Default: "permissive"
     ///
     /// If `allow_dangerous` is true (from config or env), exec/env are removed
     /// from the policy's deny list.
@@ -649,7 +671,25 @@ impl Config {
                             .as_ref()
                             .and_then(|p| p.profile.clone())
                             .map_or_else(
-                                || ("safe".to_string(), "default"),
+                                || {
+                                    self.extension_policy
+                                        .as_ref()
+                                        .and_then(|p| p.default_permissive)
+                                        .map_or_else(
+                                            || ("permissive".to_string(), "default"),
+                                            |default_permissive| {
+                                                (
+                                                    if default_permissive {
+                                                        "permissive"
+                                                    } else {
+                                                        "safe"
+                                                    }
+                                                    .to_string(),
+                                                    "config",
+                                                )
+                                            },
+                                        )
+                                },
                                 |value| (value, "config"),
                             )
                     },
@@ -669,6 +709,11 @@ impl Config {
             PolicyProfile::Standard
         } else {
             // Unknown values fail closed to the safe profile.
+            tracing::warn!(
+                requested = %normalized_profile,
+                fallback = "safe",
+                "Unknown extension policy profile; falling back to safe"
+            );
             PolicyProfile::Safe
         };
 
@@ -1026,6 +1071,20 @@ fn merge_retry(base: Option<RetrySettings>, other: Option<RetrySettings>) -> Opt
     }
 }
 
+fn merge_markdown(
+    base: Option<MarkdownSettings>,
+    other: Option<MarkdownSettings>,
+) -> Option<MarkdownSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(MarkdownSettings {
+            code_block_indent: other.code_block_indent.or(base.code_block_indent),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
 fn merge_images(
     base: Option<ImageSettings>,
     other: Option<ImageSettings>,
@@ -1081,6 +1140,7 @@ fn merge_extension_policy(
     match (base, other) {
         (Some(base), Some(other)) => Some(ExtensionPolicyConfig {
             profile: other.profile.or(base.profile),
+            default_permissive: other.default_permissive.or(base.default_permissive),
             allow_dangerous: other.allow_dangerous.or(base.allow_dangerous),
         }),
         (None, Some(other)) => Some(other),
@@ -1270,6 +1330,48 @@ mod tests {
 
         let config =
             Config::load_with_roots(Some(&override_path), &global_dir, &cwd).expect("load config");
+        assert_eq!(config.theme.as_deref(), Some("override"));
+        assert_eq!(config.default_provider.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn resolve_config_override_path_anchors_relative_paths_to_supplied_cwd() {
+        let cwd = PathBuf::from("/tmp/pi-agent");
+        let relative = PathBuf::from("config/override.json");
+        let absolute = PathBuf::from("/etc/pi/settings.json");
+
+        assert_eq!(
+            Config::resolve_config_override_path(&relative, &cwd),
+            cwd.join("config/override.json")
+        );
+        assert_eq!(
+            Config::resolve_config_override_path(&absolute, &cwd),
+            absolute
+        );
+    }
+
+    #[test]
+    fn load_with_roots_resolves_relative_override_against_supplied_cwd() {
+        let temp = TempDir::new().expect("create tempdir");
+        let unrelated = temp.path().join("unrelated");
+        std::fs::create_dir_all(&unrelated).expect("create unrelated dir");
+
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        let override_dir = cwd.join("config");
+        std::fs::create_dir_all(&override_dir).expect("create override dir");
+        write_file(
+            &override_dir.join("override.json"),
+            r#"{ "theme": "override", "default_provider": "openai" }"#,
+        );
+
+        let config = Config::load_with_roots(
+            Some(std::path::Path::new("config/override.json")),
+            &global_dir,
+            &cwd,
+        )
+        .expect("load config");
+
         assert_eq!(config.theme.as_deref(), Some("override"));
         assert_eq!(config.default_provider.as_deref(), Some("openai"));
     }
@@ -1969,13 +2071,14 @@ mod tests {
     // ====================================================================
 
     #[test]
-    fn extension_policy_defaults_to_safe_behavior() {
+    fn extension_policy_defaults_to_permissive_behavior() {
         let config = Config::default();
         let policy = config.resolve_extension_policy(None);
-        assert_eq!(policy.mode, crate::extensions::ExtensionPolicyMode::Strict);
-        // Safe mode: dangerous capabilities are denied by default.
-        assert!(policy.deny_caps.contains(&"exec".to_string()));
-        assert!(policy.deny_caps.contains(&"env".to_string()));
+        assert_eq!(
+            policy.mode,
+            crate::extensions::ExtensionPolicyMode::Permissive
+        );
+        assert!(policy.deny_caps.is_empty());
     }
 
     #[test]
@@ -2024,6 +2127,26 @@ mod tests {
         assert_eq!(
             resolved.policy.mode,
             crate::extensions::ExtensionPolicyMode::Prompt
+        );
+    }
+
+    #[test]
+    fn extension_policy_default_permissive_toggle_false_restores_safe_behavior() {
+        let config = Config {
+            extension_policy: Some(ExtensionPolicyConfig {
+                profile: None,
+                default_permissive: Some(false),
+                allow_dangerous: None,
+            }),
+            ..Default::default()
+        };
+        let resolved = config.resolve_extension_policy_with_metadata(None);
+        assert_eq!(resolved.profile_source, "config");
+        assert_eq!(resolved.requested_profile, "safe");
+        assert_eq!(resolved.effective_profile, "safe");
+        assert_eq!(
+            resolved.policy.mode,
+            crate::extensions::ExtensionPolicyMode::Strict
         );
     }
 
@@ -2086,12 +2209,12 @@ mod tests {
         let global_dir = temp.path().join("global");
         write_file(
             &global_dir.join("settings.json"),
-            r#"{ "extensionPolicy": { "allowDangerous": true } }"#,
+            r#"{ "extensionPolicy": { "defaultPermissive": false, "allowDangerous": true } }"#,
         );
 
         let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load");
         let policy = config.resolve_extension_policy(None);
-        // Safe mode still drops explicit deny-caps when allowDangerous=true.
+        // Safe fallback still drops explicit deny-caps when allowDangerous=true.
         assert!(!policy.deny_caps.contains(&"exec".to_string()));
         assert!(!policy.deny_caps.contains(&"env".to_string()));
     }
@@ -2127,11 +2250,15 @@ mod tests {
 
     #[test]
     fn extension_policy_deserializes_camel_case() {
-        let json = r#"{ "extensionPolicy": { "profile": "safe", "allowDangerous": false } }"#;
+        let json = r#"{ "extensionPolicy": { "profile": "safe", "defaultPermissive": false, "allowDangerous": false } }"#;
         let config: Config = serde_json::from_str(json).expect("parse");
         assert_eq!(
             config.extension_policy.as_ref().unwrap().profile.as_deref(),
             Some("safe")
+        );
+        assert_eq!(
+            config.extension_policy.as_ref().unwrap().default_permissive,
+            Some(false)
         );
         assert_eq!(
             config.extension_policy.as_ref().unwrap().allow_dangerous,
@@ -2477,7 +2604,7 @@ mod tests {
                     prop_assert_eq!(merged.fail_closed, other.fail_closed.or(base.fail_closed));
                     prop_assert_eq!(merged.enforce, other.enforce.or(base.enforce));
                 }
-                _ => panic!("merge_extension_risk must preserve Option-shape semantics"),
+                _ => assert!(false, "merge_extension_risk must preserve Option-shape semantics"),
             }
         }
 
@@ -2956,14 +3083,28 @@ mod tests {
             #[test]
             fn extension_policy_other_overrides(
                 b_profile in prop::option::of(string_regex("[a-z]{3,10}").unwrap()),
+                b_default_permissive in prop::option::of(any::<bool>()),
                 b_danger in prop::option::of(any::<bool>()),
                 o_profile in prop::option::of(string_regex("[a-z]{3,10}").unwrap()),
+                o_default_permissive in prop::option::of(any::<bool>()),
                 o_danger in prop::option::of(any::<bool>()),
             ) {
-                let base = ExtensionPolicyConfig { profile: b_profile.clone(), allow_dangerous: b_danger };
-                let other = ExtensionPolicyConfig { profile: o_profile.clone(), allow_dangerous: o_danger };
+                let base = ExtensionPolicyConfig {
+                    profile: b_profile.clone(),
+                    default_permissive: b_default_permissive,
+                    allow_dangerous: b_danger,
+                };
+                let other = ExtensionPolicyConfig {
+                    profile: o_profile.clone(),
+                    default_permissive: o_default_permissive,
+                    allow_dangerous: o_danger,
+                };
                 let result = merge_extension_policy(Some(base), Some(other)).unwrap();
                 assert_eq!(result.profile, o_profile.or(b_profile));
+                assert_eq!(
+                    result.default_permissive,
+                    o_default_permissive.or(b_default_permissive)
+                );
                 assert_eq!(result.allow_dangerous, o_danger.or(b_danger));
             }
 

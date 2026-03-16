@@ -129,6 +129,7 @@ fn make_model_entry(provider: &str, id: &str, base_url: &str) -> ModelEntry {
     entry.model.provider = provider.to_string();
     entry.model.id = id.to_string();
     entry.model.base_url = base_url.to_string();
+    entry.api_key = Some("test-key".to_string());
     entry
 }
 
@@ -1748,7 +1749,14 @@ fn tui_state_tool_update_with_large_diff_shows_truncation_indicator() {
     press_ctrlo(&harness, &mut app);
     let mut step = press_ctrlo(&harness, &mut app);
 
+    for _ in 0..5 {
+        if step.after.contains("@@ foo.txt @@") {
+            break;
+        }
+        step = press_pgup(&harness, &mut app);
+    }
     assert_after_contains(&harness, &step, "@@ foo.txt @@");
+
     if !step.after.contains("diff truncated") {
         for _ in 0..10 {
             let next = press_pgdown(&harness, &mut app);
@@ -2796,19 +2804,21 @@ fn tui_state_slash_model_no_args_shows_configured_only_message_when_none_availab
     assert_after_contains(
         &harness,
         &step,
-        "No models with configured API keys. Use /login <provider> to configure credentials.",
+        "Only showing models that are ready to use (see README for details)",
     );
+    assert_after_contains(&harness, &step, "No matching models.");
 }
 
 #[test]
 fn tui_state_slash_model_no_args_opens_configured_only_selector() {
     let harness = TestHarness::new("tui_state_slash_model_no_args_opens_configured_only_selector");
 
-    let anthropic = make_model_entry(
+    let mut anthropic = make_model_entry(
         "anthropic",
         "claude-a",
         "https://api.anthropic.com/v1/messages",
     );
+    anthropic.api_key = None;
     let mut openai = make_model_entry("openai", "gpt-a", "https://api.openai.com/v1");
     openai.api_key = Some("test-openai-key".to_string());
 
@@ -2831,10 +2841,44 @@ fn tui_state_slash_model_no_args_opens_configured_only_selector() {
     assert_after_contains(
         &harness,
         &step,
-        "Only showing models with configured API keys (see README for details)",
+        "Only showing models that are ready to use (see README for details)",
     );
     assert_after_contains(&harness, &step, "openai/gpt-a");
     assert_after_not_contains(&harness, &step, "  anthropic/claude-a");
+}
+
+#[test]
+fn tui_state_slash_model_no_args_dedupes_case_variant_models() {
+    let harness = TestHarness::new("tui_state_slash_model_no_args_dedupes_case_variant_models");
+
+    let anthropic = make_model_entry(
+        "anthropic",
+        "claude-a",
+        "https://api.anthropic.com/v1/messages",
+    );
+    let mut openai_lower = make_model_entry("openai", "gpt-a", "https://api.openai.com/v1");
+    openai_lower.api_key = Some("test-openai-key".to_string());
+    let mut openai_upper = make_model_entry("OpenAI", "GPT-A", "https://api.openai.com/v1");
+    openai_upper.api_key = Some("test-openai-key-2".to_string());
+
+    let available_models = vec![anthropic.clone(), openai_lower, openai_upper];
+    let model_scope = Vec::new();
+
+    let mut app = build_app_with_models(
+        &harness,
+        Session::in_memory(),
+        Config::default(),
+        anthropic,
+        model_scope,
+        available_models,
+        KeyBindings::new(),
+    );
+
+    type_text(&harness, &mut app, "/model");
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Select a model");
+    assert_after_contains(&harness, &step, "openai/gpt-a");
+    assert_after_not_contains(&harness, &step, "OpenAI/GPT-A");
 }
 
 #[test]
@@ -4122,6 +4166,43 @@ fn tui_state_slash_tree_select_root_user_message_prefills_editor_and_resets_leaf
 }
 
 #[test]
+fn tui_state_slash_tree_summary_prompt_stays_open_when_agent_busy() {
+    let harness =
+        TestHarness::new("tui_state_slash_tree_summary_prompt_stays_open_when_agent_busy");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    {
+        let session = app.session_handle();
+        let mut session_guard = session.try_lock().expect("session try_lock");
+        session_guard.append_message(SessionMessage::User {
+            content: UserContent::Text("Root".to_string()),
+            timestamp: Some(0),
+        });
+        session_guard.append_message(SessionMessage::User {
+            content: UserContent::Text("Child".to_string()),
+            timestamp: Some(0),
+        });
+    }
+
+    type_text(&harness, &mut app, "/tree");
+    press_enter(&harness, &mut app);
+    press_up(&harness, &mut app);
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Branch Summary");
+
+    press_down(&harness, &mut app);
+
+    let agent_handle = app.agent_handle();
+    let _guard = agent_handle.try_lock().expect("agent lock");
+
+    let step = press_enter(&harness, &mut app);
+
+    assert_eq!(app.status_message(), Some("Agent busy; try again"));
+    assert_after_contains(&harness, &step, "Branch Summary");
+}
+
+#[test]
 fn tui_state_slash_fork_creates_session_and_prefills_editor() {
     let harness = TestHarness::new("tui_state_slash_fork_creates_session_and_prefills_editor");
     let base_dir = harness.temp_path("sessions");
@@ -4285,11 +4366,7 @@ fn tui_state_status_message_clears_on_any_keypress() {
     press_enter(&harness, &mut app);
 
     let step = type_text(&harness, &mut app, "x");
-    assert_after_not_contains(
-        &harness,
-        &step,
-        "No models with configured API keys. Use /login <provider> to configure credentials.",
-    );
+    assert_after_not_contains(&harness, &step, "No matching models.");
 }
 
 #[test]
@@ -5108,6 +5185,25 @@ fn tui_grad_branch_picker_opens_with_branches() {
 }
 
 #[test]
+fn tui_grad_branch_picker_busy_session_shows_busy_message() {
+    let harness = TestHarness::new("tui_grad_branch_picker_busy_session_shows_busy_message");
+    let (session, _, _, _) = create_two_branch_session();
+    let (mut app, _rx) = build_app_with_session_and_events(&harness, Vec::new(), session);
+    log_initial_state(&harness, &app);
+
+    let session_handle = app.session_handle();
+    let _guard = session_handle.try_lock().expect("session lock");
+
+    app.open_branch_picker();
+
+    assert_eq!(app.status_message(), Some("Session busy; try again"));
+    assert!(
+        !app.has_branch_picker(),
+        "Picker should stay closed while busy"
+    );
+}
+
+#[test]
 fn tui_grad_branch_picker_escape_closes() {
     let harness = TestHarness::new("tui_grad_branch_picker_escape_closes");
     let (session, _, _, _) = create_two_branch_session();
@@ -5154,6 +5250,63 @@ fn tui_grad_branch_picker_navigation_up_down() {
 }
 
 #[test]
+fn tui_grad_branch_picker_enter_while_session_busy_keeps_picker_open() {
+    let harness =
+        TestHarness::new("tui_grad_branch_picker_enter_while_session_busy_keeps_picker_open");
+    let (session, _, _, _) = create_two_branch_session();
+    let (mut app, _rx) = build_app_with_session_and_events(&harness, Vec::new(), session);
+    log_initial_state(&harness, &app);
+
+    app.open_branch_picker();
+    assert!(app.has_branch_picker());
+    app.handle_branch_picker_key(&KeyMsg::from_type(KeyType::Down));
+
+    let session_handle = app.session_handle();
+    let _guard = session_handle.try_lock().expect("session lock");
+
+    app.handle_branch_picker_key(&KeyMsg::from_type(KeyType::Enter));
+
+    assert_eq!(app.status_message(), Some("Session busy; try again"));
+    assert!(
+        app.has_branch_picker(),
+        "Picker should remain open when branch switch cannot start"
+    );
+}
+
+#[test]
+fn tui_grad_branch_picker_enter_while_agent_busy_keeps_picker_open() {
+    let harness =
+        TestHarness::new("tui_grad_branch_picker_enter_while_agent_busy_keeps_picker_open");
+    let (session, _, _, _) = create_two_branch_session();
+    let extension_source = r"
+export default function init(pi) {}
+";
+    let (mut app, _rx) = build_app_with_session_and_events_and_extension(
+        &harness,
+        Vec::new(),
+        session,
+        Config::default(),
+        extension_source,
+    );
+    log_initial_state(&harness, &app);
+
+    app.open_branch_picker();
+    assert!(app.has_branch_picker());
+    app.handle_branch_picker_key(&KeyMsg::from_type(KeyType::Down));
+
+    let agent_handle = app.agent_handle();
+    let _guard = agent_handle.try_lock().expect("agent lock");
+
+    app.handle_branch_picker_key(&KeyMsg::from_type(KeyType::Enter));
+
+    assert_eq!(app.status_message(), Some("Agent busy; try again"));
+    assert!(
+        app.has_branch_picker(),
+        "Picker should remain open when navigation cannot start"
+    );
+}
+
+#[test]
 fn tui_grad_branch_picker_enter_switches_branch() {
     let harness = TestHarness::new("tui_grad_branch_picker_enter_switches_branch");
     let (session, _, _, _) = create_two_branch_session();
@@ -5188,6 +5341,21 @@ fn tui_grad_cycle_sibling_forward_with_branches() {
         !msg.contains("No sibling branches"),
         "Expected successful branch cycle, got status: {msg}"
     );
+}
+
+#[test]
+fn tui_grad_cycle_sibling_branch_busy_session_shows_busy_message() {
+    let harness = TestHarness::new("tui_grad_cycle_sibling_branch_busy_session_shows_busy_message");
+    let (session, _, _, _) = create_two_branch_session();
+    let (mut app, _rx) = build_app_with_session_and_events(&harness, Vec::new(), session);
+    log_initial_state(&harness, &app);
+
+    let session_handle = app.session_handle();
+    let _guard = session_handle.try_lock().expect("session lock");
+
+    app.cycle_sibling_branch(true);
+
+    assert_eq!(app.status_message(), Some("Session busy; try again"));
 }
 
 #[test]
@@ -6224,7 +6392,7 @@ fn tui_state_model_selector_opens_on_ctrll() {
 
     let step = press_ctrll(&harness, &mut app);
     assert_after_contains(&harness, &step, "Select a model");
-    assert_after_contains(&harness, &step, "(type to filter)");
+    assert_after_contains(&harness, &step, "Only showing models that are ready to use");
     assert_after_contains(&harness, &step, "anthropic/claude-a");
     assert_after_contains(&harness, &step, "openai/gpt-a");
 }

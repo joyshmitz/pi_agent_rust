@@ -117,15 +117,82 @@ impl OpenAIResponsesProvider {
             )
         };
 
+        let instructions = context.system_prompt.as_deref().map(ToString::to_string);
+
+        // Codex mode requires additional fields per the TS reference implementation.
+        // tool_choice and parallel_tool_calls are always sent (not conditional on tools).
+        let (tool_choice, parallel_tool_calls, text, include, reasoning) = if self.codex_mode {
+            let effort = options
+                .thinking_level
+                .as_ref()
+                .map_or_else(|| "high".to_string(), ToString::to_string);
+            (
+                Some("auto"),
+                Some(true),
+                Some(OpenAIResponsesTextConfig {
+                    verbosity: "medium",
+                }),
+                Some(vec!["reasoning.encrypted_content"]),
+                Some(OpenAIResponsesReasoning {
+                    effort,
+                    summary: Some("auto"),
+                }),
+            )
+        } else {
+            (None, None, None, None, None)
+        };
+
         OpenAIResponsesRequest {
             model: self.model.clone(),
             input,
+            instructions,
             temperature: options.temperature,
-            max_output_tokens: options.max_tokens.or(Some(DEFAULT_MAX_OUTPUT_TOKENS)),
+            max_output_tokens: if self.codex_mode {
+                None
+            } else {
+                options.max_tokens.or(Some(DEFAULT_MAX_OUTPUT_TOKENS))
+            },
             tools,
             stream: true,
+            store: false,
+            tool_choice,
+            parallel_tool_calls,
+            text,
+            include,
+            reasoning,
         }
     }
+}
+
+fn bearer_token_from_authorization_header(value: &str) -> Option<String> {
+    let mut parts = value.split_whitespace();
+    let scheme = parts.next()?;
+    let bearer_value = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if scheme.eq_ignore_ascii_case("bearer") && !bearer_value.trim().is_empty() {
+        Some(bearer_value.trim().to_string())
+    } else {
+        None
+    }
+}
+
+fn authorization_override(
+    options: &StreamOptions,
+    compat: Option<&CompatConfig>,
+) -> Option<String> {
+    super::first_non_empty_header_value_case_insensitive(&options.headers, &["authorization"])
+        .or_else(|| {
+            compat
+                .and_then(|compat| compat.custom_headers.as_ref())
+                .and_then(|headers| {
+                    super::first_non_empty_header_value_case_insensitive(
+                        headers,
+                        &["authorization"],
+                    )
+                })
+        })
 }
 
 #[async_trait]
@@ -148,12 +215,9 @@ impl Provider for OpenAIResponsesProvider {
         context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-        let has_authorization_header = options
-            .headers
-            .keys()
-            .any(|key| key.eq_ignore_ascii_case("authorization"));
+        let authorization_header_value = authorization_override(options, self.compat.as_ref());
 
-        let auth_value = if has_authorization_header {
+        let auth_value = if authorization_header_value.is_some() {
             None
         } else {
             Some(
@@ -164,7 +228,7 @@ impl Provider for OpenAIResponsesProvider {
                     .ok_or_else(|| {
                         Error::provider(
                             self.name(),
-                            "Missing API key for OpenAI/Codex. Set OPENAI_API_KEY or run /login.",
+                            "Missing API key for provider. Configure credentials with /login <provider> or set the provider's API key env var.",
                         )
                     })?,
             )
@@ -179,39 +243,54 @@ impl Provider for OpenAIResponsesProvider {
             .post(&self.base_url)
             .header("Accept", "text/event-stream");
 
-        if let Some(auth_value) = auth_value {
+        if let Some(ref auth_value) = auth_value {
             request = request.header("Authorization", format!("Bearer {auth_value}"));
-            if self.codex_mode {
-                let account_id = extract_chatgpt_account_id(&auth_value).ok_or_else(|| {
+        }
+
+        if self.codex_mode {
+            let codex_bearer = authorization_header_value
+                .as_deref()
+                .and_then(bearer_token_from_authorization_header)
+                .or_else(|| auth_value.clone())
+                .ok_or_else(|| {
                     Error::provider(
                         self.name(),
-                        "Invalid OpenAI Codex OAuth token (missing chatgpt_account_id claim). Run /login openai-codex again.",
+                        "OpenAI Codex mode requires a Bearer token. Provide one via /login openai-codex or an Authorization: Bearer <token> header.",
                     )
                 })?;
-                request = request
-                    .header("chatgpt-account-id", account_id)
-                    .header("OpenAI-Beta", "responses=experimental")
-                    .header("originator", "pi")
-                    .header("User-Agent", "pi_agent_rust");
-                if let Some(session_id) = &options.session_id {
-                    request = request.header("session_id", session_id);
-                }
+            let account_id = extract_chatgpt_account_id(&codex_bearer).ok_or_else(|| {
+                Error::provider(
+                    self.name(),
+                    "Invalid OpenAI Codex OAuth token (missing chatgpt_account_id claim). Run /login openai-codex again.",
+                )
+            })?;
+            request = request
+                .header("chatgpt-account-id", account_id)
+                .header("OpenAI-Beta", "responses=experimental")
+                .header("originator", "pi")
+                .header("User-Agent", "pi_agent_rust");
+            if let Some(session_id) = &options.session_id {
+                request = request.header("session_id", session_id);
             }
         }
 
         // Apply provider-specific custom headers from compat config.
         if let Some(compat) = &self.compat {
             if let Some(custom_headers) = &compat.custom_headers {
-                for (key, value) in custom_headers {
-                    request = request.header(key, value);
-                }
+                request = super::apply_headers_ignoring_blank_auth_overrides(
+                    request,
+                    custom_headers,
+                    &["authorization"],
+                );
             }
         }
 
         // Per-request headers from StreamOptions (highest priority).
-        for (key, value) in &options.headers {
-            request = request.header(key, value);
-        }
+        request = super::apply_headers_ignoring_blank_auth_overrides(
+            request,
+            &options.headers,
+            &["authorization"],
+        );
 
         let request = request.json(&request_body)?;
 
@@ -228,28 +307,27 @@ impl Provider for OpenAIResponsesProvider {
             ));
         }
 
+        // Validate Content-Type when present. If the header is missing entirely
+        // (as with some OpenAI Codex endpoints), proceed optimistically since the
+        // wire framing may still be SSE. If the header IS present and indicates
+        // a non-SSE type, reject early so we fail closed instead of silently
+        // dropping events in the SSE parser.
         let content_type = response
             .headers()
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
             .map(|(_, value)| value.to_ascii_lowercase());
-        if !content_type
-            .as_deref()
-            .is_some_and(|value| value.contains("text/event-stream"))
-        {
-            let message = content_type.map_or_else(
-                || {
-                    format!(
-                        "OpenAI API protocol error (HTTP {status}): missing Content-Type (expected text/event-stream)"
-                    )
-                },
-                |value| {
-                    format!(
-                        "OpenAI API protocol error (HTTP {status}): unexpected Content-Type {value} (expected text/event-stream)"
-                    )
-                },
-            );
-            return Err(Error::api(message));
+        if let Some(ref ct) = content_type {
+            if ct.contains("application/x-ndjson") {
+                return Err(Error::api(format!(
+                    "OpenAI API protocol error (HTTP {status}): unsupported Content-Type {ct} (NDJSON streaming is not yet supported; expected text/event-stream)"
+                )));
+            }
+            if !ct.contains("text/event-stream") {
+                return Err(Error::api(format!(
+                    "OpenAI API protocol error (HTTP {status}): unexpected Content-Type {ct} (expected text/event-stream)"
+                )));
+            }
         }
 
         let event_source = SseStream::new(response.bytes_stream());
@@ -266,19 +344,24 @@ impl Provider for OpenAIResponsesProvider {
                         return Some((Ok(event), state));
                     }
 
-                    // We may have marked the stream finished (e.g. after receiving
-                    // response.completed) but still need to drain queued events (ToolCallEnd,
-                    // Done, etc). Only stop once the queue is empty.
+                    // We may have queued terminal events (ToolCallEnd, Done, etc) after
+                    // consuming the final wire chunk. Only stop once the queue is empty.
                     if state.finished {
                         return None;
                     }
 
                     match state.event_source.next().await {
                         Some(Ok(msg)) => {
+                            // A successful chunk resets the consecutive error counter.
+                            state.write_zero_count = 0;
                             if msg.data == "[DONE]" {
-                                // Best-effort fallback: if we didn't see a completed/incomplete
-                                // chunk, emit Done using current state.
-                                state.finish(None);
+                                // Response terminal metadata can arrive before trailing item
+                                // events, so only emit Done once the wire stream itself ends.
+                                if !state.finish_terminal_response() {
+                                    // Best-effort fallback: if we didn't see a completed or
+                                    // incomplete chunk, emit Done using current state.
+                                    state.finish(None);
+                                }
                                 continue;
                             }
 
@@ -287,10 +370,33 @@ impl Provider for OpenAIResponsesProvider {
                             }
                         }
                         Some(Err(e)) => {
+                            // WriteZero errors are transient (e.g. empty SSE
+                            // frames from certain providers like Kimi K2.5).
+                            // Skip them and keep reading the stream, but cap
+                            // consecutive occurrences to avoid infinite loops.
+                            const MAX_CONSECUTIVE_WRITE_ZERO: usize = 5;
+                            if e.kind() == std::io::ErrorKind::WriteZero {
+                                state.write_zero_count += 1;
+                                if state.write_zero_count <= MAX_CONSECUTIVE_WRITE_ZERO {
+                                    tracing::warn!(
+                                        count = state.write_zero_count,
+                                        "Transient WriteZero error in SSE stream, continuing"
+                                    );
+                                    continue;
+                                }
+                                tracing::warn!(
+                                    "WriteZero error persisted after {MAX_CONSECUTIVE_WRITE_ZERO} \
+                                     consecutive attempts, treating as fatal"
+                                );
+                            }
                             let err = Error::api(format!("SSE error: {e}"));
                             return Some((Err(err), state));
                         }
                         None => {
+                            if state.finish_terminal_response() {
+                                continue;
+                            }
+
                             // If the stream ends unexpectedly, surface an error. This matches the
                             // agent loop expectation that providers emit Done/Error explicitly.
                             return Some((
@@ -320,7 +426,14 @@ struct TextKey {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ReasoningKey {
     item_id: String,
-    summary_index: u32,
+    kind: ReasoningKind,
+    index: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ReasoningKind {
+    Summary,
+    Text,
 }
 
 struct ToolCallState {
@@ -328,6 +441,20 @@ struct ToolCallState {
     call_id: String,
     name: String,
     arguments: String,
+}
+
+enum TerminalContentSnapshot {
+    Text {
+        content_index: usize,
+        content: String,
+    },
+    Thinking {
+        content_index: usize,
+        content: String,
+    },
+    ToolCall {
+        content_index: usize,
+    },
 }
 
 struct StreamState<S>
@@ -342,6 +469,11 @@ where
     text_blocks: HashMap<TextKey, usize>,
     reasoning_blocks: HashMap<ReasoningKey, usize>,
     tool_calls_by_item_id: HashMap<String, ToolCallState>,
+    orphan_tool_call_arguments: HashMap<String, String>,
+    terminal_response_seen: bool,
+    terminal_incomplete_reason: Option<String>,
+    /// Consecutive WriteZero errors seen without a successful event in between.
+    write_zero_count: usize,
 }
 
 impl<S> StreamState<S>
@@ -367,6 +499,10 @@ where
             text_blocks: HashMap::new(),
             reasoning_blocks: HashMap::new(),
             tool_calls_by_item_id: HashMap::new(),
+            orphan_tool_call_arguments: HashMap::new(),
+            terminal_response_seen: false,
+            terminal_incomplete_reason: None,
+            write_zero_count: 0,
         }
     }
 
@@ -377,6 +513,22 @@ where
                 partial: self.partial.clone(),
             });
         }
+    }
+
+    fn record_terminal_response(&mut self, incomplete_reason: Option<String>) {
+        self.terminal_response_seen = true;
+        self.terminal_incomplete_reason = incomplete_reason;
+    }
+
+    fn finish_terminal_response(&mut self) -> bool {
+        if !self.terminal_response_seen {
+            return false;
+        }
+
+        let incomplete_reason = self.terminal_incomplete_reason.take();
+        self.terminal_response_seen = false;
+        self.finish(incomplete_reason);
+        true
     }
 
     fn text_block_for(&mut self, item_id: String, content_index: u32) -> usize {
@@ -398,10 +550,11 @@ where
         idx
     }
 
-    fn reasoning_block_for(&mut self, item_id: String, summary_index: u32) -> usize {
+    fn reasoning_block_for(&mut self, kind: ReasoningKind, item_id: String, index: u32) -> usize {
         let key = ReasoningKey {
             item_id,
-            summary_index,
+            kind,
+            index,
         };
         if let Some(idx) = self.reasoning_blocks.get(&key) {
             return *idx;
@@ -420,10 +573,98 @@ where
         idx
     }
 
+    fn append_reasoning_delta(
+        &mut self,
+        kind: ReasoningKind,
+        item_id: String,
+        index: u32,
+        delta: String,
+    ) {
+        self.ensure_started();
+        let idx = self.reasoning_block_for(kind, item_id, index);
+        if let Some(ContentBlock::Thinking(block)) = self.partial.content.get_mut(idx) {
+            block.thinking.push_str(&delta);
+        }
+        self.pending_events.push_back(StreamEvent::ThinkingDelta {
+            content_index: idx,
+            delta,
+        });
+    }
+
+    fn apply_text_snapshot(&mut self, item_id: String, content_index: u32, text: String) {
+        self.ensure_started();
+        let idx = self.text_block_for(item_id, content_index);
+        let Some(ContentBlock::Text(block)) = self.partial.content.get_mut(idx) else {
+            return;
+        };
+
+        if block.text == text {
+            return;
+        }
+
+        if let Some(suffix) = text.strip_prefix(&block.text) {
+            if suffix.is_empty() {
+                return;
+            }
+            block.text.push_str(suffix);
+            self.pending_events.push_back(StreamEvent::TextDelta {
+                content_index: idx,
+                delta: suffix.to_string(),
+            });
+            return;
+        }
+
+        tracing::warn!(
+            content_index = idx,
+            old_len = block.text.len(),
+            new_len = text.len(),
+            "text snapshot does not extend accumulated text; replacing"
+        );
+        block.text = text;
+    }
+
+    fn apply_reasoning_snapshot(
+        &mut self,
+        kind: ReasoningKind,
+        item_id: String,
+        index: u32,
+        text: String,
+    ) {
+        self.ensure_started();
+        let idx = self.reasoning_block_for(kind, item_id, index);
+        let Some(ContentBlock::Thinking(block)) = self.partial.content.get_mut(idx) else {
+            return;
+        };
+
+        if block.thinking == text {
+            return;
+        }
+
+        if let Some(suffix) = text.strip_prefix(&block.thinking) {
+            if suffix.is_empty() {
+                return;
+            }
+            block.thinking.push_str(suffix);
+            self.pending_events.push_back(StreamEvent::ThinkingDelta {
+                content_index: idx,
+                delta: suffix.to_string(),
+            });
+            return;
+        }
+
+        tracing::warn!(
+            content_index = idx,
+            old_len = block.thinking.len(),
+            new_len = text.len(),
+            "reasoning snapshot does not extend accumulated thinking; replacing"
+        );
+        block.thinking = text;
+    }
+
     #[allow(clippy::too_many_lines)]
     fn process_event(&mut self, data: &str) -> Result<()> {
-        let chunk: OpenAIResponsesChunk =
-            serde_json::from_str(data).map_err(|e| Error::api(format!("JSON parse error: {e}")))?;
+        let chunk: OpenAIResponsesChunk = serde_json::from_str(data)
+            .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
 
         match chunk {
             OpenAIResponsesChunk::OutputTextDelta {
@@ -446,16 +687,69 @@ where
                 summary_index,
                 delta,
             } => {
-                self.ensure_started();
-                let idx = self.reasoning_block_for(item_id, summary_index);
-                if let Some(ContentBlock::Thinking(t)) = self.partial.content.get_mut(idx) {
-                    t.thinking.push_str(&delta);
-                }
-                self.pending_events.push_back(StreamEvent::ThinkingDelta {
-                    content_index: idx,
-                    delta,
-                });
+                self.append_reasoning_delta(ReasoningKind::Summary, item_id, summary_index, delta);
             }
+            OpenAIResponsesChunk::ReasoningTextDelta {
+                item_id,
+                content_index,
+                delta,
+            } => {
+                self.append_reasoning_delta(ReasoningKind::Text, item_id, content_index, delta);
+            }
+            OpenAIResponsesChunk::OutputTextDone {
+                item_id,
+                content_index,
+                text,
+            } => {
+                self.apply_text_snapshot(item_id, content_index, text);
+            }
+            OpenAIResponsesChunk::ContentPartDone {
+                item_id,
+                content_index,
+                part,
+            } => match part {
+                OpenAIResponsesContentPartDone::OutputText { text } => {
+                    self.apply_text_snapshot(item_id, content_index, text);
+                }
+                OpenAIResponsesContentPartDone::ReasoningText { text } => {
+                    self.apply_reasoning_snapshot(
+                        ReasoningKind::Text,
+                        item_id,
+                        content_index,
+                        text,
+                    );
+                }
+                OpenAIResponsesContentPartDone::Unknown => {}
+            },
+            OpenAIResponsesChunk::ReasoningTextDone {
+                item_id,
+                content_index,
+                text,
+            } => {
+                self.apply_reasoning_snapshot(ReasoningKind::Text, item_id, content_index, text);
+            }
+            OpenAIResponsesChunk::ReasoningSummaryTextDone {
+                item_id,
+                summary_index,
+                text,
+            } => {
+                self.apply_reasoning_snapshot(ReasoningKind::Summary, item_id, summary_index, text);
+            }
+            OpenAIResponsesChunk::ReasoningSummaryPartDone {
+                item_id,
+                summary_index,
+                part,
+            } => match part {
+                OpenAIResponsesReasoningSummaryPartDone::SummaryText { text } => {
+                    self.apply_reasoning_snapshot(
+                        ReasoningKind::Summary,
+                        item_id,
+                        summary_index,
+                        text,
+                    );
+                }
+                OpenAIResponsesReasoningSummaryPartDone::Unknown => {}
+            },
             OpenAIResponsesChunk::OutputItemAdded { item } => {
                 if let OpenAIResponsesOutputItem::FunctionCall {
                     id,
@@ -465,6 +759,12 @@ where
                 } = item
                 {
                     self.ensure_started();
+
+                    let mut buffered_arguments = self
+                        .orphan_tool_call_arguments
+                        .remove(&id)
+                        .unwrap_or_default();
+                    buffered_arguments.insert_str(0, &arguments);
 
                     let content_index = self.partial.content.len();
                     self.partial.content.push(ContentBlock::ToolCall(ToolCall {
@@ -480,17 +780,17 @@ where
                             content_index,
                             call_id,
                             name,
-                            arguments: arguments.clone(),
+                            arguments: buffered_arguments.clone(),
                         },
                     );
 
                     self.pending_events
                         .push_back(StreamEvent::ToolCallStart { content_index });
 
-                    if !arguments.is_empty() {
+                    if !buffered_arguments.is_empty() {
                         self.pending_events.push_back(StreamEvent::ToolCallDelta {
                             content_index,
-                            delta: arguments,
+                            delta: buffered_arguments,
                         });
                     }
                 }
@@ -503,6 +803,11 @@ where
                         content_index: tc.content_index,
                         delta,
                     });
+                } else {
+                    self.orphan_tool_call_arguments
+                        .entry(item_id)
+                        .or_default()
+                        .push_str(&delta);
                 }
             }
             OpenAIResponsesChunk::OutputItemDone { item } => {
@@ -527,8 +832,7 @@ where
                     .usage
                     .total_tokens
                     .unwrap_or(response.usage.input_tokens + response.usage.output_tokens);
-
-                self.finish(response.incomplete_reason());
+                self.record_terminal_response(response.incomplete_reason());
             }
             OpenAIResponsesChunk::ResponseFailed { response } => {
                 self.ensure_started();
@@ -569,11 +873,10 @@ where
     }
 
     fn end_tool_call(&mut self, item_id: &str, call_id: &str, name: &str, arguments: &str) {
-        let mut tc = self
-            .tool_calls_by_item_id
-            .remove(item_id)
-            .unwrap_or_else(|| {
-                // If we missed the added event, synthesize a content slot now.
+        let (mut tc, synthesized_start) = self.tool_calls_by_item_id.remove(item_id).map_or_else(
+            || {
+                // If we missed the added event, synthesize the full tool-call block now
+                // so downstream consumers still see a valid Start → Delta? → End sequence.
                 let content_index = self.partial.content.len();
                 self.partial.content.push(ContentBlock::ToolCall(ToolCall {
                     id: call_id.to_string(),
@@ -581,41 +884,109 @@ where
                     arguments: serde_json::Value::Null,
                     thought_signature: None,
                 }));
-                ToolCallState {
-                    content_index,
-                    call_id: call_id.to_string(),
-                    name: name.to_string(),
-                    arguments: String::new(),
-                }
+                (
+                    ToolCallState {
+                        content_index,
+                        call_id: call_id.to_string(),
+                        name: name.to_string(),
+                        arguments: self
+                            .orphan_tool_call_arguments
+                            .remove(item_id)
+                            .unwrap_or_default(),
+                    },
+                    true,
+                )
+            },
+            |state| (state, false),
+        );
+
+        if synthesized_start {
+            self.pending_events.push_back(StreamEvent::ToolCallStart {
+                content_index: tc.content_index,
             });
+        }
 
         // Prefer the final arguments field when present.
         if !arguments.is_empty() {
             tc.arguments = arguments.to_string();
         }
 
-        let parsed_args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, raw = %tc.arguments, "Failed to parse tool arguments as JSON");
-            serde_json::Value::Null
-        });
-
-        if let Some(ContentBlock::ToolCall(block)) = self.partial.content.get_mut(tc.content_index)
-        {
-            block.id.clone_from(&tc.call_id);
-            block.name.clone_from(&tc.name);
-            block.arguments = parsed_args.clone();
+        if synthesized_start && !tc.arguments.is_empty() {
+            self.pending_events.push_back(StreamEvent::ToolCallDelta {
+                content_index: tc.content_index,
+                delta: tc.arguments.clone(),
+            });
         }
+
+        let parsed_args: serde_json::Value =
+            serde_json::from_str(&tc.arguments).unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    raw = %tc.arguments,
+                    "Failed to parse tool arguments as JSON"
+                );
+                serde_json::Value::Null
+            });
 
         self.partial.stop_reason = StopReason::ToolUse;
         self.pending_events.push_back(StreamEvent::ToolCallEnd {
             content_index: tc.content_index,
             tool_call: ToolCall {
-                id: tc.call_id,
-                name: tc.name,
-                arguments: parsed_args,
+                id: tc.call_id.clone(),
+                name: tc.name.clone(),
+                arguments: parsed_args.clone(),
                 thought_signature: None,
             },
         });
+
+        if let Some(ContentBlock::ToolCall(block)) = self.partial.content.get_mut(tc.content_index)
+        {
+            block.id = tc.call_id;
+            block.name = tc.name;
+            block.arguments = parsed_args;
+        }
+    }
+
+    fn terminal_content_snapshots(&self) -> Vec<TerminalContentSnapshot> {
+        self.partial
+            .content
+            .iter()
+            .enumerate()
+            .filter_map(|(content_index, block)| match block {
+                ContentBlock::Text(t) => Some(TerminalContentSnapshot::Text {
+                    content_index,
+                    content: t.text.clone(),
+                }),
+                ContentBlock::Thinking(t) => Some(TerminalContentSnapshot::Thinking {
+                    content_index,
+                    content: t.thinking.clone(),
+                }),
+                ContentBlock::ToolCall(_) => {
+                    Some(TerminalContentSnapshot::ToolCall { content_index })
+                }
+                ContentBlock::Image(_) => None,
+            })
+            .collect()
+    }
+
+    fn open_tool_call_snapshots_in_content_order(
+        &self,
+    ) -> Vec<(usize, String, String, String, String)> {
+        let mut open_tool_calls: Vec<(usize, String, String, String, String)> = self
+            .tool_calls_by_item_id
+            .iter()
+            .map(|(item_id, tc)| {
+                (
+                    tc.content_index,
+                    item_id.clone(),
+                    tc.call_id.clone(),
+                    tc.name.clone(),
+                    tc.arguments.clone(),
+                )
+            })
+            .collect();
+        open_tool_calls.sort_by_key(|(content_index, ..)| *content_index);
+        open_tool_calls
     }
 
     fn finish(&mut self, incomplete_reason: Option<String>) {
@@ -623,35 +994,40 @@ where
             return;
         }
 
-        // Emit TextEnd for all open text blocks
-        for idx in self.text_blocks.values() {
-            if let Some(ContentBlock::Text(t)) = self.partial.content.get(*idx) {
-                self.pending_events.push_back(StreamEvent::TextEnd {
-                    content_index: *idx,
-                    content: t.text.clone(),
-                });
+        let mut open_tool_calls = self
+            .open_tool_call_snapshots_in_content_order()
+            .into_iter()
+            .peekable();
+
+        for block in self.terminal_content_snapshots() {
+            match block {
+                TerminalContentSnapshot::Text {
+                    content_index,
+                    content,
+                } => self.pending_events.push_back(StreamEvent::TextEnd {
+                    content_index,
+                    content,
+                }),
+                TerminalContentSnapshot::Thinking {
+                    content_index,
+                    content,
+                } => self.pending_events.push_back(StreamEvent::ThinkingEnd {
+                    content_index,
+                    content,
+                }),
+                TerminalContentSnapshot::ToolCall { content_index } => {
+                    while let Some((_, item_id, call_id, name, arguments)) = open_tool_calls
+                        .next_if(|(tool_content_index, ..)| *tool_content_index == content_index)
+                    {
+                        self.end_tool_call(&item_id, &call_id, &name, &arguments);
+                    }
+                }
             }
         }
 
-        // Emit ThinkingEnd for all open reasoning blocks
-        for idx in self.reasoning_blocks.values() {
-            if let Some(ContentBlock::Thinking(t)) = self.partial.content.get(*idx) {
-                self.pending_events.push_back(StreamEvent::ThinkingEnd {
-                    content_index: *idx,
-                    content: t.thinking.clone(),
-                });
-            }
-        }
-
-        // Best-effort: close any tool calls we didn't see "done" for.
-        let ids: Vec<String> = self.tool_calls_by_item_id.keys().cloned().collect();
-        for id in ids {
-            // Clone metadata first (end_tool_call removes the state).
-            let (call_id, name, arguments) = match self.tool_calls_by_item_id.get(&id) {
-                Some(tc) => (tc.call_id.clone(), tc.name.clone(), tc.arguments.clone()),
-                None => continue,
-            };
-            self.end_tool_call(&id, &call_id, &name, &arguments);
+        // Best-effort: close any tool calls whose content block disappeared unexpectedly.
+        for (_, item_id, call_id, name, arguments) in open_tool_calls {
+            self.end_tool_call(&item_id, &call_id, &name, &arguments);
         }
 
         // Infer stop reason.
@@ -709,12 +1085,37 @@ pub struct OpenAIResponsesRequest {
     model: String,
     input: Vec<OpenAIResponsesInputItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OpenAIResponsesTool>>,
     stream: bool,
+    store: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<OpenAIResponsesTextConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include: Option<Vec<&'static str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<OpenAIResponsesReasoning>,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAIResponsesTextConfig {
+    verbosity: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAIResponsesReasoning {
+    effort: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -787,14 +1188,11 @@ fn convert_tool_to_openai_responses(tool: &ToolDef) -> OpenAIResponsesTool {
 }
 
 fn build_openai_responses_input(context: &Context<'_>) -> Vec<OpenAIResponsesInputItem> {
-    let mut input = Vec::new();
+    let mut input = Vec::with_capacity(context.messages.len());
 
-    if let Some(system) = &context.system_prompt {
-        input.push(OpenAIResponsesInputItem::System {
-            role: "system",
-            content: system.to_string(),
-        });
-    }
+    // System prompt is sent as top-level `instructions` field, not in input array.
+    // Some providers (e.g. OpenAI Codex) require `instructions` and reject system
+    // messages in the input array.
 
     for message in context.messages.iter() {
         match message {
@@ -913,17 +1311,53 @@ enum OpenAIResponsesChunk {
         content_index: u32,
         delta: String,
     },
+    #[serde(rename = "response.output_text.done")]
+    OutputTextDone {
+        item_id: String,
+        content_index: u32,
+        text: String,
+    },
     #[serde(rename = "response.output_item.added")]
     OutputItemAdded { item: OpenAIResponsesOutputItem },
     #[serde(rename = "response.output_item.done")]
     OutputItemDone { item: OpenAIResponsesOutputItemDone },
     #[serde(rename = "response.function_call_arguments.delta")]
     FunctionCallArgumentsDelta { item_id: String, delta: String },
+    #[serde(rename = "response.content_part.done")]
+    ContentPartDone {
+        item_id: String,
+        content_index: u32,
+        part: OpenAIResponsesContentPartDone,
+    },
+    #[serde(rename = "response.reasoning_text.delta")]
+    ReasoningTextDelta {
+        item_id: String,
+        content_index: u32,
+        delta: String,
+    },
+    #[serde(rename = "response.reasoning_text.done")]
+    ReasoningTextDone {
+        item_id: String,
+        content_index: u32,
+        text: String,
+    },
     #[serde(rename = "response.reasoning_summary_text.delta")]
     ReasoningSummaryTextDelta {
         item_id: String,
         summary_index: u32,
         delta: String,
+    },
+    #[serde(rename = "response.reasoning_summary_text.done")]
+    ReasoningSummaryTextDone {
+        item_id: String,
+        summary_index: u32,
+        text: String,
+    },
+    #[serde(rename = "response.reasoning_summary_part.done")]
+    ReasoningSummaryPartDone {
+        item_id: String,
+        summary_index: u32,
+        part: OpenAIResponsesReasoningSummaryPartDone,
     },
     #[serde(rename = "response.completed")]
     ResponseCompleted {
@@ -943,6 +1377,26 @@ enum OpenAIResponsesChunk {
     },
     #[serde(rename = "error")]
     Error { message: String },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum OpenAIResponsesContentPartDone {
+    #[serde(rename = "output_text")]
+    OutputText { text: String },
+    #[serde(rename = "reasoning_text")]
+    ReasoningText { text: String },
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type")]
+enum OpenAIResponsesReasoningSummaryPartDone {
+    #[serde(rename = "summary_text")]
+    SummaryText { text: String },
     #[serde(other)]
     Unknown,
 }
@@ -1079,11 +1533,10 @@ mod tests {
         assert!((temperature - 0.3).abs() < 1e-6);
         assert_eq!(value["max_output_tokens"], DEFAULT_MAX_OUTPUT_TOKENS);
         assert_eq!(value["stream"], true);
-        assert_eq!(value["input"][0]["role"], "system");
-        assert_eq!(value["input"][0]["content"], "System guidance");
-        assert_eq!(value["input"][1]["role"], "user");
-        assert_eq!(value["input"][1]["content"][0]["type"], "input_text");
-        assert_eq!(value["input"][1]["content"][0]["text"], "Ping");
+        assert_eq!(value["instructions"], "System guidance");
+        assert_eq!(value["input"][0]["role"], "user");
+        assert_eq!(value["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(value["input"][0]["content"][0]["text"], "Ping");
         assert_eq!(value["tools"][0]["type"], "function");
         assert_eq!(value["tools"][0]["name"], "search");
         assert_eq!(value["tools"][0]["description"], "Search docs");
@@ -1222,6 +1675,627 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_synthesizes_tool_call_start_when_done_arrives_first() {
+        let events = vec![
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_3",
+                    "call_id": "call_3",
+                    "name": "echo",
+                    "arguments": "{\"text\":\"late start\"}",
+                    "status": "completed"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "incomplete_details": null,
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2
+                    }
+                }
+            }),
+        ];
+
+        let out = collect_events(&events);
+        let start_idx = out
+            .iter()
+            .position(|event| matches!(event, StreamEvent::ToolCallStart { .. }))
+            .expect("tool call start");
+        let delta_idx = out
+            .iter()
+            .position(|event| matches!(event, StreamEvent::ToolCallDelta { delta, .. } if delta == "{\"text\":\"late start\"}"))
+            .expect("tool call delta");
+        let end_idx = out
+            .iter()
+            .position(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+            .expect("tool call end");
+
+        assert!(start_idx < delta_idx);
+        assert!(delta_idx < end_idx);
+
+        let tool_end = out
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::ToolCallEnd { tool_call, .. } => Some(tool_call),
+                _ => None,
+            })
+            .expect("tool call end");
+        assert_eq!(tool_end.id, "call_3");
+        assert_eq!(tool_end.name, "echo");
+        assert_eq!(tool_end.arguments, json!({ "text": "late start" }));
+        assert!(matches!(
+            out.last(),
+            Some(StreamEvent::Done {
+                reason: StopReason::ToolUse,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_stream_preserves_orphan_tool_call_deltas_until_done() {
+        let events = vec![
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_4",
+                "delta": "{\"text\":\"buffered\"}"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_4",
+                    "call_id": "call_4",
+                    "name": "echo",
+                    "arguments": "",
+                    "status": "completed"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "incomplete_details": null,
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2
+                    }
+                }
+            }),
+        ];
+
+        let out = collect_events(&events);
+        assert!(
+            out.iter()
+                .any(|event| matches!(event, StreamEvent::ToolCallStart { .. }))
+        );
+        assert!(out.iter().any(
+            |event| matches!(event, StreamEvent::ToolCallDelta { delta, .. } if delta == "{\"text\":\"buffered\"}")
+        ));
+
+        let tool_end = out
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::ToolCallEnd { tool_call, .. } => Some(tool_call),
+                _ => None,
+            })
+            .expect("tool call end");
+        assert_eq!(tool_end.id, "call_4");
+        assert_eq!(tool_end.arguments, json!({ "text": "buffered" }));
+    }
+
+    #[test]
+    fn test_stream_reads_late_tool_call_events_after_response_completed() {
+        let body = [
+            r#"data: {"type":"response.function_call_arguments.delta","item_id":"fc_5","delta":"{\"text\":\"late tool\"}"}"#,
+            "",
+            r#"data: {"type":"response.completed","response":{"incomplete_details":null,"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}"#,
+            "",
+            r#"data: {"type":"response.output_item.done","item":{"type":"function_call","id":"fc_5","call_id":"call_5","name":"echo","arguments":"","status":"completed"}}"#,
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+
+        let out = collect_stream_events_from_body(&body);
+        let start_idx = out
+            .iter()
+            .position(|event| matches!(event, StreamEvent::ToolCallStart { .. }))
+            .expect("tool call start");
+        let delta_idx = out
+            .iter()
+            .position(|event| matches!(event, StreamEvent::ToolCallDelta { delta, .. } if delta == "{\"text\":\"late tool\"}"))
+            .expect("tool call delta");
+        let end_idx = out
+            .iter()
+            .position(|event| matches!(event, StreamEvent::ToolCallEnd { .. }))
+            .expect("tool call end");
+        let done_idx = out
+            .iter()
+            .position(|event| matches!(event, StreamEvent::Done { .. }))
+            .expect("done event");
+
+        assert!(start_idx < delta_idx);
+        assert!(delta_idx < end_idx);
+        assert!(end_idx < done_idx);
+
+        let tool_end = out
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::ToolCallEnd { tool_call, .. } => Some(tool_call),
+                _ => None,
+            })
+            .expect("tool call end");
+        assert_eq!(tool_end.id, "call_5");
+        assert_eq!(tool_end.arguments, json!({ "text": "late tool" }));
+    }
+
+    #[test]
+    fn test_stream_materializes_output_text_done_without_deltas() {
+        let events = vec![
+            json!({
+                "type": "response.output_text.done",
+                "item_id": "msg_done",
+                "content_index": 0,
+                "text": "done-only text"
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "incomplete_details": null,
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2
+                    }
+                }
+            }),
+        ];
+
+        let out = collect_events(&events);
+        assert!(matches!(out.first(), Some(StreamEvent::Start { .. })));
+        assert!(matches!(
+            out.get(1),
+            Some(StreamEvent::TextStart { content_index: 0 })
+        ));
+        assert!(matches!(
+            out.get(2),
+            Some(StreamEvent::TextDelta {
+                content_index: 0,
+                delta,
+            }) if delta == "done-only text"
+        ));
+        assert!(matches!(
+            out.iter().find(|event| matches!(event, StreamEvent::TextEnd { .. })),
+            Some(StreamEvent::TextEnd {
+                content_index: 0,
+                content,
+            }) if content == "done-only text"
+        ));
+        assert!(matches!(
+            out.last(),
+            Some(StreamEvent::Done {
+                reason: StopReason::Stop,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_stream_backfills_missing_output_text_suffix_from_done_event() {
+        let events = vec![
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_suffix",
+                "content_index": 0,
+                "delta": "Hello"
+            }),
+            json!({
+                "type": "response.output_text.done",
+                "item_id": "msg_suffix",
+                "content_index": 0,
+                "text": "Hello world"
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "incomplete_details": null,
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 2,
+                        "total_tokens": 3
+                    }
+                }
+            }),
+        ];
+
+        let out = collect_events(&events);
+        let text_deltas: Vec<(usize, String)> = out
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta {
+                    content_index,
+                    delta,
+                } => Some((*content_index, delta.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            text_deltas,
+            vec![(0, "Hello".to_string()), (0, " world".to_string())]
+        );
+        assert!(matches!(
+            out.iter().find(|event| matches!(event, StreamEvent::TextEnd { .. })),
+            Some(StreamEvent::TextEnd {
+                content_index: 0,
+                content,
+            }) if content == "Hello world"
+        ));
+    }
+
+    #[test]
+    fn test_stream_materializes_reasoning_summary_part_done_without_deltas() {
+        let events = vec![
+            json!({
+                "type": "response.reasoning_summary_part.done",
+                "item_id": "rs_done",
+                "summary_index": 0,
+                "part": {
+                    "type": "summary_text",
+                    "text": "Plan first, answer second."
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "incomplete_details": null,
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2
+                    }
+                }
+            }),
+        ];
+
+        let out = collect_events(&events);
+        assert!(matches!(out.first(), Some(StreamEvent::Start { .. })));
+        assert!(matches!(
+            out.get(1),
+            Some(StreamEvent::ThinkingStart { content_index: 0 })
+        ));
+        assert!(matches!(
+            out.get(2),
+            Some(StreamEvent::ThinkingDelta {
+                content_index: 0,
+                delta,
+            }) if delta == "Plan first, answer second."
+        ));
+        assert!(matches!(
+            out.iter()
+                .find(|event| matches!(event, StreamEvent::ThinkingEnd { .. })),
+            Some(StreamEvent::ThinkingEnd {
+                content_index: 0,
+                content,
+            }) if content == "Plan first, answer second."
+        ));
+    }
+
+    #[test]
+    fn test_stream_materializes_reasoning_text_done_without_deltas() {
+        let events = vec![
+            json!({
+                "type": "response.reasoning_text.done",
+                "item_id": "rt_done",
+                "content_index": 0,
+                "text": "Private chain of thought."
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "incomplete_details": null,
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2
+                    }
+                }
+            }),
+        ];
+
+        let out = collect_events(&events);
+        assert!(matches!(out.first(), Some(StreamEvent::Start { .. })));
+        assert!(matches!(
+            out.get(1),
+            Some(StreamEvent::ThinkingStart { content_index: 0 })
+        ));
+        assert!(matches!(
+            out.get(2),
+            Some(StreamEvent::ThinkingDelta {
+                content_index: 0,
+                delta,
+            }) if delta == "Private chain of thought."
+        ));
+        assert!(matches!(
+            out.iter()
+                .find(|event| matches!(event, StreamEvent::ThinkingEnd { .. })),
+            Some(StreamEvent::ThinkingEnd {
+                content_index: 0,
+                content,
+            }) if content == "Private chain of thought."
+        ));
+    }
+
+    #[test]
+    fn test_stream_separates_reasoning_summary_and_reasoning_text_for_same_item() {
+        let events = vec![
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "rs_same",
+                "summary_index": 0,
+                "delta": "summary"
+            }),
+            json!({
+                "type": "response.reasoning_text.delta",
+                "item_id": "rs_same",
+                "content_index": 0,
+                "delta": "full reasoning"
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "incomplete_details": null,
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2
+                    }
+                }
+            }),
+        ];
+
+        let out = collect_events(&events);
+        let thinking_starts: Vec<usize> = out
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ThinkingStart { content_index } => Some(*content_index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking_starts, vec![0, 1]);
+
+        let thinking_deltas: Vec<(usize, String)> = out
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ThinkingDelta {
+                    content_index,
+                    delta,
+                } => Some((*content_index, delta.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            thinking_deltas,
+            vec![
+                (0, "summary".to_string()),
+                (1, "full reasoning".to_string())
+            ]
+        );
+
+        let thinking_ends: Vec<(usize, String)> = out
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::ThinkingEnd {
+                    content_index,
+                    content,
+                } => Some((*content_index, content.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            thinking_ends,
+            vec![
+                (0, "summary".to_string()),
+                (1, "full reasoning".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_finish_emits_terminal_block_end_events_in_content_order() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let byte_stream = stream::iter(vec![Ok(Vec::new())]);
+            let event_source = crate::sse::SseStream::new(Box::pin(byte_stream));
+            let mut state = StreamState::new(
+                event_source,
+                "gpt-test".to_string(),
+                "openai-responses".to_string(),
+                "openai".to_string(),
+            );
+
+            state
+                .process_event(
+                    &json!({
+                        "type": "response.output_text.delta",
+                        "item_id": "msg_1",
+                        "content_index": 0,
+                        "delta": "hello",
+                    })
+                    .to_string(),
+                )
+                .expect("text delta");
+            state
+                .process_event(
+                    &json!({
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": "rs_1",
+                        "summary_index": 0,
+                        "delta": "think",
+                    })
+                    .to_string(),
+                )
+                .expect("reasoning delta");
+            state
+                .process_event(
+                    &json!({
+                        "type": "response.output_text.delta",
+                        "item_id": "msg_2",
+                        "content_index": 0,
+                        "delta": "world",
+                    })
+                    .to_string(),
+                )
+                .expect("second text delta");
+
+            state.finish(None);
+
+            let terminal_end_kinds: Vec<(&'static str, usize)> = state
+                .pending_events
+                .iter()
+                .filter_map(|event| match event {
+                    StreamEvent::TextEnd { content_index, .. } => Some(("text", *content_index)),
+                    StreamEvent::ThinkingEnd { content_index, .. } => {
+                        Some(("thinking", *content_index))
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            assert_eq!(
+                terminal_end_kinds,
+                vec![("text", 0), ("thinking", 1), ("text", 2)]
+            );
+        });
+    }
+
+    #[test]
+    fn test_open_tool_call_snapshots_sort_by_content_index() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let byte_stream = stream::iter(vec![Ok(Vec::new())]);
+            let event_source = crate::sse::SseStream::new(Box::pin(byte_stream));
+            let mut state = StreamState::new(
+                event_source,
+                "gpt-test".to_string(),
+                "openai-responses".to_string(),
+                "openai".to_string(),
+            );
+
+            state.tool_calls_by_item_id.insert(
+                "late".to_string(),
+                ToolCallState {
+                    content_index: 4,
+                    call_id: "call-late".to_string(),
+                    name: "later".to_string(),
+                    arguments: "{\"b\":2}".to_string(),
+                },
+            );
+            state.tool_calls_by_item_id.insert(
+                "early".to_string(),
+                ToolCallState {
+                    content_index: 1,
+                    call_id: "call-early".to_string(),
+                    name: "earlier".to_string(),
+                    arguments: "{\"a\":1}".to_string(),
+                },
+            );
+
+            let ordered_ids: Vec<String> = state
+                .open_tool_call_snapshots_in_content_order()
+                .into_iter()
+                .map(|(_, item_id, ..)| item_id)
+                .collect();
+
+            assert_eq!(ordered_ids, vec!["early".to_string(), "late".to_string()]);
+        });
+    }
+
+    #[test]
+    fn test_finish_keeps_open_tool_call_end_in_content_order() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let byte_stream = stream::iter(vec![Ok(Vec::new())]);
+            let event_source = crate::sse::SseStream::new(Box::pin(byte_stream));
+            let mut state = StreamState::new(
+                event_source,
+                "gpt-test".to_string(),
+                "openai-responses".to_string(),
+                "openai".to_string(),
+            );
+
+            state
+                .process_event(
+                    &json!({
+                        "type": "response.output_text.delta",
+                        "item_id": "msg_1",
+                        "content_index": 0,
+                        "delta": "before",
+                    })
+                    .to_string(),
+                )
+                .expect("first text delta");
+            state
+                .process_event(
+                    &json!({
+                        "type": "response.output_item.added",
+                        "item": {
+                            "type": "function_call",
+                            "id": "fc_7",
+                            "call_id": "call_7",
+                            "name": "echo",
+                            "arguments": "{\"text\":\"mid\"}"
+                        }
+                    })
+                    .to_string(),
+                )
+                .expect("tool call added");
+            state
+                .process_event(
+                    &json!({
+                        "type": "response.output_text.delta",
+                        "item_id": "msg_2",
+                        "content_index": 0,
+                        "delta": "after",
+                    })
+                    .to_string(),
+                )
+                .expect("second text delta");
+
+            state.finish(None);
+
+            let terminal_event_order: Vec<(&'static str, usize)> = state
+                .pending_events
+                .iter()
+                .filter_map(|event| match event {
+                    StreamEvent::TextEnd { content_index, .. } => Some(("text", *content_index)),
+                    StreamEvent::ToolCallEnd { content_index, .. } => {
+                        Some(("tool", *content_index))
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            assert_eq!(
+                terminal_event_order,
+                vec![("text", 0), ("tool", 1), ("text", 2)]
+            );
+        });
+    }
+
+    #[test]
     fn test_stream_sets_bearer_auth_header() {
         let captured = run_stream_and_capture_headers().expect("captured request");
         assert_eq!(
@@ -1237,6 +2311,182 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+    }
+
+    fn build_test_jwt(account_id: &str) -> String {
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": account_id
+                }
+            }))
+            .expect("payload json"),
+        );
+        format!("{header}.{payload}.sig")
+    }
+
+    #[test]
+    fn test_bearer_token_parser_accepts_case_insensitive_scheme() {
+        let parsed_bearer = super::bearer_token_from_authorization_header("bEaReR abc.def.ghi");
+        assert_eq!(parsed_bearer.as_deref(), Some("abc.def.ghi"));
+        assert!(super::bearer_token_from_authorization_header("Basic abc").is_none());
+        assert!(super::bearer_token_from_authorization_header("Bearer").is_none());
+    }
+
+    #[test]
+    fn test_codex_mode_adds_required_headers_with_authorization_override() {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let provider = OpenAIResponsesProvider::new("gpt-4o")
+            .with_provider_name("openai-codex")
+            .with_api_name("openai-codex-responses")
+            .with_codex_mode(true)
+            .with_base_url(base_url);
+        let context = Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })],
+            Vec::new(),
+        );
+        let test_jwt = build_test_jwt("acct_test_123");
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), format!("Bearer {test_jwt}"));
+        let options = StreamOptions {
+            headers,
+            session_id: Some("session-abc".to_string()),
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let captured = rx.recv_timeout(Duration::from_secs(2)).expect("captured");
+        let expected_auth = format!("Bearer {test_jwt}");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some(expected_auth.as_str())
+        );
+        assert_eq!(captured.header_count("authorization"), 1);
+        assert_eq!(
+            captured.headers.get("user-agent").map(String::as_str),
+            Some("pi_agent_rust")
+        );
+        assert_eq!(captured.header_count("user-agent"), 1);
+        assert_eq!(
+            captured
+                .headers
+                .get("chatgpt-account-id")
+                .map(String::as_str),
+            Some("acct_test_123")
+        );
+        assert_eq!(
+            captured.headers.get("openai-beta").map(String::as_str),
+            Some("responses=experimental")
+        );
+        assert_eq!(
+            captured.headers.get("session_id").map(String::as_str),
+            Some("session-abc")
+        );
+    }
+
+    #[test]
+    fn test_codex_mode_accepts_compat_authorization_header_without_api_key() {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let test_jwt = build_test_jwt("acct_compat_456");
+        let mut custom_headers = HashMap::new();
+        custom_headers.insert("Authorization".to_string(), format!("Bearer {test_jwt}"));
+        let provider = OpenAIResponsesProvider::new("gpt-4o")
+            .with_provider_name("openai-codex")
+            .with_api_name("openai-codex-responses")
+            .with_codex_mode(true)
+            .with_base_url(base_url)
+            .with_compat(Some(CompatConfig {
+                custom_headers: Some(custom_headers),
+                ..Default::default()
+            }));
+        let context = Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })],
+            Vec::new(),
+        );
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider
+                .stream(&context, &StreamOptions::default())
+                .await
+                .expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let captured = rx.recv_timeout(Duration::from_secs(2)).expect("captured");
+        assert_eq!(captured.header_count("authorization"), 1);
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some(format!("Bearer {test_jwt}").as_str())
+        );
+        assert_eq!(
+            captured
+                .headers
+                .get("chatgpt-account-id")
+                .map(String::as_str),
+            Some("acct_compat_456")
+        );
+    }
+
+    #[test]
+    fn test_stream_rejects_ndjson_content_type_without_parser_support() {
+        let body = concat!(
+            "{\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\",\"content_index\":0,\"delta\":\"ok\"}\n",
+            "{\"type\":\"response.completed\",\"response\":{\"incomplete_details\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n"
+        );
+        let (base_url, _rx) = spawn_test_server(200, "application/x-ndjson", body);
+        let provider = OpenAIResponsesProvider::new("gpt-4o").with_base_url(base_url);
+        let context = Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })],
+            Vec::new(),
+        );
+        let options = StreamOptions {
+            api_key: Some("test-openai-key".to_string()),
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let Err(err) = provider.stream(&context, &options).await else {
+                panic!("ndjson should be rejected until a parser exists");
+            };
+            let err_text = err.to_string();
+            assert!(err_text.contains("unsupported Content-Type"));
+            assert!(err_text.contains("application/x-ndjson"));
+        });
     }
 
     fn collect_events(events: &[Value]) -> Vec<StreamEvent> {
@@ -1258,12 +2508,33 @@ mod tests {
             );
 
             let mut out = Vec::new();
-            while let Some(item) = state.event_source.next().await {
-                let msg = item.expect("SSE event");
-                state.process_event(&msg.data).expect("process_event");
-                out.extend(state.pending_events.drain(..));
+            loop {
+                if let Some(event) = state.pending_events.pop_front() {
+                    out.push(event);
+                    continue;
+                }
+
                 if state.finished {
                     break;
+                }
+
+                match state.event_source.next().await {
+                    Some(item) => {
+                        let msg = item.expect("SSE event");
+                        if msg.data == "[DONE]" {
+                            if !state.finish_terminal_response() {
+                                state.finish(None);
+                            }
+                            continue;
+                        }
+                        state.process_event(&msg.data).expect("process_event");
+                    }
+                    None => {
+                        assert!(
+                            state.finish_terminal_response(),
+                            "stream ended without Done event"
+                        );
+                    }
                 }
             }
 
@@ -1271,10 +2542,55 @@ mod tests {
         })
     }
 
+    fn collect_stream_events_from_body(body: &str) -> Vec<StreamEvent> {
+        let (base_url, _rx) = spawn_test_server(200, "text/event-stream", body);
+        let provider = OpenAIResponsesProvider::new("gpt-4o").with_base_url(base_url);
+        let context = Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })],
+            Vec::new(),
+        );
+        let options = StreamOptions {
+            api_key: Some("test-openai-key".to_string()),
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            let mut out = Vec::new();
+            while let Some(event) = stream.next().await {
+                let event = event.expect("stream event");
+                let is_terminal =
+                    matches!(event, StreamEvent::Done { .. } | StreamEvent::Error { .. });
+                out.push(event);
+                if is_terminal {
+                    break;
+                }
+            }
+            out
+        })
+    }
+
     #[derive(Debug)]
     struct CapturedRequest {
         headers: HashMap<String, String>,
+        header_lines: Vec<(String, String)>,
         body: String,
+    }
+
+    impl CapturedRequest {
+        fn header_count(&self, name: &str) -> usize {
+            self.header_lines
+                .iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                .count()
+        }
     }
 
     fn run_stream_and_capture_headers() -> Option<CapturedRequest> {
@@ -1352,7 +2668,7 @@ mod tests {
                     {
                         break;
                     }
-                    Err(err) => panic!("read request failed: {err}"),
+                    Err(err) => assert!(false, "request header read failed: {err}"),
                 }
             }
 
@@ -1361,7 +2677,7 @@ mod tests {
                 .position(|window| window == b"\r\n\r\n")
                 .expect("request header boundary");
             let header_text = String::from_utf8_lossy(&bytes[..header_end]).to_string();
-            let headers = parse_headers(&header_text);
+            let (headers, header_lines) = parse_headers(&header_text);
             let mut request_body = bytes[header_end + 4..].to_vec();
 
             let content_length = headers
@@ -1378,12 +2694,13 @@ mod tests {
                     {
                         break;
                     }
-                    Err(err) => panic!("read request body failed: {err}"),
+                    Err(err) => assert!(false, "request body read failed: {err}"),
                 }
             }
 
             let captured = CapturedRequest {
                 headers,
+                header_lines,
                 body: String::from_utf8_lossy(&request_body).to_string(),
             };
             tx.send(captured).expect("send captured request");
@@ -1406,14 +2723,18 @@ mod tests {
         (format!("http://{addr}/responses"), rx)
     }
 
-    fn parse_headers(header_text: &str) -> HashMap<String, String> {
+    fn parse_headers(header_text: &str) -> (HashMap<String, String>, Vec<(String, String)>) {
         let mut headers = HashMap::new();
+        let mut header_lines = Vec::new();
         for line in header_text.lines().skip(1) {
             if let Some((name, value)) = line.split_once(':') {
-                headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+                let normalized_name = name.trim().to_ascii_lowercase();
+                let normalized_value = value.trim().to_string();
+                header_lines.push((normalized_name.clone(), normalized_value.clone()));
+                headers.insert(normalized_name, normalized_value);
             }
         }
-        headers
+        (headers, header_lines)
     }
 
     // ========================================================================

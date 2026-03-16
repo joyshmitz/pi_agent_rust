@@ -4023,6 +4023,7 @@ fn run_orchestrate_with_fake_toolchain_with_env(
         .arg("full")
         .arg("--skip-build")
         .arg("--skip-env-check")
+        .arg("--no-rch")
         .current_dir(project_root())
         .env("PATH", path)
         .env("CARGO_TARGET_DIR", &target_dir)

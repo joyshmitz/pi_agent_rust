@@ -57,13 +57,54 @@ use swc_ecma_codegen::{Emitter, text_writer::JsWriter};
 use swc_ecma_parser::{Parser as SwcParser, StringInput, Syntax, TsSyntax};
 use swc_ecma_transforms_base::resolver;
 use swc_ecma_transforms_typescript::strip;
-use uuid::Uuid;
 
 // ============================================================================
 // Environment variable filtering (bd-1av0.9)
 // ============================================================================
 
-use crate::extensions::SecretBrokerPolicy;
+use crate::extensions::{
+    ExecMediationResult, ExtensionPolicy, ExtensionPolicyMode, SecretBrokerPolicy,
+    evaluate_exec_mediation,
+};
+
+/// Helper to check `exec` capability for sync execution where we cannot prompt.
+fn check_exec_capability(policy: &ExtensionPolicy, extension_id: Option<&str>) -> bool {
+    let cap = "exec";
+
+    // 1. Per-extension overrides
+    if let Some(id) = extension_id {
+        if let Some(override_config) = policy.per_extension.get(id) {
+            if override_config.deny.iter().any(|c| c == cap) {
+                return false;
+            }
+            if override_config.allow.iter().any(|c| c == cap) {
+                return true;
+            }
+            if let Some(mode) = override_config.mode {
+                return match mode {
+                    ExtensionPolicyMode::Permissive => true,
+                    ExtensionPolicyMode::Strict | ExtensionPolicyMode::Prompt => false, // Prompt = deny for sync
+                };
+            }
+        }
+    }
+
+    // 2. Global deny
+    if policy.deny_caps.iter().any(|c| c == cap) {
+        return false;
+    }
+
+    // 3. Global allow (default_caps)
+    if policy.default_caps.iter().any(|c| c == cap) {
+        return true;
+    }
+
+    // 4. Mode fallback
+    match policy.mode {
+        ExtensionPolicyMode::Permissive => true,
+        ExtensionPolicyMode::Strict | ExtensionPolicyMode::Prompt => false, // Prompt = deny for sync
+    }
+}
 
 /// Determine whether an environment variable is safe to expose to extensions.
 ///
@@ -341,6 +382,7 @@ impl HostcallRequest {
 }
 
 const MAX_JSON_DEPTH: usize = 64;
+const MAX_JOBS_PER_TICK: usize = 10_000;
 
 /// Convert a serde_json::Value to a rquickjs Value.
 #[allow(clippy::option_if_let_else)]
@@ -429,7 +471,14 @@ fn js_to_json_inner(value: &Value<'_>, depth: usize) -> rquickjs::Result<serde_j
     }
     if let Some(arr) = value.as_array() {
         let len = arr.len();
-        let mut result = Vec::with_capacity(len);
+        if len > 100_000 {
+            return Err(rquickjs::Error::new_into_js_message(
+                "json",
+                "stringify",
+                format!("Array length ({len}) exceeds maximum allowed limit of 100,000"),
+            ));
+        }
+        let mut result = Vec::with_capacity(std::cmp::min(len, 1024));
         for i in 0..len {
             let v: Value<'_> = arr.get(i)?;
             result.push(js_to_json_inner(&v, depth + 1)?);
@@ -438,7 +487,14 @@ fn js_to_json_inner(value: &Value<'_>, depth: usize) -> rquickjs::Result<serde_j
     }
     if let Some(obj) = value.as_object() {
         let mut result = serde_json::Map::new();
-        for item in obj.props::<String, Value<'_>>() {
+        for (count, item) in obj.props::<String, Value<'_>>().enumerate() {
+            if count >= 100_000 {
+                return Err(rquickjs::Error::new_into_js_message(
+                    "json",
+                    "stringify",
+                    "Object properties count exceeds maximum allowed limit of 100,000",
+                ));
+            }
             let (k, v) = item?;
             result.insert(k, js_to_json_inner(&v, depth + 1)?);
         }
@@ -1376,10 +1432,19 @@ pub fn validate_proposal(
     // 5. Monotonicity for path-bearing ops.
     if let Some(root) = extension_root {
         for op in &proposal.ops {
-            let path_str = op_target_path(op);
-            let target = Path::new(&path_str);
-            if target.is_absolute() {
-                let verdict = verify_repair_monotonicity(root, root, target);
+            let mut paths_to_check = vec![op_target_path(op)];
+            if let PatchOp::ReplaceModulePath { from, .. } = op {
+                paths_to_check.push(from.clone());
+            }
+
+            for path_str in paths_to_check {
+                let target = Path::new(&path_str);
+                let resolved = if target.is_absolute() {
+                    target.to_path_buf()
+                } else {
+                    root.join(target)
+                };
+                let verdict = verify_repair_monotonicity(root, root, &resolved);
                 if !verdict.is_safe() {
                     errors.push(ProposalValidationError::MonotonicityViolation { path: path_str });
                 }
@@ -3491,8 +3556,9 @@ pub fn compute_canary_bucket(extension_id: &str, environment: &str) -> u8 {
     hasher.update(b":");
     hasher.update(environment.as_bytes());
     let hash = hasher.finalize();
-    // Take first byte modulo 100 for bucket.
-    hash[0] % 100
+    // Use u16 to reduce modulo bias (65536 % 100 = 36 vs 256 % 100 = 56).
+    let val = u16::from_be_bytes([hash[0], hash[1]]);
+    (val % 100) as u8
 }
 
 // ---------------------------------------------------------------------------
@@ -4663,12 +4729,22 @@ struct PiJsModuleState {
     /// Extension root directories used to detect monorepo escape (Pattern 3).
     /// Populated as extensions are loaded via [`PiJsRuntime::add_extension_root`].
     extension_roots: Vec<PathBuf>,
+    /// Pre-canonicalized extension roots to avoid doing filesystem IO during import resolution.
+    canonical_extension_roots: Vec<PathBuf>,
     /// Source-tier classification per extension root. Used by Pattern 4 to
     /// avoid proxy stubs for official/first-party extensions.
     extension_root_tiers: HashMap<PathBuf, ProxyStubSourceTier>,
     /// Package scope (`@scope`) per extension root (when discoverable from
     /// package.json name). Pattern 4 allows same-scope packages.
     extension_root_scopes: HashMap<PathBuf, String>,
+    /// Canonical extension roots grouped by extension id for runtime
+    /// filesystem access checks. This keeps sync host reads/writes scoped to
+    /// the currently executing extension instead of all registered roots.
+    extension_roots_by_id: HashMap<String, Vec<PathBuf>>,
+    /// Canonical extension roots registered without extension metadata.
+    /// These remain available to the active extension for legacy callers that
+    /// still use `add_extension_root()`.
+    extension_roots_without_id: Vec<PathBuf>,
     /// Shared handle for recording repair events from the resolver.
     repair_events: Arc<std::sync::Mutex<Vec<ExtensionRepairEvent>>>,
     /// Directory for persistent transpiled-source disk cache.
@@ -4706,8 +4782,11 @@ impl PiJsModuleState {
             module_cache_counters: ModuleCacheCounters::default(),
             repair_mode: RepairMode::default(),
             extension_roots: Vec::new(),
+            canonical_extension_roots: Vec::new(),
             extension_root_tiers: HashMap::new(),
             extension_root_scopes: HashMap::new(),
+            extension_roots_by_id: HashMap::new(),
+            extension_roots_without_id: Vec::new(),
             repair_events: Arc::new(std::sync::Mutex::new(Vec::new())),
             disk_cache_dir: None,
         }
@@ -4730,6 +4809,50 @@ impl PiJsModuleState {
         self.disk_cache_dir = dir;
         self
     }
+}
+
+fn current_extension_id(ctx: &Ctx<'_>) -> Option<String> {
+    ctx.globals()
+        .get::<_, Option<String>>("__pi_current_extension_id")
+        .ok()
+        .flatten()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn extension_roots_for_fs_access(
+    extension_id: Option<&str>,
+    module_state: &Rc<RefCell<PiJsModuleState>>,
+    fallback_roots: &Arc<std::sync::Mutex<Vec<PathBuf>>>,
+) -> Vec<PathBuf> {
+    if let Some(extension_id) = extension_id {
+        let state = module_state.borrow();
+        let mut roots = state.extension_roots_without_id.clone();
+        if let Some(scoped_roots) = state.extension_roots_by_id.get(extension_id) {
+            for root in scoped_roots {
+                if !roots.contains(root) {
+                    roots.push(root.clone());
+                }
+            }
+        }
+        return roots;
+    }
+
+    fallback_roots
+        .lock()
+        .map(|roots| roots.clone())
+        .unwrap_or_default()
+}
+
+fn path_is_in_allowed_extension_root(
+    path: &Path,
+    extension_id: Option<&str>,
+    module_state: &Rc<RefCell<PiJsModuleState>>,
+    fallback_roots: &Arc<std::sync::Mutex<Vec<PathBuf>>>,
+) -> bool {
+    extension_roots_for_fs_access(extension_id, module_state, fallback_roots)
+        .iter()
+        .any(|root| path.starts_with(root))
 }
 
 #[derive(Clone, Debug)]
@@ -4941,6 +5064,9 @@ fn is_proxy_allowlisted_package(spec: &str) -> bool {
     false
 }
 
+// Limit extension source size to prevent OOM/DoS during load.
+const MAX_MODULE_SOURCE_BYTES: u64 = 1024 * 1024 * 1024;
+
 fn should_auto_stub_package(
     spec: &str,
     base: &str,
@@ -5006,7 +5132,7 @@ fn is_valid_js_export_name(name: &str) -> bool {
 fn generate_proxy_stub_module(spec: &str, named_exports: &BTreeSet<String>) -> String {
     let spec_literal = serde_json::to_string(spec).unwrap_or_else(|_| "\"<unknown>\"".to_string());
     let mut source = format!(
-        r"// Auto-generated npm proxy stub (Pattern 4) for {spec}
+        r"// Auto-generated npm proxy stub (Pattern 4) for {spec_literal}
 const __pkg = {spec_literal};
 const __handler = {{
   get(_target, prop) {{
@@ -5125,6 +5251,17 @@ fn builtin_overlay_module_key(base: &str, canonical: &str) -> String {
     format!("pijs-compat://builtin/{canonical}/{short}")
 }
 
+/// Read up to 1MB of a source file for import extraction.
+/// This prevents OOM vulnerabilities if a module path resolves to a massive file or /dev/zero.
+fn read_source_for_import_extraction(path: &str) -> Option<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut handle = file.take(1024 * 1024); // 1MB limit
+    let mut buffer = String::new();
+    handle.read_to_string(&mut buffer).ok()?;
+    Some(buffer)
+}
+
 fn maybe_register_builtin_compat_overlay(
     state: &mut PiJsModuleState,
     base: &str,
@@ -5135,7 +5272,7 @@ fn maybe_register_builtin_compat_overlay(
         return None;
     }
 
-    let source = std::fs::read_to_string(base).ok()?;
+    let source = read_source_for_import_extraction(base)?;
     let extracted_names = extract_builtin_import_names(&source, spec, canonical);
     if extracted_names.is_empty() {
         return None;
@@ -5201,12 +5338,30 @@ impl JsModuleResolver for PiJsResolver {
             state.repair_mode
         };
 
-        if let Some(path) = resolve_module_path(base, spec, repair_mode) {
+        let canonical_roots = {
+            let state = self.state.borrow();
+            state.canonical_extension_roots.clone()
+        };
+        if let Some(path) = resolve_module_path(base, spec, repair_mode, &canonical_roots) {
             // Canonicalize to collapse `.` / `..` segments and normalise
             // separators (Windows backslashes → forward slashes for QuickJS).
-            let canonical = std::fs::canonicalize(&path)
-                .map(crate::extensions::strip_unc_prefix)
-                .unwrap_or(path);
+            let canonical = crate::extensions::safe_canonicalize(&path);
+
+            let is_safe = canonical_roots
+                .iter()
+                .any(|canonical_root| canonical.starts_with(canonical_root));
+
+            if !is_safe {
+                tracing::warn!(
+                    event = "pijs.resolve.escape",
+                    base = %base,
+                    specifier = %spec,
+                    resolved = %canonical.display(),
+                    "import resolved to path outside extension roots"
+                );
+                return Err(rquickjs::Error::new_resolving(base, name));
+            }
+
             return Ok(canonical.to_string_lossy().replace('\\', "/"));
         }
 
@@ -5216,12 +5371,12 @@ impl JsModuleResolver for PiJsResolver {
         // containing no-op exports matching the import declaration.
         if spec.starts_with('.') && repair_mode.allows_aggressive() {
             let state = self.state.borrow();
-            let roots = state.extension_roots.clone();
+            let canonical_roots = state.canonical_extension_roots.clone();
             drop(state);
 
-            if let Some(escaped_path) = detect_monorepo_escape(base, spec, &roots) {
+            if let Some(escaped_path) = detect_monorepo_escape(base, spec, &canonical_roots) {
                 // Read the importing file to extract import names.
-                let source = std::fs::read_to_string(base).unwrap_or_default();
+                let source = read_source_for_import_extraction(base).unwrap_or_default();
                 let names = extract_import_names(&source, spec);
 
                 let stub = generate_monorepo_stub(&names);
@@ -5288,7 +5443,7 @@ impl JsModuleResolver for PiJsResolver {
                     "auto-repair: generated proxy stub for missing npm dependency"
                 );
 
-                let source = std::fs::read_to_string(base).unwrap_or_default();
+                let source = read_source_for_import_extraction(base).unwrap_or_default();
                 let extracted_names = extract_import_names(&source, spec);
                 let mut state = self.state.borrow_mut();
                 let entry_key = spec.to_string();
@@ -5333,6 +5488,21 @@ impl JsModuleResolver for PiJsResolver {
 
                 return Ok(spec.to_string());
             }
+        }
+
+        let canonical_roots = {
+            let state = self.state.borrow();
+            state.canonical_extension_roots.clone()
+        };
+        if let Some(escaped_path) = detect_monorepo_escape(base, spec, &canonical_roots) {
+            return Err(rquickjs::Error::new_resolving_message(
+                base,
+                name,
+                format!(
+                    "Module path escapes extension root: {}",
+                    escaped_path.display()
+                ),
+            ));
         }
 
         Err(rquickjs::Error::new_resolving_message(
@@ -5383,9 +5553,37 @@ fn compile_module_source(
         ));
     }
 
+    let metadata = fs::metadata(path)
+        .map_err(|err| rquickjs::Error::new_loading_message(name, format!("metadata: {err}")))?;
+    if metadata.len() > MAX_MODULE_SOURCE_BYTES {
+        return Err(rquickjs::Error::new_loading_message(
+            name,
+            format!(
+                "Module source exceeds size limit: {} > {}",
+                metadata.len(),
+                MAX_MODULE_SOURCE_BYTES
+            ),
+        ));
+    }
+
     let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
-    let raw = fs::read_to_string(path)
+    let file = fs::File::open(path)
+        .map_err(|err| rquickjs::Error::new_loading_message(name, format!("open: {err}")))?;
+    let mut handle = std::io::Read::take(file, MAX_MODULE_SOURCE_BYTES + 1);
+    let mut raw = String::new();
+    std::io::Read::read_to_string(&mut handle, &mut raw)
         .map_err(|err| rquickjs::Error::new_loading_message(name, format!("read: {err}")))?;
+
+    if raw.len() as u64 > MAX_MODULE_SOURCE_BYTES {
+        return Err(rquickjs::Error::new_loading_message(
+            name,
+            format!(
+                "Module source exceeds size limit: {} > {}",
+                raw.len(),
+                MAX_MODULE_SOURCE_BYTES
+            ),
+        ));
+    }
 
     let compiled = match extension {
         "ts" | "tsx" => {
@@ -5472,8 +5670,16 @@ fn store_to_disk_cache(cache_dir: &Path, cache_key: &str, source: &[u8]) {
             return;
         }
     }
-    if let Err(err) = fs::write(&path, source) {
-        tracing::debug!(event = "pijs.module_cache.disk.write_failed", path = %path.display(), %err);
+
+    let temp_path = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4().simple()));
+    if let Err(err) = fs::write(&temp_path, source) {
+        tracing::debug!(event = "pijs.module_cache.disk.write_failed", path = %temp_path.display(), %err);
+        return;
+    }
+
+    if let Err(err) = fs::rename(&temp_path, &path) {
+        tracing::debug!(event = "pijs.module_cache.disk.rename_failed", from = %temp_path.display(), to = %path.display(), %err);
+        let _ = fs::remove_file(&temp_path);
     }
 }
 
@@ -5627,14 +5833,53 @@ fn prefix_import_meta_url(module_name: &str, body: &str) -> Vec<u8> {
     format!("import.meta.url = {url_literal};\n{body}").into_bytes()
 }
 
-fn resolve_module_path(base: &str, specifier: &str, repair_mode: RepairMode) -> Option<PathBuf> {
+#[allow(clippy::too_many_lines)]
+fn resolve_module_path(
+    base: &str,
+    specifier: &str,
+    repair_mode: RepairMode,
+    canonical_roots: &[PathBuf],
+) -> Option<PathBuf> {
     let specifier = specifier.trim();
     if specifier.is_empty() {
         return None;
     }
 
     if let Some(path) = specifier.strip_prefix("file://") {
-        return resolve_existing_file(PathBuf::from(path));
+        if canonical_roots.is_empty() {
+            return None;
+        }
+        let path_buf = PathBuf::from(path);
+        let canonical = crate::extensions::safe_canonicalize(&path_buf);
+        let allowed = canonical_roots
+            .iter()
+            .any(|canonical_root| canonical.starts_with(canonical_root));
+        if !allowed {
+            tracing::warn!(
+                event = "pijs.resolve.monotonicity_violation",
+                original = %path_buf.display(),
+                "resolution blocked: file:// path escapes extension root"
+            );
+            return None;
+        }
+
+        let resolved = resolve_existing_file(path_buf)?;
+
+        // Second check after resolution (in case of symlinks)
+        let canonical_resolved = crate::extensions::safe_canonicalize(&resolved);
+        let allowed_resolved = canonical_roots
+            .iter()
+            .any(|canonical_root| canonical_resolved.starts_with(canonical_root));
+
+        if !allowed_resolved {
+            tracing::warn!(
+                event = "pijs.resolve.monotonicity_violation",
+                resolved = %resolved.display(),
+                "resolution blocked: resolved file:// path escapes extension root"
+            );
+            return None;
+        }
+        return Some(resolved);
     }
 
     let path = if specifier.starts_with('/') {
@@ -5653,14 +5898,49 @@ fn resolve_module_path(base: &str, specifier: &str, repair_mode: RepairMode) -> 
         return None;
     };
 
+    // SEC-FIX: Enforce scope monotonicity before checking file existence (bd-k5q5.9.1.3).
+    // This prevents directory traversal probes from revealing existence of files
+    // outside the extension root (e.g. `../../../../etc/passwd`).
+    if canonical_roots.is_empty() {
+        return None;
+    }
+    let canonical = crate::extensions::safe_canonicalize(&path);
+    let allowed = canonical_roots
+        .iter()
+        .any(|canonical_root| canonical.starts_with(canonical_root));
+
+    if !allowed {
+        return None;
+    }
+
     if let Some(resolved) = resolve_existing_module_candidate(path.clone()) {
+        // SEC-FIX: Enforce scope monotonicity on the *resolved* path (bd-k5q5.9.1.3).
+        // This handles cases where `resolve_existing_module_candidate` finds a file
+        // (e.g. .ts sibling) that is a symlink escaping the root, even if the base path was safe.
+        if canonical_roots.is_empty() {
+            return None;
+        }
+        let canonical_resolved = crate::extensions::safe_canonicalize(&resolved);
+        let allowed = canonical_roots
+            .iter()
+            .any(|canonical_root| canonical_resolved.starts_with(canonical_root));
+
+        if !allowed {
+            tracing::warn!(
+                event = "pijs.resolve.monotonicity_violation",
+                original = %path.display(),
+                resolved = %resolved.display(),
+                "resolution blocked: resolved path escapes extension root"
+            );
+            return None;
+        }
         return Some(resolved);
     }
 
     // Pattern 1 (bd-k5q5.8.2): dist/ → src/ fallback for missing build artifacts.
     // Gated by repair_mode (bd-k5q5.9.1.2): only static-analysis operations
     // (path existence checks) happen here — broken code is never executed.
-    if repair_mode.should_apply() {
+    let fallback_resolved = if repair_mode.should_apply() {
         try_dist_to_src_fallback(&path)
     } else {
         if repair_mode == RepairMode::Suggest {
@@ -5676,7 +5956,27 @@ fn resolve_module_path(base: &str, specifier: &str, repair_mode: RepairMode) -> 
             }
         }
         None
+    };
+
+    if let Some(resolved) = fallback_resolved {
+        let canonical_resolved = crate::extensions::safe_canonicalize(&resolved);
+        let allowed = canonical_roots
+            .iter()
+            .any(|canonical_root| canonical_resolved.starts_with(canonical_root));
+
+        if !allowed {
+            tracing::warn!(
+                event = "pijs.resolve.monotonicity_violation",
+                original = %path.display(),
+                resolved = %resolved.display(),
+                "resolution blocked: repaired path escapes extension root"
+            );
+            return None;
+        }
+        return Some(resolved);
     }
+
+    None
 }
 
 /// Auto-repair Pattern 1: when a module path contains `/dist/` and the file
@@ -5685,57 +5985,55 @@ fn resolve_module_path(base: &str, specifier: &str, repair_mode: RepairMode) -> 
 /// references compiled output that was never built.
 fn try_dist_to_src_fallback(path: &Path) -> Option<PathBuf> {
     let path_str = path.to_string_lossy();
-    let idx = path_str.find("/dist/")?;
+
+    // Normalize to handle both Windows backslashes and Unix forward slashes.
+    let normalized = path_str.replace('\\', "/");
+    let idx = normalized.find("/dist/")?;
 
     // The extension root is the directory containing /dist/.
     let extension_root = PathBuf::from(&path_str[..idx]);
 
-    let src_path = format!("{}/src/{}", &path_str[..idx], &path_str[idx + 6..]);
+    let sep = std::path::MAIN_SEPARATOR;
+    let src_path = format!("{}{sep}src{sep}{}", &path_str[..idx], &path_str[idx + 6..]);
 
-    let candidates = [
-        PathBuf::from(&src_path),
-        PathBuf::from(src_path.replace(".js", ".ts")),
-        PathBuf::from(src_path.replace(".js", ".tsx")),
-    ];
+    let candidate = PathBuf::from(&src_path);
 
-    for candidate in &candidates {
-        if let Some(resolved) = resolve_existing_module_candidate(candidate.clone()) {
-            // Privilege monotonicity check (bd-k5q5.9.1.3): ensure the
-            // resolved path stays within the extension root.
-            let verdict = verify_repair_monotonicity(&extension_root, path, &resolved);
-            if !verdict.is_safe() {
-                tracing::warn!(
-                    event = "pijs.repair.monotonicity_violation",
-                    original = %path_str,
-                    resolved = %resolved.display(),
-                    verdict = ?verdict,
-                    "repair blocked: resolved path escapes extension root"
-                );
-                return None;
-            }
-
-            // Structural validation gate (bd-k5q5.9.5.1): verify the
-            // resolved file is parseable before accepting the repair.
-            let structural = validate_repaired_artifact(&resolved);
-            if !structural.is_valid() {
-                tracing::warn!(
-                    event = "pijs.repair.structural_validation_failed",
-                    original = %path_str,
-                    resolved = %resolved.display(),
-                    verdict = %structural,
-                    "repair blocked: resolved artifact failed structural validation"
-                );
-                continue;
-            }
-
-            tracing::info!(
-                event = "pijs.repair.dist_to_src",
+    if let Some(resolved) = resolve_existing_module_candidate(candidate) {
+        // Privilege monotonicity check (bd-k5q5.9.1.3): ensure the
+        // resolved path stays within the extension root.
+        let verdict = verify_repair_monotonicity(&extension_root, path, &resolved);
+        if !verdict.is_safe() {
+            tracing::warn!(
+                event = "pijs.repair.monotonicity_violation",
                 original = %path_str,
                 resolved = %resolved.display(),
-                "auto-repair: resolved dist/ → src/ fallback"
+                verdict = ?verdict,
+                "repair blocked: resolved path escapes extension root"
             );
-            return Some(resolved);
+            return None;
         }
+
+        // Structural validation gate (bd-k5q5.9.5.1): verify the
+        // resolved file is parseable before accepting the repair.
+        let structural = validate_repaired_artifact(&resolved);
+        if !structural.is_valid() {
+            tracing::warn!(
+                event = "pijs.repair.structural_validation_failed",
+                original = %path_str,
+                resolved = %resolved.display(),
+                verdict = %structural,
+                "repair blocked: resolved artifact failed structural validation"
+            );
+            return None;
+        }
+
+        tracing::info!(
+            event = "pijs.repair.dist_to_src",
+            original = %path_str,
+            resolved = %resolved.display(),
+            "auto-repair: resolved dist/ → src/ fallback"
+        );
+        return Some(resolved);
     }
 
     None
@@ -5826,7 +6124,7 @@ fn require_destructure_regex() -> &'static regex::Regex {
 fn detect_monorepo_escape(
     base: &str,
     specifier: &str,
-    extension_roots: &[PathBuf],
+    canonical_extension_roots: &[PathBuf],
 ) -> Option<PathBuf> {
     if !specifier.starts_with('.') {
         return None;
@@ -5834,25 +6132,12 @@ fn detect_monorepo_escape(
     let base_dir = Path::new(base).parent()?;
     let resolved = base_dir.join(specifier);
 
-    // Canonicalize as much as possible — if the exact path doesn't exist,
-    // try the parent directory.
-    let effective = std::fs::canonicalize(&resolved)
-        .map(crate::extensions::strip_unc_prefix)
-        .or_else(|_| {
-            resolved
-                .parent()
-                .and_then(|p| {
-                    std::fs::canonicalize(p)
-                        .map(crate::extensions::strip_unc_prefix)
-                        .ok()
-                })
-                .map(|p| p.join(resolved.file_name().unwrap_or_default()))
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no parent"))
-        })
-        .unwrap_or_else(|_| resolved.clone());
+    // Safely canonicalize resolving all .. and . segments logically
+    // if the path doesn't exist on disk, avoiding path traversal bypasses.
+    let effective = crate::extensions::safe_canonicalize(&resolved);
 
-    for root in extension_roots {
-        if effective.starts_with(root) {
+    for canonical_root in canonical_extension_roots {
+        if effective.starts_with(canonical_root) {
             return None; // Within an extension root — not an escape
         }
     }
@@ -5924,8 +6209,13 @@ pub fn generate_monorepo_stub(names: &[String]) -> String {
     lines.push("// Auto-generated monorepo escape stub (Pattern 3)".to_string());
 
     for name in names {
-        let export = if name.chars().all(|c| c.is_ascii_uppercase() || c == '_') && !name.is_empty()
-        {
+        if !is_valid_js_export_name(name) {
+            continue;
+        }
+
+        let export = if name == "default" {
+            "export default () => {};".to_string()
+        } else if name.chars().all(|c| c.is_ascii_uppercase() || c == '_') && !name.is_empty() {
             // ALL_CAPS constant
             format!("export const {name} = [];")
         } else if name.starts_with("is") || name.starts_with("has") || name.starts_with("check") {
@@ -5950,26 +6240,200 @@ pub fn generate_monorepo_stub(names: &[String]) -> String {
     lines.join("\n")
 }
 
-fn source_declares_binding(source: &str, name: &str) -> bool {
-    let patterns = [
-        format!("const {name}"),
-        format!("let {name}"),
-        format!("var {name}"),
-        format!("function {name}"),
-        format!("class {name}"),
-        format!("export const {name}"),
-        format!("export let {name}"),
-        format!("export var {name}"),
-        format!("export function {name}"),
-        format!("export class {name}"),
-    ];
-    source.lines().any(|line| {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("//") || trimmed.starts_with('*') {
-            return false;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum DeclState {
+    #[default]
+    None,
+    AfterExport,
+    AfterAsync,
+    AfterDeclKeyword,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BindingLexMode {
+    #[default]
+    Normal,
+    SingleQuoted,
+    DoubleQuoted,
+    Template,
+    LineComment,
+    BlockComment,
+}
+
+#[derive(Debug, Default)]
+struct BindingScanner {
+    mode: BindingLexMode,
+    escaped: bool,
+    state: DeclState,
+}
+
+impl BindingScanner {
+    fn consume_context(&mut self, b: u8, next: Option<u8>, index: &mut usize) -> bool {
+        match self.mode {
+            BindingLexMode::Normal => false,
+            BindingLexMode::LineComment => {
+                if b == b'\n' {
+                    self.mode = BindingLexMode::Normal;
+                }
+                *index += 1;
+                true
+            }
+            BindingLexMode::BlockComment => {
+                if b == b'*' && next == Some(b'/') {
+                    *index += 2;
+                    self.mode = BindingLexMode::Normal;
+                } else {
+                    *index += 1;
+                }
+                true
+            }
+            BindingLexMode::SingleQuoted => {
+                consume_quoted_context(&mut self.mode, &mut self.escaped, b, b'\'');
+                *index += 1;
+                true
+            }
+            BindingLexMode::DoubleQuoted => {
+                consume_quoted_context(&mut self.mode, &mut self.escaped, b, b'"');
+                *index += 1;
+                true
+            }
+            BindingLexMode::Template => {
+                consume_quoted_context(&mut self.mode, &mut self.escaped, b, b'`');
+                *index += 1;
+                true
+            }
         }
-        patterns.iter().any(|pattern| trimmed.starts_with(pattern))
-    })
+    }
+
+    fn enter_context(&mut self, b: u8, next: Option<u8>, index: &mut usize) -> bool {
+        if b == b'/' && next == Some(b'/') {
+            self.mode = BindingLexMode::LineComment;
+            *index += 2;
+            return true;
+        }
+
+        if b == b'/' && next == Some(b'*') {
+            self.mode = BindingLexMode::BlockComment;
+            *index += 2;
+            return true;
+        }
+
+        if b == b'\'' {
+            self.mode = BindingLexMode::SingleQuoted;
+            *index += 1;
+            return true;
+        }
+
+        if b == b'"' {
+            self.mode = BindingLexMode::DoubleQuoted;
+            *index += 1;
+            return true;
+        }
+
+        if b == b'`' {
+            self.mode = BindingLexMode::Template;
+            *index += 1;
+            return true;
+        }
+
+        false
+    }
+
+    fn advance_state(&mut self, token: &str, name: &str) -> bool {
+        self.state = match self.state {
+            DeclState::None => match token {
+                "export" => DeclState::AfterExport,
+                "const" | "let" | "var" | "function" | "class" => DeclState::AfterDeclKeyword,
+                _ => DeclState::None,
+            },
+            DeclState::AfterExport => match token {
+                "const" | "let" | "var" | "function" | "class" => DeclState::AfterDeclKeyword,
+                "async" => DeclState::AfterAsync,
+                _ => DeclState::None,
+            },
+            DeclState::AfterAsync => {
+                if token == "function" {
+                    DeclState::AfterDeclKeyword
+                } else {
+                    DeclState::None
+                }
+            }
+            DeclState::AfterDeclKeyword => {
+                if token == name {
+                    return true;
+                }
+                DeclState::None
+            }
+        };
+
+        false
+    }
+}
+
+const fn consume_quoted_context(
+    mode: &mut BindingLexMode,
+    escaped: &mut bool,
+    b: u8,
+    terminator: u8,
+) {
+    if *escaped {
+        *escaped = false;
+    } else if b == b'\\' {
+        *escaped = true;
+    } else if b == terminator {
+        *mode = BindingLexMode::Normal;
+    }
+}
+
+fn consume_js_identifier<'a>(source: &'a str, bytes: &[u8], index: &mut usize) -> &'a str {
+    let start = *index;
+    *index += 1;
+    while *index < bytes.len() && is_js_ident_continue(bytes[*index]) {
+        *index += 1;
+    }
+    &source[start..*index]
+}
+
+fn source_declares_binding(source: &str, name: &str) -> bool {
+    if name.is_empty() || !name.is_ascii() {
+        return false;
+    }
+
+    let bytes = source.as_bytes();
+    let mut i = 0usize;
+    let mut scanner = BindingScanner::default();
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        let next = bytes.get(i + 1).copied();
+
+        if scanner.consume_context(b, next, &mut i) || scanner.enter_context(b, next, &mut i) {
+            continue;
+        }
+
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+
+        if is_js_ident_start(b) {
+            let token = consume_js_identifier(source, bytes, &mut i);
+            if scanner.advance_state(token, name) {
+                return true;
+            }
+            continue;
+        }
+
+        if scanner.state == DeclState::AfterDeclKeyword && b == b'*' {
+            i += 1;
+            continue;
+        }
+
+        scanner.state = DeclState::None;
+        i += 1;
+    }
+
+    false
 }
 
 /// Extract static `require("specifier")` calls from JavaScript source.
@@ -6168,9 +6632,15 @@ fn maybe_cjs_to_esm(source: &str) -> String {
         || source.contains("module[\"exports\"]")
         || source.contains("module['exports']");
     let has_exports_usage = source.contains("exports.") || source.contains("exports[");
-    let has_dirname_refs = source.contains("__dirname") || source.contains("__filename");
+    let has_filename_refs = source.contains("__filename");
+    let has_dirname_refs = source.contains("__dirname");
 
-    if !has_require && !has_module_exports && !has_exports_usage && !has_dirname_refs {
+    if !has_require
+        && !has_module_exports
+        && !has_exports_usage
+        && !has_filename_refs
+        && !has_dirname_refs
+    {
         return source.to_string();
     }
 
@@ -6184,13 +6654,19 @@ fn maybe_cjs_to_esm(source: &str) -> String {
     // Extract all require() specifiers
     let specifiers = extract_static_require_specifiers(source);
 
-    if specifiers.is_empty() && !has_module_exports && !has_exports_usage && !has_dirname_refs {
+    if specifiers.is_empty()
+        && !has_module_exports
+        && !has_exports_usage
+        && !has_filename_refs
+        && !has_dirname_refs
+    {
         return source.to_string();
     }
     if specifiers.is_empty()
         && has_esm
         && !has_module_exports
         && !has_exports_usage
+        && !has_filename_refs
         && !has_dirname_refs
     {
         return source.to_string();
@@ -6228,7 +6704,7 @@ fn maybe_cjs_to_esm(source: &str) -> String {
     let has_dirname_binding = source_declares_binding(source, "__dirname");
     let has_module_binding = source_declares_binding(source, "module");
     let has_exports_binding = source_declares_binding(source, "exports");
-    let needs_filename = has_dirname_refs && !has_filename_binding;
+    let needs_filename = has_filename_refs && !has_filename_binding;
     let needs_dirname = has_dirname_refs && !has_dirname_binding;
     let needs_module = (has_module_exports || has_exports_usage) && !has_module_binding;
     let needs_exports = (has_module_exports || has_exports_usage) && !has_exports_binding;
@@ -6244,7 +6720,12 @@ fn maybe_cjs_to_esm(source: &str) -> String {
         }
         if needs_dirname {
             output.push_str(
-                "const __dirname = __filename ? __filename.replace(/[/\\\\][^/\\\\]*$/, '') : '.';\n",
+                "const __dirname = (() => {\n\
+                 \x20 try {\n\
+                 \x20\x20 const __pi_pathname = new URL(import.meta.url).pathname || '';\n\
+                 \x20\x20 return __pi_pathname ? __pi_pathname.replace(/[/\\\\][^/\\\\]*$/, '') : '.';\n\
+                 \x20 } catch { return '.'; }\n\
+                 })();\n",
             );
         }
         if needs_module {
@@ -7739,10 +8220,10 @@ export default { v1, v3, v4, v5, v7, validate, version };
 export function createTwoFilesPatch(oldFile, newFile, oldStr, newStr, _oldHeader, _newHeader, _opts) {
   const oldLines = String(oldStr ?? "").split("\n");
   const newLines = String(newStr ?? "").split("\n");
-  let patch = `--- ${oldFile}\n+++ ${newFile}\n@@ -1,${oldLines.length} +1,${newLines.length} @@\n`;
-  for (const line of oldLines) patch += `-${line}\n`;
-  for (const line of newLines) patch += `+${line}\n`;
-  return patch;
+  let patch = [`--- ${oldFile}`, `+++ ${newFile}`, `@@ -1,${oldLines.length} +1,${newLines.length} @@`];
+  for (const line of oldLines) patch.push(`-${line}`);
+  for (const line of newLines) patch.push(`+${line}`);
+  return patch.join('\n') + '\n';
 }
 export function createPatch(fileName, oldStr, newStr, oldH, newH, opts) {
   return createTwoFilesPatch(fileName, fileName, oldStr, newStr, oldH, newH, opts);
@@ -8233,10 +8714,11 @@ export function spawnSync(command, argsInput, options) {
     : (options || {});
   const cwd = typeof opts.cwd === "string" ? opts.cwd : "";
   const timeout = typeof opts.timeout === "number" ? opts.timeout : 0;
+  const maxBuffer = typeof opts.maxBuffer === "number" ? opts.maxBuffer : 1024 * 1024;
 
   let result;
   try {
-    const raw = __pi_exec_sync_native(cmd, JSON.stringify(args), cwd, timeout);
+    const raw = __pi_exec_sync_native(cmd, JSON.stringify(args), cwd, timeout, maxBuffer);
     result = JSON.parse(raw);
   } catch (e) {
     return {
@@ -8258,7 +8740,7 @@ export function spawnSync(command, argsInput, options) {
       stdout: result.stdout || "",
       stderr: result.stderr || "",
       status: null,
-      signal: null,
+      signal: result.killed ? "SIGTERM" : null,
       error: err,
     };
   }
@@ -8285,7 +8767,7 @@ export function execSync(command, options) {
   const maxBuffer = typeof opts.maxBuffer === "number" ? opts.maxBuffer : 1024 * 1024;
 
   // execSync runs through a shell, so pass via sh -c
-  const raw = __pi_exec_sync_native("sh", JSON.stringify(["-c", cmdStr]), cwd, timeout);
+  const raw = __pi_exec_sync_native("sh", JSON.stringify(["-c", cmdStr]), cwd, timeout, maxBuffer);
   const result = __parseExecSyncResult(raw, cmdStr);
 
   if (result.status !== 0 && result.status !== null) {
@@ -8341,22 +8823,24 @@ function __normalizeExecOptions(raw) {
 }
 
 function __wrapExecLike(commandForError, child, opts, callback) {
-  let stdout = "";
-  let stderr = "";
+  let stdoutChunks = [];
+  let stderrChunks = [];
   let callbackDone = false;
-  const finish = (err, out, errOut) => {
+  const finish = (err, outStr, errOutStr) => {
     if (callbackDone) return;
     callbackDone = true;
+    const out = outStr !== undefined ? outStr : stdoutChunks.join("");
+    const errOut = errOutStr !== undefined ? errOutStr : stderrChunks.join("");
     if (typeof callback === "function") {
       callback(err, out, errOut);
     }
   };
 
   child.stdout?.on("data", (chunk) => {
-    stdout += String(chunk ?? "");
+    stdoutChunks.push(String(chunk ?? ""));
   });
   child.stderr?.on("data", (chunk) => {
-    stderr += String(chunk ?? "");
+    stderrChunks.push(String(chunk ?? ""));
   });
 
   child.on("error", (error) => {
@@ -8368,8 +8852,8 @@ function __wrapExecLike(commandForError, child, opts, callback) {
   });
 
   child.on("close", (code) => {
-    let out = stdout;
-    let errOut = stderr;
+    let out = stdoutChunks.join("");
+    let errOut = stderrChunks.join("");
 
     if (out.length > opts.maxBuffer) {
       const err = new Error("stdout maxBuffer length exceeded");
@@ -8447,8 +8931,9 @@ export function execFileSync(file, argsInput, options) {
     : (options || {});
   const cwd = typeof opts.cwd === "string" ? opts.cwd : "";
   const timeout = typeof opts.timeout === "number" ? opts.timeout : 0;
+  const maxBuffer = typeof opts.maxBuffer === "number" ? opts.maxBuffer : 1024 * 1024;
 
-  const raw = __pi_exec_sync_native(fileStr, JSON.stringify(args), cwd, timeout);
+  const raw = __pi_exec_sync_native(fileStr, JSON.stringify(args), cwd, timeout, maxBuffer);
   const result = __parseExecSyncResult(raw, fileStr);
 
   if (result.status !== 0 && result.status !== null) {
@@ -8784,6 +9269,12 @@ const __pi_vfs = (() => {
     nextFd: 100,
   };
 
+  function checkWriteAccess(resolved) {
+    if (typeof globalThis.__pi_host_check_write_access === "function") {
+      globalThis.__pi_host_check_write_access(resolved);
+    }
+  }
+
   function normalizePath(input) {
     let raw = String(input ?? "").replace(/\\/g, "/");
     // Strip Windows UNC verbatim prefix that canonicalize() produces.
@@ -8875,8 +9366,9 @@ const __pi_vfs = (() => {
     const normalized = String(encoding).toLowerCase();
     if (normalized === "base64") {
       let bin = "";
-      for (let i = 0; i < bytes.length; i++) {
-        bin += String.fromCharCode(bytes[i] & 0xff);
+      const CHUNK_SIZE = 8192;
+      for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK_SIZE));
       }
       return btoa(bin);
     }
@@ -9058,7 +9550,8 @@ const __pi_vfs = (() => {
     if (!isDir && bytes === undefined && typeof globalThis.__pi_host_read_file_sync === "function") {
       try {
         const content = globalThis.__pi_host_read_file_sync(normalized);
-        bytes = toBytes(content);
+        // Host read payload is base64-encoded to preserve binary file fidelity.
+        bytes = toBytes(content, "base64");
         ensureDir(dirname(normalized));
         state.files.set(normalized, bytes);
       } catch (e) {
@@ -9111,6 +9604,7 @@ const __pi_vfs = (() => {
   state.listChildren = listChildren;
   state.makeStat = makeStat;
   state.resolvePath = resolvePath;
+  state.checkWriteAccess = checkWriteAccess;
   state.parseOpenFlags = parseOpenFlags;
   state.getFdEntry = getFdEntry;
   state.toWritableView = toWritableView;
@@ -9134,7 +9628,8 @@ export function readFileSync(path, encoding) {
   if (!bytes && typeof globalThis.__pi_host_read_file_sync === "function") {
     try {
       const content = globalThis.__pi_host_read_file_sync(resolved);
-      bytes = __pi_vfs.toBytes(content);
+      // Host read payload is base64-encoded to preserve binary file fidelity.
+      bytes = __pi_vfs.toBytes(content, "base64");
       __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
       __pi_vfs.files.set(resolved, bytes);
     } catch (e) {
@@ -9155,6 +9650,7 @@ export function readFileSync(path, encoding) {
 
 export function appendFileSync(path, data, opts) {
   const resolved = __pi_vfs.resolvePath(path, true);
+  __pi_vfs.checkWriteAccess(resolved);
   const current = __pi_vfs.files.get(resolved) || new Uint8Array();
   const next = __pi_vfs.toBytes(data, opts);
   const merged = new Uint8Array(current.byteLength + next.byteLength);
@@ -9166,6 +9662,7 @@ export function appendFileSync(path, data, opts) {
 
 export function writeFileSync(path, data, opts) {
   const resolved = __pi_vfs.resolvePath(path, true);
+  __pi_vfs.checkWriteAccess(resolved);
   __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
   __pi_vfs.files.set(resolved, __pi_vfs.toBytes(data, opts));
 }
@@ -9197,6 +9694,7 @@ export function lstatSync(path) { return __pi_vfs.makeStat(path, false); }
 export function mkdtempSync(prefix, _opts) {
   const p = String(prefix ?? "/tmp/tmp-");
   const out = `${p}${Date.now().toString(36)}`;
+  __pi_vfs.checkWriteAccess(__pi_vfs.normalizePath(out));
   __pi_vfs.ensureDir(out);
   return out;
 }
@@ -9205,6 +9703,7 @@ export function realpathSync(path, _opts) {
 }
 export function unlinkSync(path) {
   const normalized = __pi_vfs.normalizePath(path);
+  __pi_vfs.checkWriteAccess(normalized);
   if (__pi_vfs.symlinks.delete(normalized)) {
     return;
   }
@@ -9214,6 +9713,7 @@ export function unlinkSync(path) {
 }
 export function rmdirSync(path, _opts) {
   const normalized = __pi_vfs.normalizePath(path);
+  __pi_vfs.checkWriteAccess(normalized);
   if (normalized === "/") {
     throw new Error("EBUSY: resource busy or locked, rmdir '/'");
   }
@@ -9241,6 +9741,7 @@ export function rmdirSync(path, _opts) {
 }
 export function rmSync(path, opts) {
   const normalized = __pi_vfs.normalizePath(path);
+  __pi_vfs.checkWriteAccess(normalized);
   if (__pi_vfs.files.has(normalized)) {
     __pi_vfs.files.delete(normalized);
     return;
@@ -9283,6 +9784,8 @@ export function copyFileSync(src, dest, _mode) {
 export function renameSync(oldPath, newPath) {
   const src = __pi_vfs.normalizePath(oldPath);
   const dst = __pi_vfs.normalizePath(newPath);
+  __pi_vfs.checkWriteAccess(src);
+  __pi_vfs.checkWriteAccess(dst);
   const linkTarget = __pi_vfs.symlinks.get(src);
   if (linkTarget !== undefined) {
     __pi_vfs.ensureDir(__pi_vfs.dirname(dst));
@@ -9300,6 +9803,8 @@ export function renameSync(oldPath, newPath) {
   throw new Error(`ENOENT: no such file or directory, rename '${String(oldPath ?? "")}'`);
 }
 export function mkdirSync(path, _opts) {
+  const resolved = __pi_vfs.resolvePath(path, true);
+  __pi_vfs.checkWriteAccess(resolved);
   __pi_vfs.ensureDir(path);
   return __pi_vfs.normalizePath(path);
 }
@@ -9332,6 +9837,7 @@ export function readlinkSync(path, opts) {
 }
 export function symlinkSync(target, path, _type) {
   const normalized = __pi_vfs.normalizePath(path);
+  __pi_vfs.checkWriteAccess(normalized);
   const parent = __pi_vfs.dirname(normalized);
   if (!__pi_vfs.dirs.has(parent)) {
     throw new Error(`ENOENT: no such file or directory, symlink '${String(path ?? "")}'`);
@@ -9344,6 +9850,10 @@ export function symlinkSync(target, path, _type) {
 export function openSync(path, flags = "r", _mode) {
   const resolved = __pi_vfs.resolvePath(path, true);
   const opts = __pi_vfs.parseOpenFlags(flags);
+
+  if (opts.writable || opts.create || opts.append || opts.truncate) {
+    __pi_vfs.checkWriteAccess(resolved);
+  }
 
   if (__pi_vfs.dirs.has(resolved)) {
     throw new Error(`EISDIR: illegal operation on a directory, open '${String(path ?? "")}'`);
@@ -10082,7 +10592,7 @@ const _URL = globalThis.URL || (() => {
       const protoEnd = u.indexOf(':');
       this.protocol = protoEnd >= 0 ? u.slice(0, protoEnd + 1) : '';
       let rest = protoEnd >= 0 ? u.slice(protoEnd + 1) : u;
-      this.username = ''; this.password = '';
+      this.username = ''; this.password  = '';
       if (rest.startsWith('//')) {
         rest = rest.slice(2);
         const pathStart = rest.indexOf('/');
@@ -10096,7 +10606,7 @@ const _URL = globalThis.URL || (() => {
           const colonIdx = userInfo.indexOf(':');
           if (colonIdx >= 0) {
             this.username = userInfo.slice(0, colonIdx);
-            this.password = userInfo.slice(colonIdx + 1);
+            this.password  = userInfo.slice(colonIdx + 1);
           } else {
             this.username = userInfo;
           }
@@ -12438,6 +12948,8 @@ pub struct PiJsRuntime<C: SchedulerClock = WallClock> {
     /// that [`Self::add_extension_root`] can push extension roots into the
     /// resolver after construction.
     module_state: Rc<RefCell<PiJsModuleState>>,
+    /// Extension policy for synchronous capability checks.
+    policy: Option<ExtensionPolicy>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -12501,8 +13013,18 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     }
 
     /// Create a new PiJS runtime with a custom clock and runtime config.
+    #[allow(clippy::future_not_send)]
+    pub async fn with_clock_and_config(clock: C, config: PiJsRuntimeConfig) -> Result<Self> {
+        Self::with_clock_and_config_with_policy(clock, config, None).await
+    }
+
+    /// Create a new PiJS runtime with a custom clock, runtime config, and optional policy.
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
-    pub async fn with_clock_and_config(clock: C, mut config: PiJsRuntimeConfig) -> Result<Self> {
+    pub async fn with_clock_and_config_with_policy(
+        clock: C,
+        mut config: PiJsRuntimeConfig,
+        policy: Option<ExtensionPolicy>,
+    ) -> Result<Self> {
         // Inject target architecture so JS process.arch can read it
         #[cfg(target_arch = "x86_64")]
         config
@@ -12612,16 +13134,33 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             allowed_read_roots: Arc::new(std::sync::Mutex::new(Vec::new())),
             repair_events,
             module_state,
+            policy,
         };
 
         instance.install_pi_bridge().await?;
         Ok(instance)
     }
 
-    fn map_quickjs_error(&self, err: &rquickjs::Error) -> Error {
+    async fn map_quickjs_error(&self, err: &rquickjs::Error) -> Error {
         if self.interrupt_budget.did_trip() {
             self.interrupt_budget.clear_trip();
             return Error::extension("PiJS execution budget exceeded".to_string());
+        }
+        if matches!(err, rquickjs::Error::Exception) {
+            let detail = self
+                .context
+                .with(|ctx| {
+                    let caught = ctx.catch();
+                    Ok::<String, rquickjs::Error>(format_quickjs_exception(&ctx, caught))
+                })
+                .await
+                .ok();
+            if let Some(detail) = detail {
+                let detail = detail.trim();
+                if !detail.is_empty() && detail != "undefined" {
+                    return Error::extension(format!("QuickJS exception: {detail}"));
+                }
+            }
         }
         map_js_error(err)
     }
@@ -12686,7 +13225,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             .await
         {
             Ok(value) => value,
-            Err(err) => return Err(self.map_quickjs_error(&err)),
+            Err(err) => return Err(self.map_quickjs_error(&err).await),
         };
 
         let reset_payload: JsRuntimeResetPayload = serde_json::from_value(reset_payload_value)
@@ -12728,8 +13267,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             state.dynamic_virtual_modules.clear();
             state.dynamic_virtual_named_exports.clear();
             state.extension_roots.clear();
+            state.canonical_extension_roots.clear();
             state.extension_root_tiers.clear();
             state.extension_root_scopes.clear();
+            state.extension_roots_by_id.clear();
+            state.extension_roots_without_id.clear();
 
             for spec in dynamic_specs {
                 if state.compiled_sources.remove(&spec).is_some() {
@@ -12774,7 +13316,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         self.interrupt_budget.reset();
         match self.context.with(|ctx| ctx.eval::<(), _>(source)).await {
             Ok(()) => {}
-            Err(err) => return Err(self.map_quickjs_error(&err)),
+            Err(err) => return Err(self.map_quickjs_error(&err).await),
         }
         // Drain any immediate jobs (Promise.resolve chains, etc.)
         self.drain_jobs().await?;
@@ -12798,7 +13340,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             .await
         {
             Ok(()) => {}
-            Err(err) => return Err(self.map_quickjs_error(&err)),
+            Err(err) => return Err(self.map_quickjs_error(&err).await),
         }
         self.drain_jobs().await?;
         Ok(())
@@ -12858,8 +13400,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     pub fn reset_transient_state(&self) {
         let mut state = self.module_state.borrow_mut();
         state.extension_roots.clear();
+        state.canonical_extension_roots.clear();
         state.extension_root_tiers.clear();
         state.extension_root_scopes.clear();
+        state.extension_roots_by_id.clear();
+        state.extension_roots_without_id.clear();
         state.dynamic_virtual_modules.clear();
         state.dynamic_virtual_named_exports.clear();
         state.module_cache_counters = ModuleCacheCounters::default();
@@ -12889,7 +13434,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         self.interrupt_budget.reset();
         match self.context.with(|ctx| ctx.eval_file::<(), _>(path)).await {
             Ok(()) => {}
-            Err(err) => return Err(self.map_quickjs_error(&err)),
+            Err(err) => return Err(self.map_quickjs_error(&err).await),
         }
         self.drain_jobs().await?;
         Ok(())
@@ -12907,7 +13452,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         self.interrupt_budget.reset();
         match self.context.with(f).await {
             Ok(value) => Ok(value),
-            Err(err) => Err(self.map_quickjs_error(&err)),
+            Err(err) => Err(self.map_quickjs_error(&err).await),
         }
     }
 
@@ -12927,7 +13472,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             .await
         {
             Ok(value) => value,
-            Err(err) => return Err(self.map_quickjs_error(&err)),
+            Err(err) => return Err(self.map_quickjs_error(&err).await),
         };
         Ok(value)
     }
@@ -12990,7 +13535,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             .await
         {
             Ok(value) => value,
-            Err(err) => return Err(self.map_quickjs_error(&err)),
+            Err(err) => return Err(self.map_quickjs_error(&err).await),
         };
 
         serde_json::from_value(value).map_err(|err| Error::Json(Box::new(err)))
@@ -13012,7 +13557,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             .await
         {
             Ok(value) => Ok(value),
-            Err(err) => Err(self.map_quickjs_error(&err)),
+            Err(err) => Err(self.map_quickjs_error(&err).await),
         }
     }
 
@@ -13089,7 +13634,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                 })
                 .await;
             if let Err(err) = result {
-                return Err(self.map_quickjs_error(&err));
+                return Err(self.map_quickjs_error(&err).await);
             }
 
             // Drain microtasks until fixpoint
@@ -13153,6 +13698,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     async fn drain_jobs(&self) -> Result<usize> {
         let mut count = 0;
         loop {
+            if count >= MAX_JOBS_PER_TICK {
+                return Err(Error::extension(format!(
+                    "PiJS microtask limit exceeded ({MAX_JOBS_PER_TICK})"
+                )));
+            }
             let ran = match self.runtime.execute_pending_job().await {
                 Ok(ran) => ran,
                 Err(err) => return Err(self.map_quickjs_job_error(err)),
@@ -13342,10 +13892,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     /// Register an additional filesystem root that `readFileSync` is allowed
     /// to access.  Called before loading each extension so it can read its own
     /// bundled assets (HTML templates, markdown docs, etc.).
-    pub fn add_allowed_read_root(&self, root: PathBuf) {
+    pub fn add_allowed_read_root(&self, root: &std::path::Path) {
+        let canonical_root = crate::extensions::safe_canonicalize(root);
         if let Ok(mut roots) = self.allowed_read_roots.lock() {
-            if !roots.contains(&root) {
-                roots.push(root);
+            if !roots.contains(&canonical_root) {
+                roots.push(canonical_root);
             }
         }
     }
@@ -13363,10 +13914,24 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     /// apply stricter policy for official/first-party extensions and to allow
     /// same-scope package imports (`@scope/*`) when scope can be discovered.
     pub fn add_extension_root_with_id(&self, root: PathBuf, extension_id: Option<&str>) {
-        self.add_allowed_read_root(root.clone());
+        let canonical_root = crate::extensions::safe_canonicalize(&root);
+        self.add_allowed_read_root(&canonical_root);
         let mut state = self.module_state.borrow_mut();
         if !state.extension_roots.contains(&root) {
+            state.canonical_extension_roots.push(canonical_root.clone());
             state.extension_roots.push(root.clone());
+        }
+
+        if let Some(extension_id) = extension_id {
+            let roots = state
+                .extension_roots_by_id
+                .entry(extension_id.to_string())
+                .or_default();
+            if !roots.contains(&canonical_root) {
+                roots.push(canonical_root);
+            }
+        } else if !state.extension_roots_without_id.contains(&canonical_root) {
+            state.extension_roots_without_id.push(canonical_root);
         }
 
         let tier = extension_id.map_or_else(
@@ -13396,6 +13961,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let repair_events = Arc::clone(&self.repair_events);
         let allow_unsafe_sync_exec = self.config.allow_unsafe_sync_exec;
         let allowed_read_roots = Arc::clone(&self.allowed_read_roots);
+        let module_state = Rc::clone(&self.module_state);
+        let policy = self.policy.clone();
 
         self.context
             .with(|ctx| {
@@ -13854,6 +14421,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     "__pi_env_get_native",
                     Func::from({
                         let env = env.clone();
+                        let policy_for_env = policy.clone();
                         move |_ctx: Ctx<'_>, key: String| -> rquickjs::Result<Option<String>> {
                             // Compat fallback runs BEFORE deny_env so conformance
                             // scanning can inject deterministic dummy keys even when
@@ -13871,7 +14439,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 tracing::debug!(event = "pijs.env.get.denied", key = %key, "env capability denied");
                                 return Ok(None);
                             }
-                            let allowed = is_env_var_allowed(&key);
+                            // If a policy is present, use its SecretBroker (including
+                            // disclosure_allowlist). Otherwise fall back to default
+                            // secret filtering so obvious credentials are still hidden.
+                            let allowed = policy_for_env.as_ref().map_or_else(
+                                || is_env_var_allowed(&key),
+                                |policy| !policy.secret_broker.is_secret(&key),
+                            );
                             tracing::debug!(
                                 event = "pijs.env.get",
                                 key = %key,
@@ -13896,8 +14470,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 input_len = text.len(),
                                 "crypto sha256"
                             );
+                            let mut bytes = Vec::with_capacity(text.len());
+                            for ch in text.chars() {
+                                bytes.push(ch as u8);
+                            }
                             let mut hasher = Sha256::new();
-                            hasher.update(text.as_bytes());
+                            hasher.update(&bytes);
                             let digest = hasher.finalize();
                             Ok(hex_lower(&digest))
                         },
@@ -13916,7 +14494,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 len,
                                 "crypto random bytes"
                             );
-                            Ok(random_bytes(len))
+                            random_bytes(len)
+                                .map_err(|err| map_crypto_entropy_error("randomBytes", err))
                         },
                     ),
                 )?;
@@ -14003,7 +14582,55 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     ),
                 )?;
 
-                // __pi_host_read_file_sync(path) -> string (throws on error)
+                // __pi_host_check_write_access(path) -> void (throws on denied path)
+                // Enforces workspace/extension-root confinement for node:fs write APIs.
+                // This guard only applies while extension code is actively executing.
+                global.set(
+                    "__pi_host_check_write_access",
+                    Func::from({
+                        let process_cwd = process_cwd.clone();
+                        let allowed_read_roots = Arc::clone(&allowed_read_roots);
+                        let module_state = Rc::clone(&module_state);
+                        move |ctx: Ctx<'_>, path: String| -> rquickjs::Result<()> {
+                            let extension_id = current_extension_id(&ctx);
+
+                            // Keep standalone PiJsRuntime unit harness behavior unchanged.
+                            if extension_id.is_none() {
+                                return Ok(());
+                            }
+
+                            let workspace_root =
+                                crate::extensions::safe_canonicalize(Path::new(&process_cwd));
+                            let requested = PathBuf::from(&path);
+                            let requested_abs = if requested.is_absolute() {
+                                requested
+                            } else {
+                                workspace_root.join(requested)
+                            };
+                            let checked_path = crate::extensions::safe_canonicalize(&requested_abs);
+
+                            let in_ext_root = path_is_in_allowed_extension_root(
+                                &checked_path,
+                                extension_id.as_deref(),
+                                &module_state,
+                                &allowed_read_roots,
+                            );
+
+                            let allowed = checked_path.starts_with(&workspace_root) || in_ext_root;
+
+                            if allowed {
+                                Ok(())
+                            } else {
+                                Err(rquickjs::Error::new_loading_message(
+                                    &path,
+                                    "host write denied: path outside extension root".to_string(),
+                                ))
+                            }
+                        }
+                    }),
+                )?;
+
+                // __pi_host_read_file_sync(path) -> base64 string (throws on error)
                 // Synchronous real-filesystem read fallback for node:fs readFileSync.
                 // Reads are confined to the workspace root AND any registered
                 // extension roots to prevent host filesystem probing outside
@@ -14013,9 +14640,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     Func::from({
                         let process_cwd = process_cwd.clone();
                         let allowed_read_roots = Arc::clone(&allowed_read_roots);
+                        let module_state = Rc::clone(&module_state);
                         let configured_repair_mode = repair_mode;
                         let repair_events = Arc::clone(&repair_events);
-                        move |path: String| -> rquickjs::Result<String> {
+                        move |ctx: Ctx<'_>, path: String| -> rquickjs::Result<String> {
+                            const MAX_SYNC_READ_SIZE: u64 = 64 * 1024 * 1024; // 64MB hard limit
+                            let extension_id = current_extension_id(&ctx);
+
                             let workspace_root =
                                 crate::extensions::safe_canonicalize(Path::new(&process_cwd));
 
@@ -14026,6 +14657,59 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 workspace_root.join(requested)
                             };
 
+                            let apply_missing_asset_fallback = |checked_path: &Path, error_msg: &str| -> rquickjs::Result<String> {
+                                let in_ext_root = path_is_in_allowed_extension_root(
+                                    checked_path,
+                                    extension_id.as_deref(),
+                                    &module_state,
+                                    &allowed_read_roots,
+                                );
+
+                                if in_ext_root {
+                                    let ext = checked_path
+                                        .extension()
+                                        .and_then(|e| e.to_str())
+                                        .unwrap_or("");
+                                    let fallback = match ext {
+                                        "html" | "htm" => "<!DOCTYPE html><html><body></body></html>",
+                                        "css" => "/* auto-repair: empty stylesheet */",
+                                        "js" | "mjs" => "// auto-repair: empty script",
+                                        "md" | "txt" | "toml" | "yaml" | "yml" => "",
+                                        _ => {
+                                            return Err(rquickjs::Error::new_loading_message(
+                                                &path,
+                                                format!("host read open: {error_msg}"),
+                                            ));
+                                        }
+                                    };
+
+                                    tracing::info!(
+                                        event = "pijs.repair.missing_asset",
+                                        path = %path,
+                                        ext = %ext,
+                                        "returning empty fallback for missing asset"
+                                    );
+
+                                    if let Ok(mut events) = repair_events.lock() {
+                                        events.push(ExtensionRepairEvent {
+                                            extension_id: extension_id.clone().unwrap_or_default(),
+                                            pattern: RepairPattern::MissingAsset,
+                                            original_error: format!("ENOENT: {}", checked_path.display()),
+                                            repair_action: format!("returned empty {ext} fallback"),
+                                            success: true,
+                                            timestamp_ms: 0,
+                                        });
+                                    }
+
+                                    return Ok(BASE64_STANDARD.encode(fallback.as_bytes()));
+                                }
+
+                                Err(rquickjs::Error::new_loading_message(
+                                    &path,
+                                    format!("host read open: {error_msg}"),
+                                ))
+                            };
+
                             #[cfg(target_os = "linux")]
                             {
                                 use std::io::Read;
@@ -14034,124 +14718,31 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 // Open first to get a handle, then verify the handle's path.
                                 // This prevents TOCTOU attacks where the path is swapped
                                 // between check and read.
-                                let mut file = match std::fs::File::open(&requested_abs) {
+                                let file = match std::fs::File::open(&requested_abs) {
                                     Ok(file) => file,
                                     Err(err)
                                         if err.kind() == std::io::ErrorKind::NotFound
                                             && configured_repair_mode.should_apply() =>
                                     {
                                         // Pattern 2 (bd-k5q5.8.3): missing asset fallback.
-                                        // Linux uses fd-based TOCTOU-safe reads; when the file
-                                        // is missing we still allow extension-local empty asset
-                                        // fallbacks for known text formats.
-                                        let checked_path = std::fs::canonicalize(&requested_abs)
-                                            .map(crate::extensions::strip_unc_prefix)
-                                            .or_else(|canonicalize_err| {
-                                                if canonicalize_err.kind()
-                                                    == std::io::ErrorKind::NotFound
-                                                {
-                                                    // Walk up the ancestor chain to find the nearest
-                                                    // existing directory. This handles cases where
-                                                    // intermediate directories are missing.
-                                                    let mut ancestor = requested_abs.as_path();
-                                                    loop {
-                                                        ancestor = match ancestor.parent() {
-                                                            Some(p) if !p.as_os_str().is_empty() => p,
-                                                            _ => break,
-                                                        };
-                                                        if let Ok(canonical_ancestor) =
-                                                            std::fs::canonicalize(ancestor).map(
-                                                                crate::extensions::strip_unc_prefix,
-                                                            )
-                                                        {
-                                                            if canonical_ancestor
-                                                                .starts_with(&workspace_root)
-                                                            {
-                                                                return Ok(requested_abs.clone());
-                                                            }
-                                                            if let Ok(roots) =
-                                                                allowed_read_roots.lock()
-                                                            {
-                                                                for root in roots.iter() {
-                                                                    if canonical_ancestor
-                                                                        .starts_with(root)
-                                                                    {
-                                                                        return Ok(
-                                                                            requested_abs.clone()
-                                                                        );
-                                                                    }
-                                                                }
-                                                            }
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                                Err(canonicalize_err)
-                                            })
-                                            .map_err(|canonicalize_err| {
-                                                rquickjs::Error::new_loading_message(
-                                                    &path,
-                                                    format!("host read open: {canonicalize_err}"),
-                                                )
-                                            })?;
+                                        let checked_path = crate::extensions::safe_canonicalize(&requested_abs);
 
-                                        let in_ext_root =
-                                            allowed_read_roots.lock().is_ok_and(|roots| {
-                                                roots.iter().any(|root| checked_path.starts_with(root))
-                                            });
+                                        let in_ext_root = path_is_in_allowed_extension_root(
+                                            &checked_path,
+                                            extension_id.as_deref(),
+                                            &module_state,
+                                            &allowed_read_roots,
+                                        );
+                                        let allowed = checked_path.starts_with(&workspace_root) || in_ext_root;
 
-                                        if in_ext_root {
-                                            let ext = checked_path
-                                                .extension()
-                                                .and_then(|e| e.to_str())
-                                                .unwrap_or("");
-                                            let fallback = match ext {
-                                                "html" | "htm" => {
-                                                    "<!DOCTYPE html><html><body></body></html>"
-                                                }
-                                                "css" => "/* auto-repair: empty stylesheet */",
-                                                "js" | "mjs" => "// auto-repair: empty script",
-                                                "md" | "txt" | "toml" | "yaml" | "yml" => "",
-                                                // Do NOT fallback for .json (empty string is
-                                                // not valid JSON) or .env (security-relevant).
-                                                _ => {
-                                                    return Err(rquickjs::Error::new_loading_message(
-                                                        &path,
-                                                        format!("host read open: {err}"),
-                                                    ));
-                                                }
-                                            };
-
-                                            tracing::info!(
-                                                event = "pijs.repair.missing_asset",
-                                                path = %path,
-                                                ext = %ext,
-                                                "returning empty fallback for missing asset"
-                                            );
-
-                                            if let Ok(mut events) = repair_events.lock() {
-                                                events.push(ExtensionRepairEvent {
-                                                    extension_id: String::new(),
-                                                    pattern: RepairPattern::MissingAsset,
-                                                    original_error: format!(
-                                                        "ENOENT: {}",
-                                                        checked_path.display()
-                                                    ),
-                                                    repair_action: format!(
-                                                        "returned empty {ext} fallback"
-                                                    ),
-                                                    success: true,
-                                                    timestamp_ms: 0,
-                                                });
-                                            }
-
-                                            return Ok(fallback.to_string());
+                                        if !allowed {
+                                            return Err(rquickjs::Error::new_loading_message(
+                                                &path,
+                                                format!("host read open: {err}"),
+                                            ));
                                         }
 
-                                        return Err(rquickjs::Error::new_loading_message(
-                                            &path,
-                                            format!("host read open: {err}"),
-                                        ));
+                                        return apply_missing_asset_fallback(&checked_path, &err.to_string());
                                     }
                                     Err(err) => {
                                         return Err(rquickjs::Error::new_loading_message(
@@ -14174,9 +14765,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 let secure_path =
                                     crate::extensions::strip_unc_prefix(secure_path_buf);
 
-                                let in_ext_root = allowed_read_roots.lock().is_ok_and(|roots| {
-                                    roots.iter().any(|root| secure_path.starts_with(root))
-                                });
+                                let in_ext_root = path_is_in_allowed_extension_root(
+                                    &secure_path,
+                                    extension_id.as_deref(),
+                                    &module_state,
+                                    &allowed_read_roots,
+                                );
                                 let allowed =
                                     secure_path.starts_with(&workspace_root) || in_ext_root;
 
@@ -14187,69 +14781,42 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     ));
                                 }
 
-                                let mut content = String::new();
-                                file.read_to_string(&mut content).map_err(|err| {
+                                let mut reader = file.take(MAX_SYNC_READ_SIZE + 1);
+                                let mut buffer = Vec::new();
+                                reader.read_to_end(&mut buffer).map_err(|err| {
                                     rquickjs::Error::new_loading_message(
                                         &path,
                                         format!("host read content: {err}"),
                                     )
                                 })?;
-                                Ok(content)
+
+                                if buffer.len() as u64 > MAX_SYNC_READ_SIZE {
+                                    return Err(rquickjs::Error::new_loading_message(
+                                        &path,
+                                        format!(
+                                            "host read failed: file exceeds {MAX_SYNC_READ_SIZE} bytes"
+                                        ),
+                                    ));
+                                }
+
+                                Ok(BASE64_STANDARD.encode(buffer))
                             }
 
                             #[cfg(not(target_os = "linux"))]
                             {
-                                let checked_path = std::fs::canonicalize(&requested_abs)
-                                    .map(crate::extensions::strip_unc_prefix)
-                                    .or_else(|err| {
-                                        if err.kind() == std::io::ErrorKind::NotFound {
-                                            // Walk up the ancestor chain to find the nearest
-                                            // existing directory.  This handles cases where
-                                            // intermediate directories are missing (e.g.
-                                            // form/index.html where form/ doesn't exist).
-                                            let mut ancestor = requested_abs.as_path();
-                                            loop {
-                                                ancestor = match ancestor.parent() {
-                                                    Some(p) if !p.as_os_str().is_empty() => p,
-                                                    _ => break,
-                                                };
-                                                if let Ok(canonical_ancestor) =
-                                                    std::fs::canonicalize(ancestor)
-                                                        .map(crate::extensions::strip_unc_prefix)
-                                                {
-                                                    if canonical_ancestor
-                                                        .starts_with(&workspace_root)
-                                                    {
-                                                        return Ok(requested_abs.clone());
-                                                    }
-                                                    if let Ok(roots) = allowed_read_roots.lock() {
-                                                        for root in roots.iter() {
-                                                            if canonical_ancestor.starts_with(root)
-                                                            {
-                                                                return Ok(requested_abs.clone());
-                                                            }
-                                                        }
-                                                    }
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        Err(err)
-                                    })
-                                    .map_err(|err| {
-                                        rquickjs::Error::new_loading_message(
-                                            &path,
-                                            format!("host read: {err}"),
-                                        )
-                                    })?;
+                                let checked_path = crate::extensions::safe_canonicalize(&requested_abs);
 
                                 // Allow reads from workspace root or any registered
                                 // extension root directory.
-                                let in_ext_root = allowed_read_roots.lock().is_ok_and(|roots| {
-                                    roots.iter().any(|root| checked_path.starts_with(root))
-                                });
+                                let in_ext_root = path_is_in_allowed_extension_root(
+                                    &checked_path,
+                                    extension_id.as_deref(),
+                                    &module_state,
+                                    &allowed_read_roots,
+                                );
                                 let allowed =
                                     checked_path.starts_with(&workspace_root) || in_ext_root;
+
                                 if !allowed {
                                     return Err(rquickjs::Error::new_loading_message(
                                         &path,
@@ -14257,89 +14824,60 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     ));
                                 }
 
-                                match std::fs::read_to_string(&checked_path) {
-                                    Ok(content) => Ok(content),
-                                    Err(err)
-                                        if err.kind() == std::io::ErrorKind::NotFound
-                                            && in_ext_root
-                                            && configured_repair_mode.should_apply() =>
-                                    {
-                                        // Pattern 2 (bd-k5q5.8.3): missing asset fallback.
-                                        // Return type-appropriate empty content for known
-                                        // asset extensions. Never for .json (invalid) or
-                                        // .env (security-relevant).
-                                        let ext = checked_path
-                                            .extension()
-                                            .and_then(|e| e.to_str())
-                                            .unwrap_or("");
-                                        let fallback = match ext {
-                                            "html" | "htm" => {
-                                                "<!DOCTYPE html><html><body></body></html>"
-                                            }
-                                            "css" => "/* auto-repair: empty stylesheet */",
-                                            "js" | "mjs" => "// auto-repair: empty script",
-                                            "md" | "txt" | "toml" | "yaml" | "yml" => "",
-                                            // Do NOT fallback for .json (empty string is
-                                            // not valid JSON) or .env (security-relevant).
-                                            _ => {
-                                                return Err(rquickjs::Error::new_loading_message(
-                                                    &path,
-                                                    format!("host read: {err}"),
-                                                ));
-                                            }
-                                        };
-
-                                        tracing::info!(
-                                            event = "pijs.repair.missing_asset",
-                                            path = %path,
-                                            ext = %ext,
-                                            "returning empty fallback for missing asset"
-                                        );
-
-                                        // Record repair event.
-                                        if let Ok(mut events) = repair_events.lock() {
-                                            events.push(ExtensionRepairEvent {
-                                                extension_id: String::new(),
-                                                pattern: RepairPattern::MissingAsset,
-                                                original_error: format!(
-                                                    "ENOENT: {}",
-                                                    checked_path.display()
-                                                ),
-                                                repair_action: format!(
-                                                    "returned empty {ext} fallback"
-                                                ),
-                                                success: true,
-                                                timestamp_ms: 0,
-                                            });
+                                use std::io::Read;
+                                let file = match std::fs::File::open(&checked_path) {
+                                    Ok(file) => file,
+                                    Err(err) => {
+                                        if err.kind() == std::io::ErrorKind::NotFound && in_ext_root && configured_repair_mode.should_apply() {
+                                            return apply_missing_asset_fallback(&checked_path, &err.to_string());
                                         }
-
-                                        Ok(fallback.to_string())
+                                        return Err(rquickjs::Error::new_loading_message(
+                                            &path,
+                                            format!("host read: {err}"),
+                                        ));
                                     }
-                                    Err(err) => Err(rquickjs::Error::new_loading_message(
+                                };
+
+                                let mut reader = file.take(MAX_SYNC_READ_SIZE + 1);
+                                let mut buffer = Vec::new();
+                                reader.read_to_end(&mut buffer).map_err(|err| {
+                                    rquickjs::Error::new_loading_message(
                                         &path,
-                                        format!("host read: {err}"),
-                                    )),
+                                        format!("host read content: {err}"),
+                                    )
+                                })?;
+
+                                if buffer.len() as u64 > MAX_SYNC_READ_SIZE {
+                                    return Err(rquickjs::Error::new_loading_message(
+                                        &path,
+                                        format!("host read failed: file exceeds {} bytes", MAX_SYNC_READ_SIZE),
+                                    ));
                                 }
+
+                                Ok(BASE64_STANDARD.encode(buffer))
                             }
                         }
                     }),
                 )?;
 
-                // __pi_exec_sync_native(cmd, args_json, cwd, timeout_ms) -> JSON string
+                // __pi_exec_sync_native(cmd, args_json, cwd, timeout_ms, max_buffer) -> JSON string
                 // Synchronous subprocess execution for node:child_process execSync/spawnSync.
                 // Runs std::process::Command directly (no hostcall queue).
                 global.set(
                     "__pi_exec_sync_native",
                     Func::from({
                         let process_cwd = process_cwd.clone();
-                        move |_ctx: Ctx<'_>,
+                        let policy = self.policy.clone();
+                        move |ctx: Ctx<'_>,
                               cmd: String,
                               args_json: String,
                               cwd: Opt<String>,
-                              timeout_ms: Opt<f64>|
+                              timeout_ms: Opt<f64>,
+                              max_buffer: Opt<f64>|
                               -> rquickjs::Result<String> {
                             use std::io::Read as _;
                             use std::process::{Command, Stdio};
+                            use std::sync::atomic::AtomicBool;
                             use std::time::{Duration, Instant};
 
                             tracing::debug!(
@@ -14348,26 +14886,75 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 "exec_sync"
                             );
 
-                            if !allow_unsafe_sync_exec {
+                            let args: Vec<String> = serde_json::from_str(&args_json)
+                                .map_err(|err| rquickjs::Error::new_into_js_message(
+                                    "String",
+                                    "Array",
+                                    format!("invalid JSON args: {err}"),
+                                ))?;
+
+                            let mut denied_reason = if allow_unsafe_sync_exec {
+                                None
+                            } else {
+                                Some("sync child_process APIs are disabled by default".to_string())
+                            };
+
+                            // 2. Per-extension capability check
+                            if denied_reason.is_none() {
+                                if let Some(policy) = &policy {
+                                    let extension_id: Option<String> = ctx
+                                        .globals()
+                                        .get::<_, Option<String>>("__pi_current_extension_id")
+                                        .ok()
+                                        .flatten()
+                                        .map(|value| value.trim().to_string())
+                                        .filter(|value| !value.is_empty());
+
+                                    if check_exec_capability(policy, extension_id.as_deref()) {
+                                        match evaluate_exec_mediation(&policy.exec_mediation, &cmd, &args) {
+                                            ExecMediationResult::Deny { reason, .. } => {
+                                                denied_reason = Some(format!(
+                                                    "command blocked by exec mediation: {reason}"
+                                                ));
+                                            }
+                                            ExecMediationResult::AllowWithAudit {
+                                                class,
+                                                reason,
+                                            } => {
+                                                tracing::info!(
+                                                    event = "pijs.exec_sync.mediation_audit",
+                                                    cmd = %cmd,
+                                                    class = class.label(),
+                                                    reason = %reason,
+                                                    "sync child_process command allowed with exec mediation audit"
+                                                );
+                                            }
+                                            ExecMediationResult::Allow => {}
+                                        }
+                                    } else {
+                                        denied_reason = Some("extension lacks 'exec' capability".to_string());
+                                    }
+                                }
+                            }
+
+                            if let Some(reason) = denied_reason {
                                 tracing::warn!(
                                     event = "pijs.exec_sync.denied",
                                     cmd = %cmd,
+                                    reason = %reason,
                                     "sync child_process execution denied by security policy"
                                 );
                                 let denied = serde_json::json!({
                                     "stdout": "",
                                     "stderr": "",
                                     "status": null,
-                                    "error": "Capability 'exec' denied by policy (sync child_process APIs are disabled by default)",
+                                    "error": format!("Execution denied by policy ({reason})"),
                                     "killed": false,
                                     "pid": 0,
                                     "code": "denied",
                                 });
                                 return Ok(denied.to_string());
                             }
-
-                            let args: Vec<String> =
-                                serde_json::from_str(&args_json).unwrap_or_default();
 
                             let working_dir = cwd
                                 .0
@@ -14379,6 +14966,13 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 .filter(|ms| ms.is_finite() && *ms > 0.0)
                                 .map(|ms| Duration::from_secs_f64(ms / 1000.0));
 
+                            // Default to 10MB limit if not specified (generous but safe vs OOM)
+                            let limit_bytes = max_buffer
+                                .0
+                                .filter(|b| b.is_finite() && *b > 0.0)
+                                .and_then(|b| b.trunc().to_string().parse::<usize>().ok())
+                                .unwrap_or(10 * 1024 * 1024);
+
                             let result: std::result::Result<serde_json::Value, String> = (|| {
                                 let mut command = Command::new(&cmd);
                                 command
@@ -14387,6 +14981,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     .stdin(Stdio::null())
                                     .stdout(Stdio::piped())
                                     .stderr(Stdio::piped());
+                                crate::tools::isolate_command_process_group(&mut command);
 
                                 let mut child = command.spawn().map_err(|e| e.to_string())?;
                                 let pid = child.id();
@@ -14396,22 +14991,48 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 let mut stderr_pipe =
                                     child.stderr.take().ok_or("Missing stderr pipe")?;
 
+                                let limit_exceeded = Arc::new(AtomicBool::new(false));
+                                let limit_exceeded_stdout = limit_exceeded.clone();
+                                let limit_exceeded_stderr = limit_exceeded.clone();
+
                                 let stdout_handle = std::thread::spawn(
-                                    move || -> std::result::Result<Vec<u8>, String> {
+                                    move || -> (Vec<u8>, Option<String>) {
                                         let mut buf = Vec::new();
-                                        stdout_pipe
-                                            .read_to_end(&mut buf)
-                                            .map_err(|e| e.to_string())?;
-                                        Ok(buf)
+                                        let mut chunk = [0u8; 8192];
+                                        loop {
+                                            let n = match stdout_pipe.read(&mut chunk) {
+                                                Ok(n) => n,
+                                                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                                                Err(e) => return (buf, Some(e.to_string())),
+                                            };
+                                            if n == 0 { break; }
+                                            if buf.len() + n > limit_bytes {
+                                                limit_exceeded_stdout.store(true, AtomicOrdering::Relaxed);
+                                                return (buf, Some("ENOBUFS: stdout maxBuffer length exceeded".to_string()));
+                                            }
+                                            buf.extend_from_slice(&chunk[..n]);
+                                        }
+                                        (buf, None)
                                     },
                                 );
                                 let stderr_handle = std::thread::spawn(
-                                    move || -> std::result::Result<Vec<u8>, String> {
+                                    move || -> (Vec<u8>, Option<String>) {
                                         let mut buf = Vec::new();
-                                        stderr_pipe
-                                            .read_to_end(&mut buf)
-                                            .map_err(|e| e.to_string())?;
-                                        Ok(buf)
+                                        let mut chunk = [0u8; 8192];
+                                        loop {
+                                            let n = match stderr_pipe.read(&mut chunk) {
+                                                Ok(n) => n,
+                                                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                                                Err(e) => return (buf, Some(e.to_string())),
+                                            };
+                                            if n == 0 { break; }
+                                            if buf.len() + n > limit_bytes {
+                                                limit_exceeded_stderr.store(true, AtomicOrdering::Relaxed);
+                                                return (buf, Some("ENOBUFS: stderr maxBuffer length exceeded".to_string()));
+                                            }
+                                            buf.extend_from_slice(&chunk[..n]);
+                                        }
+                                        (buf, None)
                                     },
                                 );
 
@@ -14421,10 +15042,16 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
                                         break st;
                                     }
+                                    if !killed && limit_exceeded.load(AtomicOrdering::Relaxed) {
+                                        killed = true;
+                                        crate::tools::kill_process_group_tree(Some(pid));
+                                        let _ = child.kill();
+                                        break child.wait().map_err(|e| e.to_string())?;
+                                    }
                                     if let Some(t) = timeout {
-                                        if start.elapsed() >= t {
+                                        if !killed && start.elapsed() >= t {
                                             killed = true;
-                                            crate::tools::kill_process_tree(Some(pid));
+                                            crate::tools::kill_process_group_tree(Some(pid));
                                             let _ = child.kill();
                                             break child.wait().map_err(|e| e.to_string())?;
                                         }
@@ -14432,18 +15059,17 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     std::thread::sleep(Duration::from_millis(5));
                                 };
 
-                                let stdout_bytes = stdout_handle
+                                let (stdout_bytes, stdout_err) = stdout_handle
                                     .join()
-                                    .map_err(|_| "stdout reader thread panicked".to_string())?
-                                    .map_err(|e| format!("failed to read stdout: {e}"))?;
-                                let stderr_bytes = stderr_handle
+                                    .map_err(|_| "stdout reader thread panicked".to_string())?;
+                                let (stderr_bytes, stderr_err) = stderr_handle
                                     .join()
-                                    .map_err(|_| "stderr reader thread panicked".to_string())?
-                                    .map_err(|e| format!("failed to read stderr: {e}"))?;
+                                    .map_err(|_| "stderr reader thread panicked".to_string())?;
 
                                 let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
                                 let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
                                 let code = status.code();
+                                let error = stdout_err.or(stderr_err);
 
                                 Ok(serde_json::json!({
                                     "stdout": stdout,
@@ -14451,6 +15077,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     "status": code,
                                     "killed": killed,
                                     "pid": pid,
+                                    "error": error
                                 }))
                             })(
                             );
@@ -14526,14 +15153,29 @@ fn hex_lower(bytes: &[u8]) -> String {
     output
 }
 
-fn random_bytes(len: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(len);
-    while out.len() < len {
-        let bytes = Uuid::new_v4().into_bytes();
-        let remaining = len - out.len();
-        out.extend_from_slice(&bytes[..remaining.min(bytes.len())]);
+fn map_crypto_entropy_error(api: &'static str, err: getrandom::Error) -> rquickjs::Error {
+    tracing::error!(
+        event = "pijs.crypto.entropy_failure",
+        api,
+        error = %err,
+        "OS randomness unavailable"
+    );
+    rquickjs::Error::new_into_js_message("crypto", api, format!("OS randomness unavailable: {err}"))
+}
+
+fn fill_random_bytes_with<F, E>(len: usize, mut fill: F) -> std::result::Result<Vec<u8>, E>
+where
+    F: FnMut(&mut [u8]) -> std::result::Result<(), E>,
+{
+    let mut out = vec![0u8; len];
+    if len > 0 {
+        fill(&mut out)?;
     }
-    out
+    Ok(out)
+}
+
+fn random_bytes(len: usize) -> std::result::Result<Vec<u8>, getrandom::Error> {
+    fill_random_bytes_with(len, getrandom::fill)
 }
 
 /// JavaScript bridge code for managing pending hostcalls and timer callbacks.
@@ -15692,10 +16334,197 @@ function __pi_build_extension_ui_template(hasUI) {
                 text: String(text === undefined || text === null ? '' : text),
             }).catch(() => {});
         },
-        custom: (_component, options) => {
-            if (!hasUI) return Promise.resolve(undefined);
-            const payload = options && typeof options === 'object' ? options : {};
-            return pi.ui('custom', payload);
+        custom: async (componentFactory, options) => {
+            if (!hasUI) return undefined;
+            const opts = options && typeof options === 'object' ? options : {};
+            if (typeof componentFactory !== 'function') {
+                return pi.ui('custom', opts);
+            }
+
+            const widgetKey = '__pi_custom_overlay';
+            const parseWidth = (value, fallback) => {
+                if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+                    return Math.max(20, Math.floor(value));
+                }
+                if (typeof value === 'string') {
+                    const text = value.trim();
+                    if (!text) return fallback;
+                    if (text.endsWith('%')) {
+                        const pct = Number.parseFloat(text.slice(0, -1));
+                        if (Number.isFinite(pct) && pct > 0) {
+                            return Math.max(20, Math.floor((fallback * pct) / 100));
+                        }
+                        return fallback;
+                    }
+                    const parsed = Number.parseInt(text, 10);
+                    if (Number.isFinite(parsed) && parsed > 0) {
+                        return Math.max(20, parsed);
+                    }
+                }
+                return fallback;
+            };
+            const fallbackWidth = parseWidth(
+                opts.width ?? (opts.overlayOptions && opts.overlayOptions.width),
+                80
+            );
+
+            let done = false;
+            let doneValue = undefined;
+            let renderWidth = fallbackWidth;
+            let needsRender = true;
+            let renderInFlight = false;
+            let pollInFlight = false;
+            let component = null;
+            let renderTimer = null;
+            let pollTimer = null;
+
+            const theme = (this && this.theme) || __pi_make_extension_theme();
+            const keybindings = {};
+            const onDone = (value) => {
+                done = true;
+                doneValue = value;
+            };
+            const tui = {
+                requestRender: () => {
+                    needsRender = true;
+                },
+            };
+
+            const toKittyRelease = (keyData) => {
+                if (typeof keyData !== 'string' || keyData.length === 0) return null;
+                if (keyData.length !== 1) return null;
+                const ch = keyData;
+                if (ch >= 'A' && ch <= 'Z') {
+                    const code = ch.toLowerCase().charCodeAt(0);
+                    return `\u001b[${code};2:3u`;
+                }
+                return `\u001b[${ch.charCodeAt(0)};1:3u`;
+            };
+
+            const disposeComponent = () => {
+                if (component && typeof component.dispose === 'function') {
+                    try {
+                        component.dispose();
+                    } catch (_) {}
+                }
+            };
+
+            const pushFrame = async () => {
+                if (!component || typeof component.render !== 'function') return;
+                let lines = [];
+                try {
+                    const rendered = component.render(renderWidth);
+                    if (Array.isArray(rendered)) {
+                        lines = rendered.map((line) =>
+                            String(line === undefined || line === null ? '' : line)
+                        );
+                    } else if (rendered !== undefined && rendered !== null) {
+                        lines = String(rendered).split('\n');
+                    }
+                } catch (_) {
+                    done = true;
+                    return;
+                }
+                await pi
+                    .ui('setWidget', {
+                        widgetKey,
+                        lines,
+                        title:
+                            typeof opts.title === 'string'
+                                ? opts.title
+                                : (opts.overlay ? 'Extension Overlay' : undefined),
+                    })
+                    .catch(() => {});
+            };
+
+            const handlePollResponse = (response) => {
+                if (!response || typeof response !== 'object') return;
+                if (typeof response.width === 'number' && Number.isFinite(response.width)) {
+                    const nextWidth = Math.max(20, Math.floor(response.width));
+                    if (nextWidth !== renderWidth) {
+                        renderWidth = nextWidth;
+                        needsRender = true;
+                    }
+                }
+                if (response.closed || response.cancelled) {
+                    done = true;
+                    return;
+                }
+                const keyData = typeof response.key === 'string' ? response.key : null;
+                if (keyData && component && typeof component.handleInput === 'function') {
+                    try {
+                        component.handleInput(keyData);
+                        const release = toKittyRelease(keyData);
+                        if (release) {
+                            component.handleInput(release);
+                        }
+                    } catch (_) {
+                        done = true;
+                        return;
+                    }
+                    needsRender = true;
+                }
+            };
+
+            const pollInput = () => {
+                if (done || pollInFlight) return;
+                pollInFlight = true;
+                void pi
+                    .ui('custom', {
+                        ...opts,
+                        mode: 'poll',
+                        widgetKey,
+                    })
+                    .then(handlePollResponse)
+                    .catch(() => {})
+                    .finally(() => {
+                        pollInFlight = false;
+                    });
+            };
+
+            try {
+                component = componentFactory(tui, theme, keybindings, onDone);
+            } catch (err) {
+                disposeComponent();
+                throw err;
+            }
+
+            renderTimer = setInterval(() => {
+                if (done || renderInFlight || !needsRender) return;
+                needsRender = false;
+                renderInFlight = true;
+                void pushFrame().finally(() => {
+                    renderInFlight = false;
+                });
+            }, 1000 / 30);
+
+            pollTimer = setInterval(() => {
+                pollInput();
+            }, 16);
+
+            pollInput();
+            needsRender = false;
+            await pushFrame();
+
+            while (!done) {
+                await __pi_sleep(16);
+            }
+
+            if (renderTimer) clearInterval(renderTimer);
+            if (pollTimer) clearInterval(pollTimer);
+            disposeComponent();
+
+            await pi.ui('setWidget', { widgetKey, clear: true, lines: [] }).catch(() => {});
+            await pi
+                .ui('custom', {
+                    ...opts,
+                    mode: 'close',
+                    close: true,
+                    widgetKey,
+                })
+                .catch(() => {});
+
+            return doneValue;
         },
     };
 }
@@ -16522,21 +17351,26 @@ if (typeof globalThis.TextDecoder === 'undefined') {
             }
 
             let out = '';
+            let chunk = [];
             for (let i = 0; i < bytes.length; ) {
+                if (chunk.length >= 8192) {
+                    out += String.fromCharCode.apply(null, chunk);
+                    chunk.length = 0;
+                }
                 const b0 = bytes[i++];
                 if (b0 < 0x80) {
-                    out += String.fromCharCode(b0);
+                    chunk.push(b0);
                     continue;
                 }
                 if ((b0 & 0xe0) === 0xc0) {
                     const b1 = bytes[i++] & 0x3f;
-                    out += String.fromCharCode(((b0 & 0x1f) << 6) | b1);
+                    chunk.push(((b0 & 0x1f) << 6) | b1);
                     continue;
                 }
                 if ((b0 & 0xf0) === 0xe0) {
                     const b1 = bytes[i++] & 0x3f;
                     const b2 = bytes[i++] & 0x3f;
-                    out += String.fromCharCode(((b0 & 0x0f) << 12) | (b1 << 6) | b2);
+                    chunk.push(((b0 & 0x0f) << 12) | (b1 << 6) | b2);
                     continue;
                 }
                 if ((b0 & 0xf8) === 0xf0) {
@@ -16545,9 +17379,12 @@ if (typeof globalThis.TextDecoder === 'undefined') {
                     const b3 = bytes[i++] & 0x3f;
                     let cp = ((b0 & 0x07) << 18) | (b1 << 12) | (b2 << 6) | b3;
                     cp -= 0x10000;
-                    out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+                    chunk.push(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
                     continue;
                 }
+            }
+            if (chunk.length > 0) {
+                out += String.fromCharCode.apply(null, chunk);
             }
             return out;
         }
@@ -16676,6 +17513,17 @@ if (typeof globalThis.URL === 'undefined') {
 
 if (typeof globalThis.Buffer === 'undefined') {
     class Buffer extends Uint8Array {
+        static _normalizeSearchOffset(length, byteOffset) {
+            if (byteOffset == null) return 0;
+            const number = Number(byteOffset);
+            if (Number.isNaN(number)) return 0;
+            if (number === Infinity) return length;
+            if (number === -Infinity) return 0;
+            const offset = Math.trunc(number);
+            if (offset < 0) return Math.max(length + offset, 0);
+            if (offset > length) return length;
+            return offset;
+        }
         static from(input, encoding) {
             if (typeof input === 'string') {
                 const enc = String(encoding || '').toLowerCase();
@@ -16765,13 +17613,18 @@ if (typeof globalThis.Buffer === 'undefined') {
             const enc = String(encoding || 'utf8').toLowerCase();
             if (enc === 'base64') {
                 let binary = '';
-                for (let i = 0; i < view.length; i++) binary += String.fromCharCode(view[i]);
+                const CHUNK_SIZE = 8192;
+                for (let i = 0; i < view.length; i += CHUNK_SIZE) {
+                    binary += String.fromCharCode.apply(null, view.subarray(i, i + CHUNK_SIZE));
+                }
                 return __pi_base64_encode_native(binary);
             }
             if (enc === 'hex') {
-                let hex = '';
-                for (let i = 0; i < view.length; i++) hex += (view[i] < 16 ? '0' : '') + view[i].toString(16);
-                return hex;
+                const hexArr = new Array(view.length);
+                for (let i = 0; i < view.length; i++) {
+                    hexArr[i] = (view[i] < 16 ? '0' : '') + view[i].toString(16);
+                }
+                return hexArr.join('');
             }
             return new TextDecoder().decode(view);
         }
@@ -16802,14 +17655,20 @@ if (typeof globalThis.Buffer === 'undefined') {
             return buf;
         }
         indexOf(value, byteOffset, encoding) {
-            const offset = byteOffset || 0;
+            let offset = Buffer._normalizeSearchOffset(this.length, byteOffset);
+            let searchEncoding = encoding;
+            if (typeof byteOffset === 'string') {
+                offset = 0;
+                searchEncoding = byteOffset;
+            }
             if (typeof value === 'number') {
                 for (let i = offset; i < this.length; i++) {
                     if (this[i] === (value & 0xff)) return i;
                 }
                 return -1;
             }
-            const needle = typeof value === 'string' ? Buffer.from(value, encoding) : value;
+            const needle = typeof value === 'string' ? Buffer.from(value, searchEncoding) : value;
+            if (needle.length === 0) return offset;
             outer: for (let i = offset; i <= this.length - needle.length; i++) {
                 for (let j = 0; j < needle.length; j++) {
                     if (this[i + j] !== needle[j]) continue outer;
@@ -16880,8 +17739,9 @@ if (typeof globalThis.crypto.subtle.digest !== 'function') {
         }
         const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
         let text = '';
-        for (let i = 0; i < bytes.length; i++) {
-            text += String.fromCharCode(bytes[i]);
+        const CHUNK_SIZE = 8192;
+        for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+            text += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK_SIZE));
         }
         const hex = __pi_crypto_sha256_hex_native(text);
         const out = new Uint8Array(hex.length / 2);
@@ -17241,7 +18101,7 @@ if (typeof globalThis.Bun === 'undefined') {
             globalThis.process && typeof globalThis.process.cwd === 'function'
                 ? globalThis.process.cwd()
                 : '/';
-        const raw = __pi_exec_sync_native('which', JSON.stringify([name]), cwd, 2000);
+        const raw = __pi_exec_sync_native('which', JSON.stringify([name]), cwd, 2000, undefined);
         try {
             const parsed = JSON.parse(raw || '{}');
             if (Number(parsed && parsed.code) !== 0) return null;
@@ -17296,17 +18156,17 @@ if (typeof globalThis.Bun === 'undefined') {
         const childProcess = __pi_bun_child_process();
         if (childProcess && typeof childProcess.spawn === 'function') {
             const child = childProcess.spawn(command, args, spawnOptions);
-            let stdoutText = '';
-            let stderrText = '';
+            let stdoutChunks = [];
+            let stderrChunks = [];
 
             if (child && child.stdout && typeof child.stdout.on === 'function') {
                 child.stdout.on('data', (chunk) => {
-                    stdoutText += String(chunk ?? '');
+                    stdoutChunks.push(String(chunk ?? ''));
                 });
             }
             if (child && child.stderr && typeof child.stderr.on === 'function') {
                 child.stderr.on('data', (chunk) => {
-                    stderrText += String(chunk ?? '');
+                    stderrChunks.push(String(chunk ?? ''));
                 });
             }
 
@@ -17329,11 +18189,11 @@ if (typeof globalThis.Bun === 'undefined') {
                 stdin: child.stdin || null,
                 stdout: __pi_bun_make_text_stream(async () => {
                     await exited.catch(() => null);
-                    return stdoutText;
+                    return stdoutChunks.join('');
                 }),
                 stderr: __pi_bun_make_text_stream(async () => {
                     await exited.catch(() => null);
-                    return stderrText;
+                    return stderrChunks.join('');
                 }),
                 exited,
                 kill(signal) {
@@ -17461,6 +18321,24 @@ if (typeof globalThis.clearInterval !== 'function') {
 }
 
 if (typeof globalThis.fetch !== 'function') {
+    const __pi_fetch_body_bytes_to_base64 = (value) => {
+        let bytes = null;
+        if (value instanceof Uint8Array) {
+            bytes = value;
+        } else if (value instanceof ArrayBuffer) {
+            bytes = new Uint8Array(value);
+        } else if (ArrayBuffer.isView && ArrayBuffer.isView(value)) {
+            bytes = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        }
+        if (!bytes) return null;
+        let binary = '';
+        const CHUNK_SIZE = 8192;
+        for (let i = 0; i < bytes.length; i += CHUNK_SIZE) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK_SIZE));
+        }
+        return __pi_base64_encode_native(binary);
+    };
+
     class Headers {
         constructor(init) {
             this._map = {};
@@ -17653,12 +18531,12 @@ if (typeof globalThis.fetch !== 'function') {
     if (typeof globalThis.AbortController === 'undefined') {
         class AbortSignal {
             constructor() { this.aborted = false; this._listeners = []; }
-            get reason() { return this.aborted ? new Error('This operation was aborted') : undefined; }
+            get reason() { return this.aborted ? (this._reason !== undefined ? this._reason : new Error('This operation was aborted')) : undefined; }
             addEventListener(type, fn) { if (type === 'abort') this._listeners.push(fn); }
             removeEventListener(type, fn) { if (type === 'abort') this._listeners = this._listeners.filter(f => f !== fn); }
             throwIfAborted() { if (this.aborted) throw this.reason; }
-            static abort(reason) { const s = new AbortSignal(); s.aborted = true; s._reason = reason; return s; }
-            static timeout(ms) { const s = new AbortSignal(); setTimeout(() => { s.aborted = true; s._listeners.forEach(fn => fn()); }, ms); return s; }
+            static abort(reason) { const s = new AbortSignal(); s.aborted = true; s._reason = reason !== undefined ? reason : new Error('This operation was aborted'); return s; }
+            static timeout(ms) { const s = new AbortSignal(); setTimeout(() => { s.aborted = true; s._reason = new Error('The operation was aborted due to timeout'); s._listeners.forEach(fn => fn()); }, ms); return s; }
         }
         class AbortController {
             constructor() { this.signal = new AbortSignal(); }
@@ -17689,11 +18567,21 @@ if (typeof globalThis.fetch !== 'function') {
         }
 
         let body = undefined;
+        let body_bytes = undefined;
         if (options.body !== undefined && options.body !== null) {
-            body = typeof options.body === 'string' ? options.body : String(options.body);
+            const encoded = __pi_fetch_body_bytes_to_base64(options.body);
+            if (encoded !== null) {
+                body_bytes = encoded;
+            } else {
+                body = typeof options.body === 'string' ? options.body : String(options.body);
+            }
         }
 
-        const resp = await pi.http({ url, method, headers, body });
+        const request = { url, method, headers };
+        if (body !== undefined) request.body = body;
+        if (body_bytes !== undefined) request.body_bytes = body_bytes;
+
+        const resp = await pi.http(request);
         const status = resp && resp.status !== undefined ? Number(resp.status) : 0;
         const respHeaders = resp && resp.headers && typeof resp.headers === 'object' ? resp.headers : {};
 
@@ -17761,7 +18649,7 @@ mod tests {
             allow_unsafe_sync_exec: true,
             ..PiJsRuntimeConfig::default()
         };
-        PiJsRuntime::with_clock_and_config(clock, config)
+        PiJsRuntime::with_clock_and_config_with_policy(clock, config, None)
             .await
             .expect("create runtime")
     }
@@ -17821,6 +18709,65 @@ module.exports = { fs, generated };
         let rewritten = maybe_cjs_to_esm(source);
         assert!(rewritten.contains(r#"from "fs";"#));
         assert!(!rewritten.contains(r#"from "ajv/dist/runtime/validation_error";"#));
+    }
+
+    #[test]
+    fn maybe_cjs_to_esm_leaves_doom_style_dirname_module_alone() {
+        let source = r#"
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+export const bundled = join(__dirname, "doom1.wad");
+"#;
+
+        let rewritten = maybe_cjs_to_esm(source);
+        assert!(
+            !rewritten.contains("const __filename ="),
+            "declared __dirname should not trigger __filename shim:\n{rewritten}"
+        );
+        assert!(
+            !rewritten.contains("const __dirname = (() =>"),
+            "declared __dirname should not be replaced:\n{rewritten}"
+        );
+    }
+
+    #[test]
+    fn source_declares_binding_detects_inline_const_binding() {
+        let source = r#"import { dirname } from "node:path"; const __dirname = dirname("/tmp/demo"); export const bundled = __dirname;"#;
+        assert!(source_declares_binding(source, "__dirname"));
+    }
+
+    #[test]
+    fn maybe_cjs_to_esm_leaves_inline_doom_style_dirname_module_alone() {
+        let source = r#"import { dirname, join } from "node:path"; import { fileURLToPath } from "node:url"; const __dirname = dirname(fileURLToPath(import.meta.url)); export const bundled = join(__dirname, "doom1.wad");"#;
+
+        let rewritten = maybe_cjs_to_esm(source);
+        assert!(
+            !rewritten.contains("const __filename ="),
+            "inline declared __dirname should not trigger __filename shim:\n{rewritten}"
+        );
+        assert!(
+            !rewritten.contains("const __dirname = (() =>"),
+            "inline declared __dirname should not be replaced:\n{rewritten}"
+        );
+    }
+
+    #[test]
+    fn maybe_cjs_to_esm_injects_dirname_without_filename_for_free_dirname() {
+        let source = r"
+export const currentDir = __dirname;
+";
+
+        let rewritten = maybe_cjs_to_esm(source);
+        assert!(
+            rewritten.contains("const __dirname = (() =>"),
+            "free __dirname should get a dirname shim:\n{rewritten}"
+        );
+        assert!(
+            !rewritten.contains("const __filename ="),
+            "free __dirname alone should not force a __filename shim:\n{rewritten}"
+        );
     }
 
     #[test]
@@ -18460,8 +19407,11 @@ import { isIPv4 as netIsIpv4 } from "node:net";
             {
                 let state = runtime.module_state.borrow();
                 assert!(state.extension_roots.is_empty());
+                assert!(state.canonical_extension_roots.is_empty());
                 assert!(state.extension_root_tiers.is_empty());
                 assert!(state.extension_root_scopes.is_empty());
+                assert!(state.extension_roots_by_id.is_empty());
+                assert!(state.extension_roots_without_id.is_empty());
                 assert!(state.dynamic_virtual_modules.is_empty());
                 assert!(state.dynamic_virtual_named_exports.is_empty());
 
@@ -18534,6 +19484,32 @@ import { isIPv4 as netIsIpv4 } from "node:net";
     }
 
     #[test]
+    fn warm_reset_clears_canonical_and_per_extension_roots() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let root = temp_dir.path().join("ext");
+            std::fs::create_dir_all(&root).expect("mkdir ext");
+            runtime.add_extension_root_with_id(root.clone(), Some("ext.reset.roots"));
+
+            let report = runtime
+                .reset_for_warm_reload()
+                .await
+                .expect("warm reset should run");
+            assert!(report.reused, "expected warm reuse, got report: {report:?}");
+
+            let state = runtime.module_state.borrow();
+            assert!(state.extension_roots.is_empty());
+            assert!(state.canonical_extension_roots.is_empty());
+            assert!(state.extension_roots_by_id.is_empty());
+            assert!(state.extension_roots_without_id.is_empty());
+        });
+    }
+
+    #[test]
     fn resolver_error_messages_are_classified_deterministically() {
         assert_eq!(
             unsupported_module_specifier_message("left-pad"),
@@ -18572,25 +19548,109 @@ import { isIPv4 as netIsIpv4 } from "node:net";
         std::fs::write(&only_json, "{\"ok\":true}\n").expect("write only_json.json");
 
         let mode = RepairMode::default();
+        let roots = [root.to_path_buf()];
+        let canonical_roots = roots
+            .iter()
+            .map(|p| crate::extensions::safe_canonicalize(p))
+            .collect::<Vec<_>>();
 
-        let resolved_pkg = resolve_module_path(base.to_string_lossy().as_ref(), "./pkg", mode)
-            .expect("resolve ./pkg");
+        let resolved_pkg = resolve_module_path(
+            base.to_string_lossy().as_ref(),
+            "./pkg",
+            mode,
+            &canonical_roots,
+        )
+        .expect("resolve ./pkg");
         assert_eq!(resolved_pkg, pkg_index_ts);
 
-        let resolved_module =
-            resolve_module_path(base.to_string_lossy().as_ref(), "./module", mode)
-                .expect("resolve ./module");
+        let resolved_module = resolve_module_path(
+            base.to_string_lossy().as_ref(),
+            "./module",
+            mode,
+            &canonical_roots,
+        )
+        .expect("resolve ./module");
         assert_eq!(resolved_module, module_ts);
 
-        let resolved_json =
-            resolve_module_path(base.to_string_lossy().as_ref(), "./only_json", mode)
-                .expect("resolve ./only_json");
+        let resolved_json = resolve_module_path(
+            base.to_string_lossy().as_ref(),
+            "./only_json",
+            mode,
+            &canonical_roots,
+        )
+        .expect("resolve ./only_json");
         assert_eq!(resolved_json, only_json);
 
         let file_url = format!("file://{}", module_ts.display());
-        let resolved_file_url =
-            resolve_module_path(base.to_string_lossy().as_ref(), &file_url, mode).expect("file://");
+        let resolved_file_url = resolve_module_path(
+            base.to_string_lossy().as_ref(),
+            &file_url,
+            mode,
+            &canonical_roots,
+        )
+        .expect("file://");
         assert_eq!(resolved_file_url, module_ts);
+    }
+
+    #[test]
+    fn resolve_module_path_blocks_file_url_outside_extension_root() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = temp_dir.path();
+        let extension_root = root.join("ext");
+        std::fs::create_dir_all(&extension_root).expect("mkdir ext");
+
+        let base = extension_root.join("index.ts");
+        std::fs::write(&base, "export {};\n").expect("write base");
+
+        let outside = root.join("secret.ts");
+        std::fs::write(&outside, "export const secret  = 1;\n").expect("write outside");
+
+        let mode = RepairMode::default();
+        let roots = [extension_root];
+        let canonical_roots = roots
+            .iter()
+            .map(|p| crate::extensions::safe_canonicalize(p))
+            .collect::<Vec<_>>();
+        let file_url = format!("file://{}", outside.display());
+        let resolved = resolve_module_path(
+            base.to_string_lossy().as_ref(),
+            &file_url,
+            mode,
+            &canonical_roots,
+        );
+        assert!(
+            resolved.is_none(),
+            "file:// import outside extension root should be blocked, got {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_module_path_allows_file_url_inside_extension_root() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = temp_dir.path();
+        let extension_root = root.join("ext");
+        std::fs::create_dir_all(&extension_root).expect("mkdir ext");
+
+        let base = extension_root.join("index.ts");
+        std::fs::write(&base, "export {};\n").expect("write base");
+
+        let inside = extension_root.join("module.ts");
+        std::fs::write(&inside, "export const ok = 1;\n").expect("write inside");
+
+        let mode = RepairMode::default();
+        let roots = [extension_root];
+        let canonical_roots = roots
+            .iter()
+            .map(|p| crate::extensions::safe_canonicalize(p))
+            .collect::<Vec<_>>();
+        let file_url = format!("file://{}", inside.display());
+        let resolved = resolve_module_path(
+            base.to_string_lossy().as_ref(),
+            &file_url,
+            mode,
+            &canonical_roots,
+        );
+        assert_eq!(resolved, Some(inside));
     }
 
     #[test]
@@ -18737,9 +19797,13 @@ export default dep;
                 repair_mode: RepairMode::AutoStrict,
                 ..PiJsRuntimeConfig::default()
             };
-            let runtime = PiJsRuntime::with_clock_and_config(DeterministicClock::new(0), config)
-                .await
-                .expect("create runtime");
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                config,
+                None,
+            )
+            .await
+            .expect("create runtime");
             runtime.add_extension_root_with_id(ext_dir.clone(), Some("community/proxy-ext"));
 
             let entry_spec = format!("file://{}", entry.display());
@@ -18794,9 +19858,13 @@ export default dep;
                 repair_mode: RepairMode::AutoSafe,
                 ..PiJsRuntimeConfig::default()
             };
-            let runtime = PiJsRuntime::with_clock_and_config(DeterministicClock::new(0), config)
-                .await
-                .expect("create runtime");
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                config,
+                None,
+            )
+            .await
+            .expect("create runtime");
             runtime.add_extension_root_with_id(ext_dir.clone(), Some("community/proxy-ext-safe"));
 
             let entry_spec = format!("file://{}", entry.display());
@@ -18850,9 +19918,13 @@ export default ConfigLoader;
                 repair_mode: RepairMode::AutoStrict,
                 ..PiJsRuntimeConfig::default()
             };
-            let runtime = PiJsRuntime::with_clock_and_config(DeterministicClock::new(0), config)
-                .await
-                .expect("create runtime");
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                config,
+                None,
+            )
+            .await
+            .expect("create runtime");
             runtime
                 .add_extension_root_with_id(ext_dir.clone(), Some("community/proxy-ext-existing"));
 
@@ -18887,6 +19959,166 @@ export default ConfigLoader;
                     .any(|event| event.pattern == RepairPattern::MissingNpmDep),
                 "existing virtual module should suppress missing_npm_dep repair events"
             );
+        });
+    }
+
+    #[test]
+    fn pijs_dynamic_import_loads_doom_style_wad_finder_module() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let ext_dir = temp_dir.path().join("community").join("doom-like");
+            std::fs::create_dir_all(&ext_dir).expect("mkdir ext");
+            let entry = ext_dir.join("wad-finder.ts");
+            std::fs::write(
+                &entry,
+                r#"
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+globalThis.__doomWadFinderProbe = {
+  bundled: join(__dirname, "doom1.wad"),
+};
+
+export const bundled = globalThis.__doomWadFinderProbe.bundled;
+"#,
+            )
+            .expect("write extension module");
+
+            let config = PiJsRuntimeConfig {
+                repair_mode: RepairMode::AutoStrict,
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                config,
+                None,
+            )
+            .await
+            .expect("create runtime");
+            runtime.add_extension_root_with_id(ext_dir.clone(), Some("community/doom-like"));
+
+            let entry_spec = format!("file://{}", entry.display());
+            let script = format!(
+                r#"
+                globalThis.doomLikeImport = {{}};
+                import({entry_spec:?})
+                  .then(() => {{
+                    globalThis.doomLikeImport.done = true;
+                    globalThis.doomLikeImport.error = "";
+                  }})
+                  .catch((err) => {{
+                    globalThis.doomLikeImport.done = true;
+                    globalThis.doomLikeImport.error = String((err && err.message) || err || "");
+                  }});
+                "#
+            );
+            runtime.eval(&script).await.expect("eval import");
+
+            let result = get_global_json(&runtime, "doomLikeImport").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            assert_eq!(result["error"], serde_json::json!(""));
+
+            let probe = get_global_json(&runtime, "__doomWadFinderProbe").await;
+            let bundled = probe["bundled"].as_str().unwrap_or_default();
+            assert!(
+                bundled.ends_with("/doom1.wad"),
+                "unexpected doom wad probe: {probe}"
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_dynamic_import_loads_real_doom_wad_finder_module() {
+        futures::executor::block_on(async {
+            let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let ext_dir = repo_root.join("tests/ext_conformance/artifacts/doom-overlay");
+            let entry = ext_dir.join("wad-finder.ts");
+            assert!(entry.is_file(), "missing doom wad-finder at {entry:?}");
+
+            let config = PiJsRuntimeConfig {
+                repair_mode: RepairMode::AutoStrict,
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                config,
+                None,
+            )
+            .await
+            .expect("create runtime");
+            runtime.add_extension_root_with_id(ext_dir.clone(), Some("community/doom-overlay"));
+
+            let entry_spec = format!("file://{}", entry.display());
+            let script = format!(
+                r#"
+                globalThis.realDoomWadFinderImport = {{}};
+                import({entry_spec:?})
+                  .then((mod) => {{
+                    globalThis.realDoomWadFinderImport.done = true;
+                    globalThis.realDoomWadFinderImport.error = "";
+                    globalThis.realDoomWadFinderImport.exportType = typeof mod.findWadFile;
+                  }})
+                  .catch((err) => {{
+                    globalThis.realDoomWadFinderImport.done = true;
+                    globalThis.realDoomWadFinderImport.error = String((err && err.message) || err || "");
+                  }});
+                "#
+            );
+            runtime.eval(&script).await.expect("eval import");
+
+            let result = get_global_json(&runtime, "realDoomWadFinderImport").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            assert_eq!(result["error"], serde_json::json!(""));
+            assert_eq!(result["exportType"], serde_json::json!("function"));
+        });
+    }
+
+    #[test]
+    fn pijs_loads_real_doom_extension_entry() {
+        futures::executor::block_on(async {
+            let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let ext_dir = repo_root.join("tests/ext_conformance/artifacts/doom-overlay");
+            let entry = ext_dir.join("index.ts");
+            assert!(entry.is_file(), "missing doom entry at {entry:?}");
+
+            let config = PiJsRuntimeConfig {
+                repair_mode: RepairMode::AutoStrict,
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                config,
+                None,
+            )
+            .await
+            .expect("create runtime");
+            runtime.add_extension_root_with_id(ext_dir.clone(), Some("community/doom-overlay"));
+
+            let entry_spec = format!("file://{}", entry.display());
+            let script = format!(
+                r#"
+                globalThis.realDoomEntryLoad = {{}};
+                __pi_load_extension("community/doom-overlay", {entry_spec:?}, {{ name: "doom-overlay" }})
+                  .then(() => {{
+                    globalThis.realDoomEntryLoad.done = true;
+                    globalThis.realDoomEntryLoad.error = "";
+                  }})
+                  .catch((err) => {{
+                    globalThis.realDoomEntryLoad.done = true;
+                    globalThis.realDoomEntryLoad.error = String((err && err.message) || err || "");
+                  }});
+                "#
+            );
+            runtime.eval(&script).await.expect("eval load_extension");
+
+            let result = get_global_json(&runtime, "realDoomEntryLoad").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            assert_eq!(result["error"], serde_json::json!(""));
+
+            let snapshot = call_global_fn_json(&runtime, "__pi_runtime_registry_snapshot").await;
+            assert_eq!(snapshot["extensions"], serde_json::json!(1));
+            assert_eq!(snapshot["commands"], serde_json::json!(1));
         });
     }
 
@@ -19417,6 +20649,51 @@ export default ConfigLoader;
     }
 
     #[test]
+    fn pijs_fetch_binary_body_uses_body_bytes_hostcall() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+            fetch("https://example.com/upload", {
+                method: "POST",
+                headers: { "content-type": "application/octet-stream" },
+                body: new Uint8Array([0, 1, 2, 255]),
+            });
+        "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            assert!(matches!(&requests[0].kind, HostcallKind::Http));
+
+            let payload = requests[0]
+                .payload
+                .as_object()
+                .expect("http payload object");
+            assert_eq!(
+                payload.get("method").and_then(serde_json::Value::as_str),
+                Some("POST")
+            );
+            assert_eq!(
+                payload
+                    .get("body_bytes")
+                    .and_then(serde_json::Value::as_str),
+                Some("AAEC/w==")
+            );
+            assert!(
+                payload.get("body").is_none(),
+                "binary fetch bodies must use body_bytes instead of text coercion: {payload:?}"
+            );
+        });
+    }
+
+    #[test]
     fn pijs_runtime_hostcall_completion_resolves_promise() {
         futures::executor::block_on(async {
             let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
@@ -19549,15 +20826,152 @@ export default ConfigLoader;
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn pijs_custom_ui_width_updates_trigger_reflow() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.renderWidths = [];
+                    const ui = __pi_make_extension_ui(true);
+                    void ui.custom((_tui, _theme, _keybindings, onDone) => ({
+                        render(width) {
+                            globalThis.renderWidths.push(width);
+                            if (width === 40) {
+                                onDone(width);
+                            }
+                            return [`width:${width}`];
+                        }
+                    }), { width: 80 });
+                    ",
+                )
+                .await
+                .expect("start custom ui");
+
+            let initial_requests = runtime.drain_hostcall_requests();
+            assert_eq!(
+                initial_requests.len(),
+                2,
+                "custom UI should issue an initial poll and first frame"
+            );
+
+            let mut initial_frame_call = None;
+            let mut initial_poll_call = None;
+            let mut unexpected_initial_hostcall = None;
+            for request in initial_requests {
+                match &request.kind {
+                    HostcallKind::Ui { op } if op == "setWidget" => {
+                        initial_frame_call = Some(request);
+                    }
+                    HostcallKind::Ui { op } if op == "custom" => {
+                        initial_poll_call = Some(request);
+                    }
+                    other => {
+                        unexpected_initial_hostcall = Some(format!("{other:?}"));
+                    }
+                }
+            }
+            assert_eq!(
+                unexpected_initial_hostcall, None,
+                "unexpected initial hostcall"
+            );
+
+            let initial_frame_call = initial_frame_call.expect("initial frame hostcall");
+            assert_eq!(
+                initial_frame_call.payload["lines"],
+                serde_json::json!(["width:80"])
+            );
+            runtime.complete_hostcall(
+                initial_frame_call.call_id,
+                HostcallOutcome::Success(serde_json::json!(null)),
+            );
+
+            let initial_poll_call = initial_poll_call.expect("initial poll hostcall");
+            runtime.complete_hostcall(
+                initial_poll_call.call_id,
+                HostcallOutcome::Success(serde_json::json!({ "width": 80 })),
+            );
+
+            runtime
+                .tick()
+                .await
+                .expect("deliver initial frame completion");
+            runtime
+                .tick()
+                .await
+                .expect("deliver initial poll completion");
+            assert_eq!(
+                get_global_json(&runtime, "renderWidths").await,
+                serde_json::json!([80])
+            );
+
+            let mut saw_post_startup_poll = false;
+            for step in 0..12 {
+                let next_deadline = runtime
+                    .scheduler
+                    .borrow()
+                    .next_timer_deadline()
+                    .expect("custom UI should keep timers alive");
+                clock.set(next_deadline);
+
+                let stats = runtime.tick().await.expect("tick timer");
+                assert!(
+                    stats.ran_macrotask,
+                    "expected timer macrotask at step {step}"
+                );
+
+                let requests = runtime.drain_hostcall_requests();
+                if requests.is_empty() {
+                    continue;
+                }
+                assert_eq!(requests.len(), 1, "expected one hostcall at step {step}");
+                let request = requests.into_iter().next().expect("hostcall request");
+
+                match &request.kind {
+                    HostcallKind::Ui { op } if op == "custom" => {
+                        saw_post_startup_poll = true;
+                        runtime.complete_hostcall(
+                            request.call_id,
+                            HostcallOutcome::Success(serde_json::json!({ "width": 40 })),
+                        );
+                        runtime.tick().await.expect("deliver poll completion");
+                    }
+                    HostcallKind::Ui { op } if op == "setWidget" => {
+                        assert!(
+                            saw_post_startup_poll,
+                            "startup should not enqueue a redundant timer-driven frame"
+                        );
+                        assert_eq!(
+                            request.payload["lines"],
+                            serde_json::json!(["width:40"]),
+                            "width change should trigger a reflow frame"
+                        );
+                        return;
+                    }
+                    other => panic!("unexpected hostcall at step {step}: {other:?}"),
+                }
+            }
+
+            panic!("did not observe a width-change reflow frame");
+        });
+    }
+
+    #[test]
     fn pijs_hostcall_timeout_rejects_promise() {
         futures::executor::block_on(async {
             let clock = Arc::new(DeterministicClock::new(0));
             let mut config = PiJsRuntimeConfig::default();
             config.limits.hostcall_timeout_ms = Some(50);
 
-            let runtime = PiJsRuntime::with_clock_and_config(Arc::clone(&clock), config)
-                .await
-                .expect("create runtime");
+            let runtime =
+                PiJsRuntime::with_clock_and_config_with_policy(Arc::clone(&clock), config, None)
+                    .await
+                    .expect("create runtime");
 
             runtime
                 .eval(
@@ -19605,9 +21019,13 @@ export default ConfigLoader;
             let mut config = PiJsRuntimeConfig::default();
             config.limits.interrupt_budget = Some(0);
 
-            let runtime = PiJsRuntime::with_clock_and_config(DeterministicClock::new(0), config)
-                .await
-                .expect("create runtime");
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                config,
+                None,
+            )
+            .await
+            .expect("create runtime");
 
             let err = runtime
                 .eval(
@@ -19742,9 +21160,10 @@ export default ConfigLoader;
                 deny_env: false,
                 disk_cache_dir: None,
             };
-            let runtime = PiJsRuntime::with_clock_and_config(Arc::clone(&clock), config)
-                .await
-                .expect("create runtime");
+            let runtime =
+                PiJsRuntime::with_clock_and_config_with_policy(Arc::clone(&clock), config, None)
+                    .await
+                    .expect("create runtime");
 
             runtime
                 .eval(
@@ -19801,9 +21220,10 @@ export default ConfigLoader;
                 deny_env: false,
                 disk_cache_dir: None,
             };
-            let runtime = PiJsRuntime::with_clock_and_config(Arc::clone(&clock), config)
-                .await
-                .expect("create runtime");
+            let runtime =
+                PiJsRuntime::with_clock_and_config_with_policy(Arc::clone(&clock), config, None)
+                    .await
+                    .expect("create runtime");
 
             runtime
                 .eval(
@@ -19876,6 +21296,46 @@ export default ConfigLoader;
             assert_eq!(
                 get_global_json(&runtime, "done").await,
                 serde_json::json!(true)
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_random_bytes_helper_propagates_fill_errors() {
+        let err = fill_random_bytes_with(16, |_| Err("entropy unavailable")).unwrap_err();
+        assert_eq!(err, "entropy unavailable");
+    }
+
+    #[test]
+    fn pijs_crypto_random_bytes_are_not_uuid_patterned() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    const bytes = pi.crypto.randomBytes(128);
+                    const blocks = [];
+                    for (let i = 0; i < bytes.length; i += 16) {
+                        blocks.push({
+                            versionNibble: (bytes[i + 6] >> 4) & 0x0f,
+                            variantBits: (bytes[i + 8] >> 6) & 0x03,
+                        });
+                    }
+                    globalThis.randomBytesLookLikeUuidBlocks = blocks.every(
+                        (block) => block.versionNibble === 4 && block.variantBits === 2,
+                    );
+                    ",
+                )
+                .await
+                .expect("eval random bytes pattern");
+
+            assert_eq!(
+                get_global_json(&runtime, "randomBytesLookLikeUuidBlocks").await,
+                serde_json::json!(false)
             );
         });
     }
@@ -20428,6 +21888,189 @@ export default ConfigLoader;
     }
 
     #[test]
+    fn pijs_host_read_denies_cross_extension_root_access() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let workspace = temp_dir.path().join("workspace");
+            let ext_a = temp_dir.path().join("ext-a");
+            let ext_b = temp_dir.path().join("ext-b");
+            std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+            std::fs::create_dir_all(&ext_a).expect("mkdir ext-a");
+            std::fs::create_dir_all(&ext_b).expect("mkdir ext-b");
+            let secret_path = ext_a.join("secret.txt");
+            std::fs::write(&secret_path, "top-secret").expect("write secret");
+
+            let config = PiJsRuntimeConfig {
+                cwd: workspace.display().to_string(),
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                config,
+                None,
+            )
+            .await
+            .expect("create runtime");
+            runtime.add_extension_root_with_id(ext_a, Some("ext.a"));
+            runtime.add_extension_root_with_id(ext_b, Some("ext.b"));
+
+            let script = format!(
+                r#"
+                globalThis.crossExtensionRead = {{}};
+                import('node:module').then(({{ createRequire }}) => {{
+                    const require = createRequire('/tmp/example.js');
+                    const fs = require('node:fs');
+                    return __pi_with_extension_async("ext.b", async () => {{
+                        try {{
+                            globalThis.crossExtensionRead.value = fs.readFileSync({secret_path:?}, 'utf8');
+                            globalThis.crossExtensionRead.ok = true;
+                        }} catch (err) {{
+                            globalThis.crossExtensionRead.ok = false;
+                            globalThis.crossExtensionRead.error = String((err && err.message) || err || '');
+                        }}
+                    }});
+                }}).finally(() => {{
+                    globalThis.crossExtensionRead.done = true;
+                }});
+                "#
+            );
+            runtime
+                .eval(&script)
+                .await
+                .expect("eval cross-extension read");
+
+            let result = get_global_json(&runtime, "crossExtensionRead").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            assert_eq!(result["ok"], serde_json::json!(false));
+            let error = result["error"].as_str().unwrap_or_default();
+            assert!(
+                error.contains("host read denied"),
+                "expected host read denial, got: {error}"
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_host_read_allows_idless_extension_root_for_active_extension() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let workspace = temp_dir.path().join("workspace");
+            let ext_root = temp_dir.path().join("ext");
+            std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+            std::fs::create_dir_all(&ext_root).expect("mkdir ext");
+            let asset_path = ext_root.join("asset.txt");
+            std::fs::write(&asset_path, "legacy-root-access").expect("write asset");
+
+            let config = PiJsRuntimeConfig {
+                cwd: workspace.display().to_string(),
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                config,
+                None,
+            )
+            .await
+            .expect("create runtime");
+            runtime.add_extension_root(ext_root);
+
+            let script = format!(
+                r#"
+                globalThis.legacyRootRead = {{}};
+                import('node:module').then(({{ createRequire }}) => {{
+                    const require = createRequire('/tmp/example.js');
+                    const fs = require('node:fs');
+                    return __pi_with_extension_async("ext.legacy", async () => {{
+                        try {{
+                            globalThis.legacyRootRead.value = fs.readFileSync({asset_path:?}, 'utf8');
+                            globalThis.legacyRootRead.ok = true;
+                        }} catch (err) {{
+                            globalThis.legacyRootRead.ok = false;
+                            globalThis.legacyRootRead.error = String((err && err.message) || err || '');
+                        }}
+                    }});
+                }}).finally(() => {{
+                    globalThis.legacyRootRead.done = true;
+                }});
+                "#
+            );
+            runtime
+                .eval(&script)
+                .await
+                .expect("eval id-less extension root read");
+
+            let result = get_global_json(&runtime, "legacyRootRead").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            assert_eq!(result["ok"], serde_json::json!(true));
+            assert_eq!(result["value"], serde_json::json!("legacy-root-access"));
+        });
+    }
+
+    #[test]
+    fn pijs_host_write_denies_cross_extension_root_access() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let workspace = temp_dir.path().join("workspace");
+            let ext_a = temp_dir.path().join("ext-a");
+            let ext_b = temp_dir.path().join("ext-b");
+            std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+            std::fs::create_dir_all(&ext_a).expect("mkdir ext-a");
+            std::fs::create_dir_all(&ext_b).expect("mkdir ext-b");
+            let target_path = ext_a.join("owned.txt");
+
+            let config = PiJsRuntimeConfig {
+                cwd: workspace.display().to_string(),
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                config,
+                None,
+            )
+            .await
+            .expect("create runtime");
+            runtime.add_extension_root_with_id(ext_a, Some("ext.a"));
+            runtime.add_extension_root_with_id(ext_b, Some("ext.b"));
+
+            let script = format!(
+                r#"
+                globalThis.crossExtensionWrite = {{}};
+                import('node:module').then(({{ createRequire }}) => {{
+                    const require = createRequire('/tmp/example.js');
+                    const fs = require('node:fs');
+                    return __pi_with_extension_async("ext.b", async () => {{
+                        try {{
+                            fs.writeFileSync({target_path:?}, 'owned');
+                            globalThis.crossExtensionWrite.ok = true;
+                        }} catch (err) {{
+                            globalThis.crossExtensionWrite.ok = false;
+                            globalThis.crossExtensionWrite.error = String((err && err.message) || err || '');
+                        }}
+                        globalThis.crossExtensionWrite.exists = fs.existsSync({target_path:?});
+                    }});
+                }}).finally(() => {{
+                    globalThis.crossExtensionWrite.done = true;
+                }});
+                "#
+            );
+            runtime
+                .eval(&script)
+                .await
+                .expect("eval cross-extension write");
+
+            let result = get_global_json(&runtime, "crossExtensionWrite").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            assert_eq!(result["ok"], serde_json::json!(false));
+            assert_eq!(result["exists"], serde_json::json!(false));
+            let error = result["error"].as_str().unwrap_or_default();
+            assert!(
+                error.contains("host write denied"),
+                "expected host write denial, got: {error}"
+            );
+        });
+    }
+
+    #[test]
     fn pijs_crash_interrupt_budget_stops_infinite_loop() {
         futures::executor::block_on(async {
             let config = PiJsRuntimeConfig {
@@ -20438,9 +22081,13 @@ export default ConfigLoader;
                 },
                 ..Default::default()
             };
-            let runtime = PiJsRuntime::with_clock_and_config(DeterministicClock::new(0), config)
-                .await
-                .expect("create runtime");
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                config,
+                None,
+            )
+            .await
+            .expect("create runtime");
 
             // Try to run an infinite loop - should be interrupted by budget
             let result = runtime
@@ -20862,11 +22509,15 @@ export default ConfigLoader;
                         globalThis.requireResults.http2PathHeader = http2.constants.HTTP2_HEADER_PATH;
 
                         try {
-                            require('left-pad');
+                            const missing = require('left-pad');
                             globalThis.requireResults.missingModuleThrows = false;
+                            globalThis.requireResults.missingModuleIsStub =
+                              typeof missing === 'function' &&
+                              typeof missing.default === 'function' &&
+                              typeof missing.anyNestedProperty === 'function';
                         } catch (err) {
-                            globalThis.requireResults.missingModuleThrows =
-                              String(err && err.message || '').includes('Cannot find module');
+                            globalThis.requireResults.missingModuleThrows = true;
+                            globalThis.requireResults.missingModuleIsStub = false;
                         }
                         globalThis.requireResults.done = true;
                     });
@@ -20882,7 +22533,8 @@ export default ConfigLoader;
             assert_eq!(r["cryptoHasRandomUUID"], serde_json::json!(true));
             assert_eq!(r["http2HasConnect"], serde_json::json!(true));
             assert_eq!(r["http2PathHeader"], serde_json::json!(":path"));
-            assert_eq!(r["missingModuleThrows"], serde_json::json!(true));
+            assert_eq!(r["missingModuleThrows"], serde_json::json!(false));
+            assert_eq!(r["missingModuleIsStub"], serde_json::json!(true));
         });
     }
 
@@ -21761,9 +23413,10 @@ export default ConfigLoader;
                 deny_env: false,
                 disk_cache_dir: None,
             };
-            let runtime = PiJsRuntime::with_clock_and_config(Arc::clone(&clock), config)
-                .await
-                .expect("create runtime");
+            let runtime =
+                PiJsRuntime::with_clock_and_config_with_policy(Arc::clone(&clock), config, None)
+                    .await
+                    .expect("create runtime");
 
             runtime
                 .eval(
@@ -21869,9 +23522,10 @@ export default ConfigLoader;
                 deny_env: false,
                 disk_cache_dir: None,
             };
-            let runtime = PiJsRuntime::with_clock_and_config(Arc::clone(&clock), config)
-                .await
-                .expect("create runtime");
+            let runtime =
+                PiJsRuntime::with_clock_and_config_with_policy(Arc::clone(&clock), config, None)
+                    .await
+                    .expect("create runtime");
 
             runtime
                 .eval(
@@ -22757,6 +24411,53 @@ export default ConfigLoader;
     }
 
     #[test]
+    fn pijs_exec_sync_enforces_exec_mediation_for_critical_commands() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let config = PiJsRuntimeConfig {
+                allow_unsafe_sync_exec: true,
+                ..PiJsRuntimeConfig::default()
+            };
+            let policy = crate::extensions::PolicyProfile::Permissive.to_policy();
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                Arc::clone(&clock),
+                config,
+                Some(policy),
+            )
+            .await
+            .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.syncMediation = {};
+                    import('node:child_process').then(({ execSync }) => {
+                        try {
+                            execSync('dd if=/dev/zero of=/dev/null count=1');
+                            globalThis.syncMediation.threw = false;
+                        } catch (e) {
+                            globalThis.syncMediation.threw = true;
+                            globalThis.syncMediation.msg = String((e && e.message) || e || '');
+                        }
+                        globalThis.syncMediation.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval execSync mediation");
+
+            let r = get_global_json(&runtime, "syncMediation").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["threw"], serde_json::json!(true));
+            assert!(
+                r["msg"].as_str().unwrap_or("").contains("exec mediation"),
+                "unexpected mediation denial message: {}",
+                r["msg"]
+            );
+        });
+    }
+
+    #[test]
     fn pijs_exec_sync_runs_command_and_returns_stdout() {
         futures::executor::block_on(async {
             let clock = Arc::new(DeterministicClock::new(0));
@@ -23256,6 +24957,11 @@ export default ConfigLoader;
                         globalThis.bufResult.indexOf = b.indexOf('World');
                         globalThis.bufResult.includes = b.includes('World');
                         globalThis.bufResult.notIncludes = b.includes('xyz');
+                        const neg = B.from('abc');
+                        globalThis.bufResult.negativeMiss = neg.indexOf('a', -1);
+                        globalThis.bufResult.negativeHit = neg.indexOf('c', -1);
+                        globalThis.bufResult.negativeIncludes = neg.includes('a', -1);
+                        globalThis.bufResult.indexOfHexNeedle = B.from('hello').indexOf('6c6c', 'hex');
 
                         const sliced = b.slice(0, 5);
                         globalThis.bufResult.slice = sliced.toString();
@@ -23326,6 +25032,10 @@ export default ConfigLoader;
             assert_eq!(r["indexOf"].as_f64(), Some(6.0));
             assert_eq!(r["includes"], serde_json::json!(true));
             assert_eq!(r["notIncludes"], serde_json::json!(false));
+            assert_eq!(r["negativeMiss"].as_f64(), Some(-1.0));
+            assert_eq!(r["negativeHit"].as_f64(), Some(2.0));
+            assert_eq!(r["negativeIncludes"], serde_json::json!(false));
+            assert_eq!(r["indexOfHexNeedle"].as_f64(), Some(2.0));
             // slice
             assert_eq!(r["slice"], serde_json::json!("Hello"));
             // toJSON

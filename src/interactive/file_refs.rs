@@ -30,6 +30,9 @@ pub(super) fn parse_quoted_file_ref(text: &str, start: usize) -> Option<(String,
 
     for (offset, ch) in text[after_quote..].char_indices() {
         if escaped {
+            if ch != quote && ch != '\\' {
+                path.push('\\');
+            }
             path.push(ch);
             escaped = false;
             continue;
@@ -117,17 +120,31 @@ pub(super) fn path_for_display(path: &Path, cwd: &Path) -> String {
 }
 
 pub(super) fn format_file_ref(path: &str) -> String {
-    if path.chars().any(char::is_whitespace) {
+    let needs_quotes =
+        path.chars().any(char::is_whitespace) || path.chars().last().is_some_and(is_trailing_punct);
+
+    if needs_quotes {
         if !path.contains('"') {
-            format!("@\"{path}\"")
+            format!("@\"{}\"", escape_quoted_file_ref(path, '"'))
         } else if !path.contains('\'') {
-            format!("@'{path}'")
+            format!("@'{}'", escape_quoted_file_ref(path, '\''))
         } else {
-            format!("@\"{}\"", path.replace('"', "\\\""))
+            format!("@\"{}\"", escape_quoted_file_ref(path, '"'))
         }
     } else {
         format!("@{path}")
     }
+}
+
+fn escape_quoted_file_ref(path: &str, quote: char) -> String {
+    let mut escaped = String::with_capacity(path.len());
+    for ch in path.chars() {
+        if ch == '\\' || ch == quote {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 pub(super) fn split_trailing_punct(token: &str) -> (&str, &str) {
@@ -162,6 +179,30 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
+
+    #[test]
+    fn parse_quoted_file_ref_preserves_windows_path_separators() {
+        let text = "\"C:\\Program Files\\Pi\\agent.rs\".";
+        let parsed = parse_quoted_file_ref(text, 0);
+        assert_eq!(
+            parsed,
+            Some((
+                "C:\\Program Files\\Pi\\agent.rs".to_string(),
+                ".".to_string(),
+                text.len()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_quoted_file_ref_unescapes_only_quote_and_backslash() {
+        let text = "\"foo\\\\bar\\\"baz.txt\"";
+        let parsed = parse_quoted_file_ref(text, 0);
+        assert_eq!(
+            parsed,
+            Some(("foo\\bar\"baz.txt".to_string(), String::new(), text.len()))
+        );
+    }
 
     #[test]
     fn strip_wrapping_quotes_double() {
@@ -263,6 +304,25 @@ mod tests {
         assert_eq!(
             format_file_ref("it's a \"file\" name.rs"),
             "@\"it's a \\\"file\\\" name.rs\""
+        );
+    }
+
+    #[test]
+    fn format_file_ref_escapes_backslashes_in_quoted_paths() {
+        assert_eq!(
+            format_file_ref("C:\\Program Files\\Pi\\"),
+            "@\"C:\\\\Program Files\\\\Pi\\\\\""
+        );
+    }
+
+    #[test]
+    fn quoted_file_ref_formatter_round_trips_repeated_and_trailing_backslashes() {
+        let path = "\\\\server\\share name\\";
+        let formatted = format_file_ref(path);
+        let parsed = parse_quoted_file_ref(&formatted, 1);
+        assert_eq!(
+            parsed,
+            Some((path.to_string(), String::new(), formatted.len()))
         );
     }
 

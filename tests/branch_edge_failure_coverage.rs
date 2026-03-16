@@ -33,9 +33,9 @@ use tempfile::TempDir;
 fn truncate_head_empty_content() {
     let result = truncate_head("", 10, 1024);
     assert!(!result.truncated);
-    assert_eq!(result.total_lines, 1); // empty string = 1 line (no newlines)
+    assert_eq!(result.total_lines, 0); // empty string = 0 lines
     assert_eq!(result.total_bytes, 0);
-    assert_eq!(result.output_lines, 1);
+    assert_eq!(result.output_lines, 0);
     assert!(!result.first_line_exceeds_limit);
 }
 
@@ -58,9 +58,9 @@ fn truncate_head_first_line_exceeds_bytes() {
     assert!(result.truncated);
     assert!(result.first_line_exceeds_limit);
     assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
-    assert_eq!(result.output_lines, 0);
-    assert_eq!(result.output_bytes, 0);
-    assert!(result.content.is_empty());
+    assert_eq!(result.output_lines, 1);
+    assert_eq!(result.output_bytes, 50);
+    assert_eq!(result.content, "x".repeat(50));
 }
 
 #[test]
@@ -70,7 +70,7 @@ fn truncate_head_truncated_by_lines_not_bytes() {
     assert!(result.truncated);
     assert_eq!(result.truncated_by, Some(TruncatedBy::Lines));
     assert_eq!(result.output_lines, 3);
-    assert_eq!(result.content, "a\nb\nc");
+    assert_eq!(result.content, "a\nb\nc\n");
 }
 
 #[test]
@@ -79,18 +79,19 @@ fn truncate_head_truncated_by_bytes_not_lines() {
     let content = "aaaa\nbbbb\ncccc\ndddd\neeee";
     // Each line is 4 bytes + 1 newline = 5 bytes per line. First line = 4 bytes, then +5 each.
     // max_bytes = 10 → fits "aaaa\nbbbb" (9 bytes) but not "aaaa\nbbbb\ncccc" (14 bytes)
+    // Actually, "aaaa\nbbbb\n" is 10 bytes! So it fits exactly.
     let result = truncate_head(content, 100, 10);
     assert!(result.truncated);
     assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
     assert_eq!(result.output_lines, 2);
-    assert_eq!(result.content, "aaaa\nbbbb");
+    assert_eq!(result.content, "aaaa\nbbbb\n");
 }
 
 #[test]
 fn truncate_head_single_newline_only() {
     let result = truncate_head("\n", 10, 1024);
     assert!(!result.truncated);
-    assert_eq!(result.total_lines, 2); // "\n" = empty line + empty line after
+    assert_eq!(result.total_lines, 1); // "\n" = 1 empty line
     assert_eq!(result.content, "\n");
 }
 
@@ -98,9 +99,9 @@ fn truncate_head_single_newline_only() {
 fn truncate_head_trailing_newline_preserved() {
     let content = "line1\nline2\n";
     let result = truncate_head(content, 2, 1024);
-    // "line1\nline2\n" has 3 lines (last is empty after trailing newline)
-    // With max_lines=2, we get "line1\nline2"
-    assert!(result.truncated);
+    // "line1\nline2\n" has exactly 2 lines.
+    // With max_lines=2, it fits exactly.
+    assert!(!result.truncated);
     assert_eq!(result.output_lines, 2);
 }
 
@@ -139,7 +140,7 @@ fn truncate_head_unicode_multibyte() {
 fn truncate_tail_empty_content() {
     let result = truncate_tail("", 10, 1024);
     assert!(!result.truncated);
-    assert_eq!(result.total_lines, 1);
+    assert_eq!(result.total_lines, 0);
     assert_eq!(result.total_bytes, 0);
 }
 
@@ -185,12 +186,12 @@ fn truncate_tail_single_long_line_partial_output() {
 
 #[test]
 fn truncate_tail_file_ending_with_newline() {
-    // File "a\n" has 2 lines: "a" and empty string after newline
+    // A trailing newline terminates the current line; it does not add another line.
     let content = "a\n";
     let result = truncate_tail(content, 1, 1024);
-    // With max_lines=1, we keep only last line (empty string after \n)
-    // Actually the tail keeps the last line which is empty
-    assert!(result.truncated);
+    assert!(!result.truncated);
+    assert_eq!(result.total_lines, 1);
+    assert_eq!(result.content, content);
 }
 
 #[test]
@@ -198,6 +199,9 @@ fn truncate_tail_max_lines_zero() {
     let result = truncate_tail("hello", 0, 1024);
     assert!(result.truncated);
     assert_eq!(result.truncated_by, Some(TruncatedBy::Lines));
+    assert_eq!(result.output_lines, 0);
+    assert_eq!(result.output_bytes, 0);
+    assert!(result.content.is_empty());
 }
 
 #[test]
@@ -852,6 +856,7 @@ fn build_system_prompt_test_mode_uses_placeholders() {
         global_dir,
         package_dir,
         true, // test_mode
+        true, // include_cwd
     );
     assert!(prompt.contains("<TIMESTAMP>"));
     assert!(prompt.contains("<CWD>"));
@@ -864,8 +869,16 @@ fn build_system_prompt_non_test_mode_uses_real_values() {
     let cwd = Path::new("/tmp/test_cwd");
     let global_dir = Path::new("/tmp/nonexistent_global");
     let package_dir = Path::new("/tmp/nonexistent_package");
-    let prompt =
-        app::build_system_prompt(&cli, cwd, &["read"], None, global_dir, package_dir, false);
+    let prompt = app::build_system_prompt(
+        &cli,
+        cwd,
+        &["read"],
+        None,
+        global_dir,
+        package_dir,
+        false,
+        true,
+    );
     assert!(!prompt.contains("<TIMESTAMP>"));
     assert!(prompt.contains("/tmp/test_cwd"));
 }
@@ -884,9 +897,40 @@ fn build_system_prompt_with_skills_prompt() {
         global_dir,
         package_dir,
         true,
+        true,
     );
     assert!(prompt.contains("Available Skills"));
     assert!(prompt.contains("/commit"));
+}
+
+#[test]
+fn build_system_prompt_includes_hashline_edit_description_and_guideline() {
+    let cli = Cli::parse_from(["pi"]);
+    let cwd = Path::new("/tmp/test_cwd");
+    let global_dir = Path::new("/tmp/nonexistent_global");
+    let package_dir = Path::new("/tmp/nonexistent_package");
+    let prompt = app::build_system_prompt(
+        &cli,
+        cwd,
+        &["read", "bash", "edit", "write", "hashline_edit"],
+        None,
+        global_dir,
+        package_dir,
+        true,
+        true,
+    );
+    assert!(
+        prompt.contains("hashline_edit"),
+        "System prompt should list hashline_edit tool"
+    );
+    assert!(
+        prompt.contains("LINE#HASH"),
+        "System prompt should describe hashline tag format"
+    );
+    assert!(
+        prompt.contains("hashline=true"),
+        "System prompt guideline should mention read with hashline=true"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1394,10 +1438,10 @@ fn truncate_head_byte_boundary_between_lines() {
 
 #[test]
 fn truncate_head_byte_limit_one_less_than_line_end() {
-    // "ab\ncd\nef" with limit 4 → "ab" only (can't fit "\ncd" = 3 more bytes, total would be 5)
+    // "ab\ncd\nef" with limit 4 → "ab\n" only (can't fit "cd" = 2 more bytes)
     let content = "ab\ncd\nef";
     let result = truncate_head(content, 100, 4);
-    assert_eq!(result.content, "ab");
+    assert_eq!(result.content, "ab\n");
     assert_eq!(result.output_lines, 1);
 }
 
@@ -1427,16 +1471,18 @@ fn truncate_head_both_limits_hit_lines_first() {
     let result = truncate_head(content, 2, 100);
     assert_eq!(result.truncated_by, Some(TruncatedBy::Lines));
     assert_eq!(result.output_lines, 2);
+    assert_eq!(result.content, "a\nb\n");
 }
 
 #[test]
 fn truncate_head_both_limits_hit_bytes_first() {
-    // 3 lines, 6 bytes total. Line limit = 100, byte limit = 3
+    // 3 lines, 6 bytes total. Line limit = 100, byte limit = 4
     let content = "a\nb\nc";
-    let result = truncate_head(content, 100, 3);
+    let result = truncate_head(content, 100, 4);
     assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
-    // "a\nb" = 3 bytes
-    assert_eq!(result.content, "a\nb");
+    // "a\nb\n" = 4 bytes
+    assert_eq!(result.output_lines, 2);
+    assert_eq!(result.content, "a\nb\n");
 }
 
 // ═══════════════════════════════════════════════════════════════════════

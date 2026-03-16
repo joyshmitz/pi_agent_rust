@@ -165,7 +165,7 @@ impl TreeSelectorState {
             self.selected = self.selected.saturating_sub(delta.unsigned_abs());
         } else {
             let delta = usize::try_from(delta).unwrap_or(usize::MAX);
-            self.selected = (self.selected + delta).min(max_index);
+            self.selected = self.selected.saturating_add(delta).min(max_index);
         }
         self.last_selected_id = self.rows.get(self.selected).map(|row| row.id.clone());
         self.ensure_scroll_visible();
@@ -371,8 +371,12 @@ impl PiApp {
                     .await
                     .unwrap_or(false);
                 if cancelled {
-                    let _ =
-                        event_tx.try_send(PiMsg::System("Fork cancelled by extension".to_string()));
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &cx,
+                        PiMsg::System("Fork cancelled by extension".to_string()),
+                    )
+                    .await;
                     return;
                 }
             }
@@ -381,16 +385,24 @@ impl PiApp {
                 let guard = match session.lock(&cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
-                        let _ = event_tx
-                            .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
+                        let _ = crate::interactive::enqueue_pi_event(
+                            &event_tx,
+                            &cx,
+                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
+                        )
+                        .await;
                         return;
                     }
                 };
                 let fork_plan = match guard.plan_fork_from_user_message(&selection.id) {
                     Ok(plan) => plan,
                     Err(err) => {
-                        let _ = event_tx
-                            .try_send(PiMsg::AgentError(format!("Failed to build fork: {err}")));
+                        let _ = crate::interactive::enqueue_pi_event(
+                            &event_tx,
+                            &cx,
+                            PiMsg::AgentError(format!("Failed to build fork: {err}")),
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -400,11 +412,7 @@ impl PiApp {
                 (fork_plan, parent_path, session_dir)
             };
 
-            let crate::session::ForkPlan {
-                entries,
-                leaf_id,
-                selected_text,
-            } = fork_plan;
+            let selected_text = fork_plan.selected_text.clone();
 
             let mut new_session = Session::create_with_dir(session_dir);
             new_session.header.provider = Some(model_provider);
@@ -413,13 +421,16 @@ impl PiApp {
             if let Some(parent_path) = parent_path {
                 new_session.set_branched_from(Some(parent_path));
             }
-            new_session.entries = entries;
-            new_session.leaf_id = leaf_id;
-            new_session.ensure_entry_ids();
+            new_session.init_from_fork_plan(fork_plan);
             let new_session_id = new_session.header.id.clone();
 
             if let Err(err) = new_session.save().await {
-                let _ = event_tx.try_send(PiMsg::AgentError(format!("Failed to save fork: {err}")));
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                    PiMsg::AgentError(format!("Failed to save fork: {err}")),
+                )
+                .await;
                 return;
             }
 
@@ -428,8 +439,12 @@ impl PiApp {
                 let mut agent_guard = match agent.lock(&cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
-                        let _ = event_tx
-                            .try_send(PiMsg::AgentError(format!("Failed to lock agent: {err}")));
+                        let _ = crate::interactive::enqueue_pi_event(
+                            &event_tx,
+                            &cx,
+                            PiMsg::AgentError(format!("Failed to lock agent: {err}")),
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -440,8 +455,12 @@ impl PiApp {
                 let mut guard = match session.lock(&cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
-                        let _ = event_tx
-                            .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
+                        let _ = crate::interactive::enqueue_pi_event(
+                            &event_tx,
+                            &cx,
+                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -452,21 +471,35 @@ impl PiApp {
                 let guard = match session.lock(&cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
-                        let _ = event_tx
-                            .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
+                        let _ = crate::interactive::enqueue_pi_event(
+                            &event_tx,
+                            &cx,
+                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
+                        )
+                        .await;
                         return;
                     }
                 };
                 conversation_from_session(&guard)
             };
 
-            let _ = event_tx.try_send(PiMsg::ConversationReset {
-                messages,
-                usage,
-                status: Some(format!("Forked new session from {}", selection.summary)),
-            });
+            let _ = crate::interactive::enqueue_pi_event(
+                &event_tx,
+                &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                PiMsg::ConversationReset {
+                    messages,
+                    usage,
+                    status: Some(format!("Forked new session from {}", selection.summary)),
+                },
+            )
+            .await;
 
-            let _ = event_tx.try_send(PiMsg::SetEditorText(selected_text));
+            let _ = crate::interactive::enqueue_pi_event(
+                &event_tx,
+                &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                PiMsg::SetEditorText(selected_text),
+            )
+            .await;
 
             if let Some(manager) = extensions {
                 let _ = manager

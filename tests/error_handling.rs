@@ -19,15 +19,16 @@ use serde_json::json;
 // Helpers
 // ============================================================================
 
-fn context_for(prompt: &str) -> Context<'static> {
-    Context::owned(
-        None,
-        vec![Message::User(UserMessage {
+fn context_for(prompt: &str) -> Context<'_> {
+    Context {
+        system_prompt: None,
+        messages: vec![Message::User(UserMessage {
             content: UserContent::Text(prompt.to_string()),
             timestamp: 0,
-        })],
-        Vec::new(),
-    )
+        })]
+        .into(),
+        tools: Vec::new().into(),
+    }
 }
 
 fn options_with_key(key: &str) -> StreamOptions {
@@ -46,6 +47,50 @@ fn get_text_content(content: &[pi::model::ContentBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+#[test]
+fn dropin174_error_surface_logs_include_requirement_id() {
+    let harness = TestHarness::new("dropin174_error_surface_logs_include_requirement_id");
+    harness
+        .log()
+        .info_ctx("dropin174.error", "Error parity assertion", |ctx| {
+            ctx.push(("requirement_id".to_string(), "DROPIN-174-ERROR".to_string()));
+            ctx.push(("surface".to_string(), "error".to_string()));
+            ctx.push((
+                "parity_requirement".to_string(),
+                "Error model + exit code parity".to_string(),
+            ));
+        });
+
+    let jsonl = harness.log().dump_jsonl();
+    let validation_errors = validate_jsonl(&jsonl);
+    assert!(
+        validation_errors.is_empty(),
+        "expected valid structured logs, got {validation_errors:?}"
+    );
+
+    let has_requirement_log = jsonl
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|record| {
+            record.get("category").and_then(serde_json::Value::as_str) == Some("dropin174.error")
+                && record
+                    .get("context")
+                    .and_then(|ctx| ctx.get("requirement_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("DROPIN-174-ERROR")
+                && record
+                    .get("context")
+                    .and_then(|ctx| ctx.get("surface"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("error")
+        });
+
+    assert!(
+        has_requirement_log,
+        "expected structured log entry to include requirement_id + surface context"
+    );
 }
 
 // ============================================================================
@@ -1487,50 +1532,4 @@ mod error_hints {
             hints.summary
         );
     }
-}
-
-#[test]
-fn dropin174_error_surface_logs_include_requirement_id() {
-    let harness = TestHarness::new("dropin174_error_surface_logs_include_requirement_id");
-    harness
-        .log()
-        .info_ctx("parity", "DROPIN-174 error parity trace", |ctx| {
-            ctx.push(("requirement_id".to_string(), "DROPIN-144".to_string()));
-            ctx.push(("surface".to_string(), "error".to_string()));
-            ctx.push((
-                "parity_requirement".to_string(),
-                "Error model and exit-code behavior parity".to_string(),
-            ));
-        });
-
-    let jsonl = harness.dump_logs();
-    let errors = validate_jsonl(&jsonl);
-    assert!(
-        errors.is_empty(),
-        "harness log JSONL must validate: {errors:?}"
-    );
-
-    let matched = jsonl
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid json log line"))
-        .filter(|value| value.get("category").and_then(serde_json::Value::as_str) == Some("parity"))
-        .any(|value| {
-            let Some(ctx) = value.get("context").and_then(serde_json::Value::as_object) else {
-                return false;
-            };
-            ctx.get("requirement_id")
-                .and_then(serde_json::Value::as_str)
-                == Some("DROPIN-144")
-                && ctx.get("surface").and_then(serde_json::Value::as_str) == Some("error")
-                && ctx
-                    .get("parity_requirement")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("Error model and exit-code behavior parity")
-        });
-
-    assert!(
-        matched,
-        "expected a parity log line with DROPIN-144 error requirement context"
-    );
 }

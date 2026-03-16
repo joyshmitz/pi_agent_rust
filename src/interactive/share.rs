@@ -9,44 +9,52 @@ use super::{AgentState, Cmd, PiApp, PiMsg};
 #[cfg(feature = "clipboard")]
 use arboard::Clipboard as ArboardClipboard;
 
-pub(super) fn run_command_output(
+pub(super) async fn run_command_output(
     program: &str,
     args: &[OsString],
     cwd: &Path,
     abort_signal: &crate::agent::AbortSignal,
 ) -> std::io::Result<std::process::Output> {
+    use asupersync::time::{sleep, wall_now};
     use std::process::{Command, Stdio};
     use std::sync::mpsc as std_mpsc;
     use std::time::Duration;
 
-    let child = Command::new(program)
+    let mut child = Command::new(program);
+    child
         .args(args)
         .current_dir(cwd)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    crate::tools::isolate_command_process_group(&mut child);
+    let child = child.spawn()?;
     let pid = child.id();
 
     let (tx, rx) = std_mpsc::channel();
-    std::thread::spawn(move || {
-        let result = child.wait_with_output();
-        let _ = tx.send(result);
-    });
+    let _handle = std::thread::Builder::new()
+        .name("share".into())
+        .spawn(move || {
+            let result = child.wait_with_output();
+            let _ = tx.send(result);
+        });
 
     let tick = Duration::from_millis(10);
     loop {
         if abort_signal.is_aborted() {
-            crate::tools::kill_process_tree(Some(pid));
+            crate::tools::kill_process_group_tree(Some(pid));
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
                 "command aborted",
             ));
         }
 
-        match rx.recv_timeout(tick) {
+        match rx.try_recv() {
             Ok(result) => return result,
-            Err(std_mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+            Err(std_mpsc::TryRecvError::Empty) => {
+                sleep(wall_now(), tick).await;
+            }
+            Err(std_mpsc::TryRecvError::Disconnected) => {
                 return Err(std::io::Error::other("command output channel disconnected"));
             }
         }
@@ -65,9 +73,21 @@ pub(super) fn parse_gist_url_and_id(output: &str) -> Option<(String, String)> {
         if host != "gist.github.com" {
             continue;
         }
-        let Some(gist_id) = url.path_segments().and_then(|mut seg| seg.next_back()) else {
+        let Some(segments) = url.path_segments().map(|segments| {
+            segments
+                .filter(|segment| !segment.is_empty())
+                .collect::<Vec<_>>()
+        }) else {
             continue;
         };
+
+        // Canonical gist links are exactly `/owner/<gist-id>`.
+        // Avoid false positives like profile URLs (`/owner`).
+        if segments.len() != 2 {
+            continue;
+        }
+
+        let gist_id = segments[1];
         if gist_id.is_empty() {
             continue;
         }
@@ -151,6 +171,17 @@ mod tests {
         let (_, id) =
             parse_gist_url_and_id("Created: https://gist.github.com/user/aaa111,").unwrap();
         assert_eq!(id, "aaa111");
+    }
+
+    #[test]
+    fn parse_gist_url_ignores_profile_links() {
+        assert!(parse_gist_url_and_id("https://gist.github.com/octocat").is_none());
+        assert!(parse_gist_url_and_id("https://gist.github.com/octocat/").is_none());
+    }
+
+    #[test]
+    fn parse_gist_url_ignores_non_canonical_paths() {
+        assert!(parse_gist_url_and_id("https://gist.github.com/octocat/aaa111/raw").is_none());
     }
 
     // ── format_command_output ───────────────────────────────────────────
@@ -277,7 +308,7 @@ impl PiApp {
                 .unwrap_or_else(|| "gh".to_string());
 
             let auth_args = vec![OsString::from("auth"), OsString::from("status")];
-            match run_command_output(&gh, &auth_args, &cwd, &abort_signal) {
+            match run_command_output(&gh, &auth_args, &cwd, &abort_signal).await {
                 Ok(output) => {
                     if !output.status.success() {
                         let details = format_command_output(&output);
@@ -286,7 +317,12 @@ impl PiApp {
                              Run `gh auth login` to authenticate, then retry `/share`.\n\n\
                              {details}"
                         );
-                        let _ = event_tx.try_send(PiMsg::AgentError(message));
+                        let _ = crate::interactive::enqueue_pi_event(
+                            &event_tx,
+                            &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                            PiMsg::AgentError(message),
+                        )
+                        .await;
                         return;
                     }
                 }
@@ -294,23 +330,41 @@ impl PiApp {
                     let message = "GitHub CLI `gh` not found.\n\
                              Install it from https://cli.github.com, then run `gh auth login`."
                         .to_string();
-                    let _ = event_tx.try_send(PiMsg::AgentError(message));
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                        PiMsg::AgentError(message),
+                    )
+                    .await;
                     return;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
-                    let _ = event_tx.try_send(PiMsg::System("Share cancelled".to_string()));
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                        PiMsg::System("Share cancelled".to_string()),
+                    )
+                    .await;
                     return;
                 }
                 Err(err) => {
-                    let _ = event_tx.try_send(PiMsg::AgentError(format!(
-                        "Failed to run `gh auth status`: {err}"
-                    )));
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                        PiMsg::AgentError(format!("Failed to run `gh auth status`: {err}")),
+                    )
+                    .await;
                     return;
                 }
             }
 
             if abort_signal.is_aborted() {
-                let _ = event_tx.try_send(PiMsg::System("Share cancelled".to_string()));
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                    PiMsg::System("Share cancelled".to_string()),
+                )
+                .await;
                 return;
             }
 
@@ -318,14 +372,23 @@ impl PiApp {
             let (html, session_name) = match session.lock(&cx).await {
                 Ok(guard) => (guard.to_html(), guard.get_name()),
                 Err(err) => {
-                    let _ = event_tx
-                        .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &cx,
+                        PiMsg::AgentError(format!("Failed to lock session: {err}")),
+                    )
+                    .await;
                     return;
                 }
             };
 
             if abort_signal.is_aborted() {
-                let _ = event_tx.try_send(PiMsg::System("Share cancelled".to_string()));
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                    PiMsg::System("Share cancelled".to_string()),
+                )
+                .await;
                 return;
             }
 
@@ -338,17 +401,23 @@ impl PiApp {
             {
                 Ok(file) => file,
                 Err(err) => {
-                    let _ = event_tx.try_send(PiMsg::AgentError(format!(
-                        "Failed to create temp file: {err}"
-                    )));
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                        PiMsg::AgentError(format!("Failed to create temp file: {err}")),
+                    )
+                    .await;
                     return;
                 }
             };
             let temp_path = temp_file.into_temp_path();
             if let Err(err) = std::fs::write(&temp_path, html.as_bytes()) {
-                let _ = event_tx.try_send(PiMsg::AgentError(format!(
-                    "Failed to write temp file: {err}"
-                )));
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                    PiMsg::AgentError(format!("Failed to write temp file: {err}")),
+                )
+                .await;
                 return;
             }
 
@@ -360,41 +429,62 @@ impl PiApp {
                 OsString::from(&gist_desc),
                 temp_path.as_os_str().to_os_string(),
             ];
-            let output = match run_command_output(&gh, &gist_args, &cwd, &abort_signal) {
+            let output = match run_command_output(&gh, &gist_args, &cwd, &abort_signal).await {
                 Ok(output) => output,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                     let message = "GitHub CLI `gh` not found.\n\
                              Install it from https://cli.github.com, then run `gh auth login`."
                         .to_string();
-                    let _ = event_tx.try_send(PiMsg::AgentError(message));
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                        PiMsg::AgentError(message),
+                    )
+                    .await;
                     return;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
-                    let _ = event_tx.try_send(PiMsg::System("Share cancelled".to_string()));
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                        PiMsg::System("Share cancelled".to_string()),
+                    )
+                    .await;
                     return;
                 }
                 Err(err) => {
-                    let _ = event_tx.try_send(PiMsg::AgentError(format!(
-                        "Failed to run `gh gist create`: {err}"
-                    )));
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                        PiMsg::AgentError(format!("Failed to run `gh gist create`: {err}")),
+                    )
+                    .await;
                     return;
                 }
             };
 
             if !output.status.success() {
                 let details = format_command_output(&output);
-                let _ = event_tx.try_send(PiMsg::AgentError(format!(
-                    "`gh gist create` failed.\n\n{details}"
-                )));
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                    PiMsg::AgentError(format!("`gh gist create` failed.\n\n{details}")),
+                )
+                .await;
                 return;
             }
 
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let Some((gist_url, gist_id)) = parse_gist_url_and_id(&stdout) else {
                 let details = format_command_output(&output);
-                let _ = event_tx.try_send(PiMsg::AgentError(format!(
-                    "Failed to parse gist URL from `gh gist create` output.\n\n{details}"
-                )));
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                    PiMsg::AgentError(format!(
+                        "Failed to parse gist URL from `gh gist create` output.\n\n{details}"
+                    )),
+                )
+                .await;
                 return;
             };
 
@@ -412,7 +502,12 @@ impl PiApp {
             let privacy = if is_public { "public" } else { "private" };
             let message =
                 format!("Created {privacy} gist\nShare URL: {share_url}\nGist: {gist_url}");
-            let _ = event_tx.try_send(PiMsg::System(message));
+            let _ = crate::interactive::enqueue_pi_event(
+                &event_tx,
+                &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                PiMsg::System(message),
+            )
+            .await;
         });
         None
     }

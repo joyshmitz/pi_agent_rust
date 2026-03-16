@@ -8,6 +8,8 @@ use std::collections::VecDeque;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+const MAX_EVENT_DATA_BYTES: usize = 100 * 1024 * 1024;
+
 /// A parsed SSE event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SseEvent {
@@ -33,7 +35,7 @@ impl Default for SseEvent {
 }
 
 /// Parser state for SSE stream.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SseParser {
     buffer: String,
     current: SseEvent,
@@ -42,6 +44,21 @@ pub struct SseParser {
     bom_checked: bool,
     /// Number of bytes in `buffer` that have already been scanned for newlines.
     scanned_len: usize,
+    /// Per-event data accumulation cap in bytes.
+    max_event_data_bytes: usize,
+}
+
+impl Default for SseParser {
+    fn default() -> Self {
+        Self {
+            buffer: String::new(),
+            current: SseEvent::default(),
+            has_data: false,
+            bom_checked: false,
+            scanned_len: 0,
+            max_event_data_bytes: MAX_EVENT_DATA_BYTES,
+        }
+    }
 }
 
 impl SseParser {
@@ -50,12 +67,22 @@ impl SseParser {
         Self::default()
     }
 
+    /// Create a parser with a custom per-event data cap (for testing).
+    #[cfg(test)]
+    fn with_max_event_data_bytes(limit: usize) -> Self {
+        Self {
+            max_event_data_bytes: limit,
+            ..Self::default()
+        }
+    }
+
     /// Intern common SSE event type names to avoid per-event String allocation.
     /// LLM streaming APIs use a fixed set of event types; matching them to
     /// `Cow::Borrowed` static strings eliminates one allocation per event.
     #[inline]
     fn intern_event_type(value: &str) -> Cow<'static, str> {
         match value {
+            // Anthropic streaming events
             "message" => Cow::Borrowed("message"),
             "message_start" => Cow::Borrowed("message_start"),
             "message_stop" => Cow::Borrowed("message_stop"),
@@ -63,14 +90,65 @@ impl SseParser {
             "content_block_start" => Cow::Borrowed("content_block_start"),
             "content_block_delta" => Cow::Borrowed("content_block_delta"),
             "content_block_stop" => Cow::Borrowed("content_block_stop"),
+            // OpenAI Responses API streaming events
+            "response.completed" => Cow::Borrowed("response.completed"),
+            "response.done" => Cow::Borrowed("response.done"),
+            "response.failed" => Cow::Borrowed("response.failed"),
+            "response.incomplete" => Cow::Borrowed("response.incomplete"),
+            "response.output_text.delta" => Cow::Borrowed("response.output_text.delta"),
+            "response.output_text.done" => Cow::Borrowed("response.output_text.done"),
+            "response.output_item.added" => Cow::Borrowed("response.output_item.added"),
+            "response.output_item.done" => Cow::Borrowed("response.output_item.done"),
+            "response.content_part.done" => Cow::Borrowed("response.content_part.done"),
+            "response.function_call_arguments.delta" => {
+                Cow::Borrowed("response.function_call_arguments.delta")
+            }
+            "response.reasoning_text.delta" => Cow::Borrowed("response.reasoning_text.delta"),
+            "response.reasoning_text.done" => Cow::Borrowed("response.reasoning_text.done"),
+            "response.reasoning_summary_text.delta" => {
+                Cow::Borrowed("response.reasoning_summary_text.delta")
+            }
+            "response.reasoning_summary_text.done" => {
+                Cow::Borrowed("response.reasoning_summary_text.done")
+            }
+            "response.reasoning_summary_part.done" => {
+                Cow::Borrowed("response.reasoning_summary_part.done")
+            }
+            "response.created" => Cow::Borrowed("response.created"),
+            // Common shared events
             "ping" => Cow::Borrowed("ping"),
             "error" => Cow::Borrowed("error"),
             _ => Cow::Owned(value.to_string()),
         }
     }
 
+    #[inline]
+    fn append_data_line(
+        current: &mut SseEvent,
+        value: &str,
+        has_data: &mut bool,
+        max_event_data_bytes: usize,
+    ) {
+        let projected_len = current
+            .data
+            .len()
+            .saturating_add(value.len())
+            .saturating_add(1);
+        if projected_len > max_event_data_bytes {
+            return;
+        }
+        current.data.push_str(value);
+        current.data.push('\n');
+        *has_data = true;
+    }
+
     /// Process a single line of SSE data.
-    fn process_line(line: &str, current: &mut SseEvent, has_data: &mut bool) {
+    fn process_line(
+        line: &str,
+        current: &mut SseEvent,
+        has_data: &mut bool,
+        max_event_data_bytes: usize,
+    ) {
         if let Some(rest) = line.strip_prefix(':') {
             // Comment line - ignore (but could be used for keep-alive)
             let _ = rest;
@@ -79,11 +157,7 @@ impl SseParser {
             let value = value.strip_prefix(' ').unwrap_or(value);
             match field {
                 "event" => current.event = Self::intern_event_type(value),
-                "data" => {
-                    current.data.push_str(value);
-                    current.data.push('\n');
-                    *has_data = true;
-                }
+                "data" => Self::append_data_line(current, value, has_data, max_event_data_bytes),
                 "id" => {
                     if !value.contains('\0') {
                         current.id = Some(value.to_string());
@@ -96,14 +170,43 @@ impl SseParser {
             // Field with no value
             match line {
                 "event" => current.event = Cow::Borrowed(""),
-                "data" => {
-                    current.data.push('\n');
-                    *has_data = true;
-                }
+                "data" => Self::append_data_line(current, "", has_data, max_event_data_bytes),
                 "id" => current.id = Some(String::new()),
                 _ => {}
             }
         }
+    }
+
+    #[inline]
+    fn reset_current_for_next_event(current: &mut SseEvent) {
+        current.event = Cow::Borrowed("message");
+        current.data.clear();
+    }
+
+    #[inline]
+    fn carry_forward_event_state(current: &SseEvent) -> SseEvent {
+        SseEvent {
+            id: current.id.clone(),
+            retry: current.retry,
+            ..Default::default()
+        }
+    }
+
+    #[inline]
+    fn reset_after_buffer_limit<F>(&mut self, emit: &mut F)
+    where
+        F: FnMut(SseEvent),
+    {
+        self.buffer = String::new();
+        self.current = SseEvent::default();
+        self.has_data = false;
+        self.bom_checked = false;
+        self.scanned_len = 0;
+        emit(SseEvent {
+            event: Cow::Borrowed("error"),
+            data: "SSE buffer limit exceeded".to_string(),
+            ..Default::default()
+        });
     }
 
     /// Process complete lines from `source`, dispatching events via `emit`.
@@ -115,6 +218,7 @@ impl SseParser {
         bom_checked: &mut bool,
         current: &mut SseEvent,
         has_data: &mut bool,
+        max_event_data_bytes: usize,
         emit: &mut F,
     ) -> usize
     where
@@ -179,12 +283,15 @@ impl SseParser {
                     if current.event.is_empty() {
                         current.event = Cow::Borrowed("message");
                     }
+                    let next_event = Self::carry_forward_event_state(current);
                     emit(std::mem::take(current));
-                    *current = SseEvent::default();
+                    *current = next_event;
                     *has_data = false;
+                } else {
+                    Self::reset_current_for_next_event(current);
                 }
             } else {
-                Self::process_line(line, current, has_data);
+                Self::process_line(line, current, has_data, max_event_data_bytes);
             }
         }
 
@@ -196,6 +303,7 @@ impl SseParser {
     where
         F: FnMut(SseEvent),
     {
+        const MAX_BUFFER_SIZE: usize = 10 * 1024 * 1024;
         if self.buffer.is_empty() {
             // Fast path: process data directly without copying to buffer.
             let consumed = Self::process_source(
@@ -204,26 +312,38 @@ impl SseParser {
                 &mut self.bom_checked,
                 &mut self.current,
                 &mut self.has_data,
+                self.max_event_data_bytes,
                 &mut emit,
             );
             if consumed < data.len() {
                 self.buffer.push_str(&data[consumed..]);
+                if self.buffer.len() > MAX_BUFFER_SIZE {
+                    self.reset_after_buffer_limit(&mut emit);
+                    return;
+                }
             }
         } else {
-            // Slow path: combine with existing buffered data, then process.
-            self.buffer.push_str(data);
+            // Slow path: parse against a temporary combined source so we only
+            // retain the truly unconsumed tail instead of a giant drained buffer.
+            let mut combined = std::mem::take(&mut self.buffer);
+            combined.push_str(data);
             // Re-scan from the last safe point (minus 1 to handle split CRLF).
             let scan_start = self.scanned_len.saturating_sub(1);
             let consumed = Self::process_source(
-                &self.buffer,
+                &combined,
                 scan_start,
                 &mut self.bom_checked,
                 &mut self.current,
                 &mut self.has_data,
+                self.max_event_data_bytes,
                 &mut emit,
             );
-            if consumed > 0 {
-                self.buffer.drain(..consumed);
+            if consumed < combined.len() {
+                self.buffer.push_str(&combined[consumed..]);
+            }
+            if self.buffer.len() > MAX_BUFFER_SIZE {
+                self.reset_after_buffer_limit(&mut emit);
+                return;
             }
         }
         // Whether we drained or not, the entire remaining buffer has been scanned.
@@ -250,7 +370,12 @@ impl SseParser {
         if !self.buffer.is_empty() {
             let line = std::mem::take(&mut self.buffer);
             let line = line.trim_end_matches('\r');
-            Self::process_line(line, &mut self.current, &mut self.has_data);
+            Self::process_line(
+                line,
+                &mut self.current,
+                &mut self.has_data,
+                self.max_event_data_bytes,
+            );
         }
 
         if self.has_data {
@@ -278,6 +403,8 @@ pub struct SseStream<S> {
     parser: SseParser,
     pending_events: VecDeque<SseEvent>,
     pending_error: Option<std::io::Error>,
+    pending_error_is_terminal: bool,
+    terminated: bool,
     utf8_buffer: Vec<u8>,
 }
 
@@ -289,6 +416,8 @@ impl<S> SseStream<S> {
             parser: SseParser::new(),
             pending_events: VecDeque::new(),
             pending_error: None,
+            pending_error_is_terminal: false,
+            terminated: false,
             utf8_buffer: Vec::new(),
         }
     }
@@ -298,98 +427,113 @@ impl<S> SseStream<S>
 where
     S: futures::Stream<Item = Result<Vec<u8>, std::io::Error>> + Unpin,
 {
-    fn feed_to_pending(&mut self, s: &str) {
-        let parser = &mut self.parser;
-        let pending = &mut self.pending_events;
+    #[inline]
+    fn invalid_utf8_error() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid UTF-8 in SSE stream",
+        )
+    }
+
+    fn feed_parsed_chunk(parser: &mut SseParser, pending: &mut VecDeque<SseEvent>, s: &str) {
         parser.feed_into(s, |event| pending.push_back(event));
     }
 
-    fn feed_valid_prefix(&mut self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        let Ok(s) = std::str::from_utf8(bytes) else {
-            return;
-        };
-        self.feed_to_pending(s);
+    fn feed_to_pending(&mut self, s: &str) {
+        Self::feed_parsed_chunk(&mut self.parser, &mut self.pending_events, s);
     }
 
-    fn process_chunk_without_utf8_tail(&mut self, bytes: Vec<u8>) -> Result<(), std::io::Error> {
-        match std::str::from_utf8(&bytes) {
-            Ok(s) => {
-                self.feed_to_pending(s);
-                Ok(())
-            }
-            Err(err) => {
-                let valid_len = err.valid_up_to();
-                self.feed_valid_prefix(&bytes[..valid_len]);
-
-                if let Some(invalid_len) = err.error_len() {
-                    // Hard UTF-8 error: skip invalid sequence, keep the rest.
-                    let mut remainder = bytes;
-                    remainder.drain(..valid_len + invalid_len);
-
-                    // Try to recover valid text from the remainder immediately
-                    match std::str::from_utf8(&remainder) {
-                        Ok(s) => self.feed_to_pending(s),
-                        Err(_) => self.utf8_buffer = remainder,
+    fn process_chunk_without_utf8_tail(&mut self, bytes: &[u8]) -> Result<(), std::io::Error> {
+        let mut processed = 0;
+        let mut first_error: Option<std::io::Error> = None;
+        loop {
+            match std::str::from_utf8(&bytes[processed..]) {
+                Ok(s) => {
+                    if !s.is_empty() {
+                        self.feed_to_pending(s);
+                    }
+                    return first_error.map_or(Ok(()), Err);
+                }
+                Err(err) => {
+                    let valid_len = err.valid_up_to();
+                    if valid_len > 0 {
+                        let s = std::str::from_utf8(&bytes[processed..processed + valid_len])
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                        self.feed_to_pending(s);
+                        processed += valid_len;
                     }
 
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, err));
+                    if let Some(invalid_len) = err.error_len() {
+                        processed += invalid_len;
+                        if first_error.is_none() {
+                            first_error = Some(Self::invalid_utf8_error());
+                        }
+                    } else {
+                        self.utf8_buffer.extend_from_slice(&bytes[processed..]);
+                        return first_error.map_or(Ok(()), Err);
+                    }
                 }
-
-                let mut remainder = bytes;
-                remainder.drain(..valid_len);
-                self.utf8_buffer = remainder;
-                Ok(())
             }
         }
     }
 
     fn process_chunk_with_utf8_tail(&mut self, bytes: &[u8]) -> Result<(), std::io::Error> {
         self.utf8_buffer.extend_from_slice(bytes);
-        let mut utf8_buffer = std::mem::take(&mut self.utf8_buffer);
-
-        match std::str::from_utf8(&utf8_buffer) {
-            Ok(s) => {
-                self.feed_to_pending(s);
-                utf8_buffer.clear();
-            }
-            Err(err) => {
-                let valid_len = err.valid_up_to();
-                self.feed_valid_prefix(&utf8_buffer[..valid_len]);
-
-                if let Some(invalid_len) = err.error_len() {
-                    // Hard UTF-8 error: skip invalid sequence, keep the rest.
-                    utf8_buffer.drain(..valid_len + invalid_len);
-
-                    // Try to recover valid text from the remainder immediately
-                    match std::str::from_utf8(&utf8_buffer) {
-                        Ok(s) => self.feed_to_pending(s),
-                        Err(_) => self.utf8_buffer = utf8_buffer,
+        let mut processed = 0;
+        let mut first_error: Option<std::io::Error> = None;
+        loop {
+            match std::str::from_utf8(&self.utf8_buffer[processed..]) {
+                Ok(s) => {
+                    if !s.is_empty() {
+                        Self::feed_parsed_chunk(&mut self.parser, &mut self.pending_events, s);
+                    }
+                    self.utf8_buffer.clear();
+                    return first_error.map_or(Ok(()), Err);
+                }
+                Err(err) => {
+                    let valid_len = err.valid_up_to();
+                    if valid_len > 0 {
+                        let s = std::str::from_utf8(
+                            &self.utf8_buffer[processed..processed + valid_len],
+                        )
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                        Self::feed_parsed_chunk(&mut self.parser, &mut self.pending_events, s);
+                        processed += valid_len;
                     }
 
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, err));
+                    if let Some(invalid_len) = err.error_len() {
+                        processed += invalid_len;
+                        if first_error.is_none() {
+                            first_error = Some(Self::invalid_utf8_error());
+                        }
+                    } else {
+                        // Move remaining bytes to start of utf8_buffer
+                        let remaining = self.utf8_buffer.len() - processed;
+                        self.utf8_buffer.copy_within(processed.., 0);
+                        self.utf8_buffer.truncate(remaining);
+                        return first_error.map_or(Ok(()), Err);
+                    }
                 }
-
-                utf8_buffer.drain(..valid_len);
             }
         }
-
-        self.utf8_buffer = utf8_buffer;
-        Ok(())
     }
 
-    fn process_chunk(&mut self, bytes: Vec<u8>) -> Result<(), std::io::Error> {
+    fn process_chunk(&mut self, bytes: &[u8]) -> Result<(), std::io::Error> {
         if self.utf8_buffer.is_empty() {
             self.process_chunk_without_utf8_tail(bytes)
         } else {
-            self.process_chunk_with_utf8_tail(&bytes)
+            self.process_chunk_with_utf8_tail(bytes)
         }
     }
 
     fn poll_stream_end(&mut self) -> Poll<Option<Result<SseEvent, std::io::Error>>> {
         if !self.utf8_buffer.is_empty() {
+            // EOF with an incomplete UTF-8 tail is a terminal stream error.
+            // Clear parser state so repeated polls don't emit the same error forever.
+            self.utf8_buffer.clear();
+            self.pending_events.clear();
+            self.pending_error = None;
+            self.parser = SseParser::new();
             return Poll::Ready(Some(Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Stream ended with incomplete UTF-8 sequence",
@@ -411,17 +555,32 @@ where
             return Poll::Ready(Some(Ok(event)));
         }
         if let Some(err) = self.pending_error.take() {
+            if self.pending_error_is_terminal {
+                self.pending_error_is_terminal = false;
+                self.pending_events.clear();
+                self.utf8_buffer.clear();
+                self.parser = SseParser::new();
+                self.terminated = true;
+            }
             return Poll::Ready(Some(Err(err)));
+        }
+        if self.terminated {
+            return Poll::Ready(None);
         }
 
         loop {
             match Pin::new(&mut self.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(bytes))) => {
-                    if let Err(err) = self.process_chunk(bytes) {
+                    if let Err(err) = self.process_chunk(&bytes) {
                         if let Some(event) = self.pending_events.pop_front() {
                             self.pending_error = Some(err);
+                            self.pending_error_is_terminal = true;
                             return Poll::Ready(Some(Ok(event)));
                         }
+                        self.pending_events.clear();
+                        self.utf8_buffer.clear();
+                        self.parser = SseParser::new();
+                        self.terminated = true;
                         return Poll::Ready(Some(Err(err)));
                     }
 
@@ -797,6 +956,16 @@ mod tests {
     }
 
     #[test]
+    fn test_last_event_id_persists_across_dispatched_events() {
+        let mut parser = SseParser::new();
+        let events = parser.feed("id: 123\ndata: first\n\ndata: second\n\n");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].id.as_deref(), Some("123"));
+        assert_eq!(events[1].id.as_deref(), Some("123"));
+        assert_eq!(events[1].data, "second");
+    }
+
+    #[test]
     fn test_multiple_events() {
         let mut parser = SseParser::new();
         let events = parser.feed("data: first\n\ndata: second\n\n");
@@ -837,6 +1006,98 @@ mod tests {
         let events = parser.feed("retry: 3000\ndata: test\n\n");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].retry, Some(3000));
+    }
+
+    #[test]
+    fn test_retry_hint_persists_across_dispatched_events() {
+        let mut parser = SseParser::new();
+        let events = parser.feed("retry: 3000\ndata: first\n\ndata: second\n\n");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].retry, Some(3000));
+        assert_eq!(events[1].retry, Some(3000));
+    }
+
+    #[test]
+    fn test_append_data_line_enforces_projected_limit() {
+        let mut current = SseEvent::default();
+        let mut has_data = false;
+
+        SseParser::append_data_line(&mut current, "ab", &mut has_data, 3);
+        assert_eq!(current.data, "ab\n");
+        assert!(has_data);
+
+        SseParser::append_data_line(&mut current, "c", &mut has_data, 3);
+        assert_eq!(current.data, "ab\n");
+    }
+
+    #[test]
+    fn test_data_cap_single_oversized_line_via_feed() {
+        // A single data line whose value exceeds the cap must be dropped entirely.
+        let mut parser = SseParser::with_max_event_data_bytes(10);
+        let events = parser.feed("data: this-is-longer-than-ten-bytes\n\n");
+        assert_eq!(
+            events.len(),
+            0,
+            "oversized-only event should not emit (no data flag set)"
+        );
+    }
+
+    #[test]
+    fn test_data_cap_accumulation_via_feed() {
+        // Multiple small data lines that collectively exceed the cap:
+        // accepted lines are kept, the line that would push past the cap is rejected.
+        let mut parser = SseParser::with_max_event_data_bytes(10);
+        // "abc\n" = 4 bytes after first append
+        let events = parser.feed("data: abc\ndata: def\ndata: ghi\n\n");
+        assert_eq!(events.len(), 1);
+        // "abc\n" (4) + "def\n" (4) = 8 bytes; "ghi\n" (4) would make 12 > 10, rejected.
+        // Trailing newline stripped on emit → "abc\ndef"
+        assert_eq!(events[0].data, "abc\ndef");
+    }
+
+    #[test]
+    fn test_data_cap_exact_boundary_via_feed() {
+        // Data that exactly reaches the cap should be accepted.
+        let mut parser = SseParser::with_max_event_data_bytes(4);
+        // "abc\n" = 4 bytes, exactly at cap
+        let events = parser.feed("data: abc\n\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "abc");
+    }
+
+    #[test]
+    fn test_data_cap_next_event_resets() {
+        // After a capped event, the next event should start fresh.
+        let mut parser = SseParser::with_max_event_data_bytes(6);
+        let events = parser.feed("data: abcde\ndata: rejected\n\ndata: ok\n\n");
+        assert_eq!(events.len(), 2);
+        // First event: "abcde\n" = 6 bytes at cap; "rejected\n" would exceed → dropped.
+        assert_eq!(events[0].data, "abcde");
+        // Second event starts fresh with a clean data buffer.
+        assert_eq!(events[1].data, "ok");
+    }
+
+    #[test]
+    fn test_data_cap_chunked_delivery() {
+        // Cap enforcement must work even when data arrives in small chunks.
+        let mut parser = SseParser::with_max_event_data_bytes(10);
+        parser.feed("data: abc\n");
+        parser.feed("data: def\n");
+        // "abc\n" (4) + "def\n" (4) = 8; "toolong\n" (8) would make 16 > 10
+        let events = parser.feed("data: toolong\n\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "abc\ndef");
+    }
+
+    #[test]
+    fn test_data_cap_flush_path() {
+        // Cap must also be enforced when the stream ends without a trailing blank line.
+        let mut parser = SseParser::with_max_event_data_bytes(6);
+        parser.feed("data: abcde\n");
+        parser.feed("data: no\n");
+        // "abcde\n" = 6 bytes at cap; "no\n" (3) would make 9 > 6 → rejected.
+        let event = parser.flush().expect("should flush pending event");
+        assert_eq!(event.data, "abcde");
     }
 
     #[test]
@@ -922,6 +1183,58 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].data.len(), payload.len());
         assert_eq!(events[0].data, payload);
+    }
+
+    #[test]
+    fn test_buffer_limit_overflow_resets_parser_state() {
+        let mut parser = SseParser::new();
+        assert!(parser.feed("data: stale\n").is_empty());
+
+        let oversized = "x".repeat(10 * 1024 * 1024 + 1);
+        let overflow_events = parser.feed(&oversized);
+        assert_eq!(overflow_events.len(), 1);
+        assert_eq!(overflow_events[0].event, "error");
+        assert_eq!(overflow_events[0].data, "SSE buffer limit exceeded");
+
+        assert!(!parser.has_pending());
+        assert!(parser.buffer.capacity() < 1024);
+        assert!(parser.flush().is_none());
+
+        let fresh = parser.feed("data: fresh\n\n");
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].data, "fresh");
+    }
+
+    #[test]
+    fn test_large_complete_chunk_does_not_trip_buffer_limit_fast_path() {
+        let mut parser = SseParser::new();
+        let payload = "x".repeat(10 * 1024 * 1024 + 1);
+        let events = parser.feed(&format!("data: {payload}\n\n"));
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "message");
+        assert_eq!(events[0].data.len(), payload.len());
+        assert_eq!(events[0].data, payload);
+        assert!(!parser.has_pending());
+        assert!(parser.buffer.capacity() < 1024);
+        assert!(parser.flush().is_none());
+    }
+
+    #[test]
+    fn test_large_complete_chunk_does_not_trip_buffer_limit_with_buffered_prefix() {
+        let mut parser = SseParser::new();
+        assert!(parser.feed("data: ").is_empty());
+
+        let payload = "x".repeat(10 * 1024 * 1024 + 1);
+        let events = parser.feed(&format!("{payload}\n\n"));
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "message");
+        assert_eq!(events[0].data.len(), payload.len());
+        assert_eq!(events[0].data, payload);
+        assert!(!parser.has_pending());
+        assert!(parser.buffer.capacity() < 1024);
+        assert!(parser.flush().is_none());
     }
 
     #[test]
@@ -1079,6 +1392,10 @@ data: {"type":"message_stop"}
                 .expect("expected a result")
                 .expect_err("expected utf8 error");
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(
+                stream.next().await.is_none(),
+                "incomplete UTF-8 at EOF should produce a terminal error"
+            );
         });
     }
 
@@ -1146,6 +1463,27 @@ data: {"type":"message_stop"}
             // 3. Error — surfaces after all pending events are delivered
             let err = stream.next().await.expect("3").expect_err("error");
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        });
+    }
+
+    #[test]
+    fn test_stream_does_not_flush_partial_tail_after_utf8_error() {
+        let mut bytes = b"data: ok\n\n".to_vec();
+        bytes.push(0xFF);
+        bytes.extend_from_slice(b"data: partial");
+
+        let mut stream = SseStream::new(stream::iter(vec![Ok(bytes)]));
+
+        futures::executor::block_on(async {
+            let first = stream.next().await.expect("1").expect("ok");
+            assert_eq!(first.data, "ok");
+
+            let err = stream.next().await.expect("2").expect_err("error");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(
+                stream.next().await.is_none(),
+                "utf-8 parse errors should terminate the stream without flushing a partial tail"
+            );
         });
     }
 

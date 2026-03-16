@@ -1,6 +1,6 @@
 {
   "schema": "pi.sec.compatibility_conformance.v1",
-  "generated_at": "2026-02-14T12:18:29.148Z",
+  "generated_at": "2026-03-12T02:22:06.471Z",
   "bead": "bd-1a2cu",
   "verdict": "pass",
   "pass_count": 40,
@@ -292,28 +292,8 @@
     }
   ],
   "categories": {
-    "profile_transition": {
-      "pass": 5,
-      "fail": 0,
-      "skip": 0
-    },
-    "deny_cap_precedence": {
-      "pass": 4,
-      "fail": 0,
-      "skip": 0
-    },
     "trust_lifecycle": {
       "pass": 4,
-      "fail": 0,
-      "skip": 0
-    },
-    "explanation_completeness": {
-      "pass": 3,
-      "fail": 0,
-      "skip": 0
-    },
-    "dangerous_gating": {
-      "pass": 6,
       "fail": 0,
       "skip": 0
     },
@@ -322,8 +302,28 @@
       "fail": 0,
       "skip": 0
     },
+    "explanation_completeness": {
+      "pass": 3,
+      "fail": 0,
+      "skip": 0
+    },
     "benign_capability": {
       "pass": 15,
+      "fail": 0,
+      "skip": 0
+    },
+    "dangerous_gating": {
+      "pass": 6,
+      "fail": 0,
+      "skip": 0
+    },
+    "profile_transition": {
+      "pass": 5,
+      "fail": 0,
+      "skip": 0
+    },
+    "deny_cap_precedence": {
+      "pass": 4,
       "fail": 0,
       "skip": 0
     }

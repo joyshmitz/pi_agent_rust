@@ -708,8 +708,8 @@ fn anthropic_base(server: &str) -> String {
     format!("{server}/v1/messages")
 }
 
-fn gemini_route(model: &str, key: &str) -> String {
-    format!("/v1beta/models/{model}:streamGenerateContent?alt=sse&key={key}")
+fn gemini_route(model: &str, _key: &str) -> String {
+    format!("/v1beta/models/{model}:streamGenerateContent?alt=sse")
 }
 fn gemini_base(server: &str) -> String {
     format!("{server}/v1beta")
@@ -2036,7 +2036,7 @@ fn e2e_comprehensive_report() {
                 "error_auth" => (spec.error_response)(),
                 "error_rate_limit" => (spec.rate_limit_response)(),
                 "schema_drift" => text_event_stream((spec.schema_drift_sse)()),
-                _ => unreachable!(),
+                _ => panic!(),
             };
             let base_url = setup_mock_route(spec, &server, response);
             let mut entry = make_entry(spec.provider_id, spec.model_id, &base_url);

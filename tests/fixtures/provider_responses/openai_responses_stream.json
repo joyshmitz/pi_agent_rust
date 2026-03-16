@@ -164,8 +164,8 @@
         { "kind": "other" },
         { "kind": "text_start", "content_index": 1 },
         { "kind": "text_delta", "content_index": 1, "delta": "The answer is 42." },
-        { "kind": "text_end", "content_index": 1, "content": "The answer is 42." },
         { "kind": "other" },
+        { "kind": "text_end", "content_index": 1, "content": "The answer is 42." },
         { "kind": "done", "reason": "stop" }
       ]
     },

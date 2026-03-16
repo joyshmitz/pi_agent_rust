@@ -271,21 +271,51 @@ impl Theme {
     }
 
     /// Load a theme by name using explicit roots.
+    ///
+    /// Project themes take precedence over global themes with the same name,
+    /// consistent with the project-over-global convention used elsewhere
+    /// (config, extension policies, resources).
     pub fn load_by_name_with_roots(name: &str, roots: &ThemeRoots) -> Result<Self> {
         let name = name.trim();
         if name.is_empty() {
             return Err(Error::validation("Theme name is empty"));
         }
 
-        for path in Self::discover_themes_with_roots(roots) {
-            if let Ok(theme) = Self::load(&path) {
-                if theme.name.eq_ignore_ascii_case(name) {
-                    return Ok(theme);
-                }
-            }
+        // Search project themes first so they override global themes.
+        if let Some(theme) =
+            Self::load_named_theme_from_dir(&roots.project_dir.join("themes"), name)?
+        {
+            return Ok(theme);
+        }
+
+        if let Some(theme) =
+            Self::load_named_theme_from_dir(&roots.global_dir.join("themes"), name)?
+        {
+            return Ok(theme);
         }
 
         Err(Error::config(format!("Theme not found: {name}")))
+    }
+
+    fn load_named_theme_from_dir(dir: &Path, name: &str) -> Result<Option<Self>> {
+        for path in glob_json(dir) {
+            match Self::load(&path) {
+                Ok(theme) => {
+                    if theme.name.eq_ignore_ascii_case(name) {
+                        return Ok(Some(theme));
+                    }
+                }
+                Err(err) if theme_path_stem_matches(&path, name) => {
+                    return Err(Error::config(format!(
+                        "Failed to load theme '{name}' from {}: {err}",
+                        path.display()
+                    )));
+                }
+                Err(_) => {}
+            }
+        }
+
+        Ok(None)
     }
 
     /// Default dark theme.
@@ -464,6 +494,12 @@ pub fn looks_like_theme_path(spec: &str) -> bool {
     spec.contains('/') || spec.contains('\\')
 }
 
+fn theme_path_stem_matches(path: &Path, name: &str) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case(name))
+}
+
 fn resolve_theme_path(spec: &str, cwd: &Path) -> PathBuf {
     let trimmed = spec.trim();
 
@@ -492,7 +528,7 @@ fn resolve_theme_path(spec: &str, cwd: &Path) -> PathBuf {
 fn parse_hex_color(value: &str) -> Option<(u8, u8, u8)> {
     let value = value.trim();
     let hex = value.strip_prefix('#')?;
-    if hex.len() != 6 {
+    if hex.len() != 6 || !hex.is_ascii() {
         return None;
     }
 
@@ -945,6 +981,69 @@ mod tests {
         };
         let loaded = Theme::load_by_name_with_roots("mycustom", &roots).unwrap();
         assert_eq!(loaded.name, "mycustom");
+    }
+
+    #[test]
+    fn load_by_name_project_overrides_global() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let global_themes = dir.path().join("global/themes");
+        let project_themes = dir.path().join("project/themes");
+        fs::create_dir_all(&global_themes).unwrap();
+        fs::create_dir_all(&project_themes).unwrap();
+
+        // Global theme with accent "#111111"
+        let mut global_theme = Theme::dark();
+        global_theme.name = "shared".to_string();
+        global_theme.colors.accent = "#111111".to_string();
+        let json = serde_json::to_string_pretty(&global_theme).unwrap();
+        fs::write(global_themes.join("shared.json"), json).unwrap();
+
+        // Project theme with same name but accent "#222222"
+        let mut project_theme = Theme::dark();
+        project_theme.name = "shared".to_string();
+        project_theme.colors.accent = "#222222".to_string();
+        let json = serde_json::to_string_pretty(&project_theme).unwrap();
+        fs::write(project_themes.join("shared.json"), json).unwrap();
+
+        let roots = ThemeRoots {
+            global_dir: dir.path().join("global"),
+            project_dir: dir.path().join("project"),
+        };
+        let loaded = Theme::load_by_name_with_roots("shared", &roots).unwrap();
+        assert_eq!(
+            loaded.colors.accent, "#222222",
+            "project theme should override global theme with the same name"
+        );
+    }
+
+    #[test]
+    fn load_by_name_invalid_project_override_does_not_fall_back_to_global() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let global_themes = dir.path().join("global/themes");
+        let project_themes = dir.path().join("project/themes");
+        fs::create_dir_all(&global_themes).unwrap();
+        fs::create_dir_all(&project_themes).unwrap();
+
+        let mut global_theme = Theme::dark();
+        global_theme.name = "shared".to_string();
+        let json = serde_json::to_string_pretty(&global_theme).unwrap();
+        fs::write(global_themes.join("shared.json"), json).unwrap();
+        fs::write(project_themes.join("shared.json"), "{ not valid json").unwrap();
+
+        let roots = ThemeRoots {
+            global_dir: dir.path().join("global"),
+            project_dir: dir.path().join("project"),
+        };
+        let err = Theme::load_by_name_with_roots("shared", &roots).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("Failed to load theme 'shared'"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("project/themes/shared.json"),
+            "unexpected error: {message}"
+        );
     }
 
     // ── tui_styles and glamour_style_config smoke tests ─────────────

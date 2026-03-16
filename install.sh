@@ -97,13 +97,6 @@ INSTALL_SOURCE="release"
 CHECKSUM_STATUS="pending"
 SIGSTORE_STATUS="pending"
 COMPLETIONS_STATUS="pending"
-CLAUDE_HOOK_STATUS="pending"
-GEMINI_HOOK_STATUS="pending"
-CODEX_HOOK_STATUS="pending"
-CLAUDE_HOOK_SETTINGS=""
-GEMINI_HOOK_SETTINGS=""
-CLAUDE_HOOK_BACKUP=""
-GEMINI_HOOK_BACKUP=""
 
 HAS_GUM=0
 if command -v gum >/dev/null 2>&1 && [ -t 1 ]; then
@@ -174,17 +167,85 @@ version_timeout_cmd() {
   printf '%s\n' ""
 }
 
-capture_version_line() {
-  local bin_path="$1"
+run_command_with_timeout_capture() {
+  local timeout_seconds="$1"
+  shift
+
   local timeout_cmd=""
   timeout_cmd="$(version_timeout_cmd)"
 
-  local out=""
   if [ -n "$timeout_cmd" ]; then
-    out=$("$timeout_cmd" 2 "$bin_path" --version 2>/dev/null | head -1 || true)
-  else
-    out=$("$bin_path" --version 2>/dev/null | head -1 || true)
+    if "$timeout_cmd" "$timeout_seconds" "$@"; then
+      return 0
+    else
+      local timeout_rc=$?
+      # Broken timeout wrappers may return 127; fall back to internal timeout handling.
+      if [ "$timeout_rc" -ne 127 ]; then
+        return "$timeout_rc"
+      fi
+    fi
   fi
+
+  local out_file=""
+  out_file="$(mktemp 2>/dev/null || true)"
+  if [ -z "$out_file" ]; then
+    return 125
+  fi
+
+  local timed_out_file=""
+  timed_out_file="$(mktemp 2>/dev/null || true)"
+  if [ -z "$timed_out_file" ]; then
+    rm -f "$out_file" 2>/dev/null || true
+    return 125
+  fi
+  : > "$timed_out_file"
+
+  "$@" > "$out_file" 2>/dev/null &
+  local cmd_pid=$!
+
+  (
+    sleep "$timeout_seconds"
+    if kill -0 "$cmd_pid" 2>/dev/null; then
+      printf '1\n' > "$timed_out_file"
+      kill "$cmd_pid" >/dev/null 2>&1 || true
+      sleep 1
+      kill -9 "$cmd_pid" >/dev/null 2>&1 || true
+    fi
+  ) &
+  local watchdog_pid=$!
+
+  local cmd_rc=0
+  if wait "$cmd_pid" 2>/dev/null; then
+    cmd_rc=0
+  else
+    cmd_rc=$?
+  fi
+
+  kill "$watchdog_pid" >/dev/null 2>&1 || true
+  wait "$watchdog_pid" 2>/dev/null || true
+
+  local timed_out=0
+  if [ -s "$timed_out_file" ]; then
+    timed_out=1
+  fi
+
+  if [ -f "$out_file" ]; then
+    cat "$out_file"
+    rm -f "$out_file" 2>/dev/null || true
+  fi
+  rm -f "$timed_out_file" 2>/dev/null || true
+
+  if [ "$timed_out" -eq 1 ]; then
+    return 124
+  fi
+  return "$cmd_rc"
+}
+
+capture_version_line() {
+  local bin_path="$1"
+  local out=""
+  out="$(run_command_with_timeout_capture 2 "$bin_path" --version || true)"
+  out="$(printf '%s\n' "$out" | head -1)"
   printf '%s\n' "$out"
 }
 
@@ -270,16 +331,6 @@ redact_proxy_value() {
   printf '%s\n' "$raw"
 }
 
-json_escape_string() {
-  local s="$1"
-  s="${s//\\/\\\\}"
-  s="${s//\"/\\\"}"
-  s="${s//$'\n'/\\n}"
-  s="${s//$'\r'/\\r}"
-  s="${s//$'\t'/\\t}"
-  printf '%s' "$s"
-}
-
 ensure_network_allowed() {
   local url="$1"
   local context="$2"
@@ -294,10 +345,32 @@ fetch_url_to_file() {
   local url="$1"
   local output_path="$2"
   local context="${3:-resource}"
+  local connect_timeout="${PI_INSTALLER_CONNECT_TIMEOUT:-10}"
+  local max_time="${PI_INSTALLER_MAX_TIME:-180}"
+  local retries="${PI_INSTALLER_RETRIES:-2}"
+  local retry_delay="${PI_INSTALLER_RETRY_DELAY:-1}"
 
   if ! ensure_network_allowed "$url" "$context"; then
     return 1
   fi
+
+  case "$context" in
+    "agent skill")
+      connect_timeout="${PI_INSTALLER_AGENT_SKILL_CONNECT_TIMEOUT:-3}"
+      max_time="${PI_INSTALLER_AGENT_SKILL_MAX_TIME:-8}"
+      retries="${PI_INSTALLER_AGENT_SKILL_RETRIES:-0}"
+      ;;
+    "release artifact")
+      connect_timeout="${PI_INSTALLER_ARTIFACT_CONNECT_TIMEOUT:-10}"
+      max_time="${PI_INSTALLER_ARTIFACT_MAX_TIME:-240}"
+      retries="${PI_INSTALLER_ARTIFACT_RETRIES:-2}"
+      ;;
+    "release checksum manifest"|"checksum file"|"derived checksum file"|"sigstore bundle")
+      connect_timeout="${PI_INSTALLER_META_CONNECT_TIMEOUT:-5}"
+      max_time="${PI_INSTALLER_META_MAX_TIME:-20}"
+      retries="${PI_INSTALLER_META_RETRIES:-2}"
+      ;;
+  esac
 
   if is_local_resource_ref "$url"; then
     local local_path
@@ -310,16 +383,39 @@ fetch_url_to_file() {
     return 0
   fi
 
-  curl -fsSL "${PROXY_ARGS[@]}" "$url" -o "$output_path"
+  curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    --retry "$retries" \
+    --retry-delay "$retry_delay" \
+    --retry-connrefused \
+    "$url" -o "$output_path"
 }
 
 fetch_url_to_stdout() {
   local url="$1"
   local context="${2:-resource}"
+  local connect_timeout="${PI_INSTALLER_CONNECT_TIMEOUT:-10}"
+  local max_time="${PI_INSTALLER_MAX_TIME:-180}"
+  local retries="${PI_INSTALLER_RETRIES:-2}"
+  local retry_delay="${PI_INSTALLER_RETRY_DELAY:-1}"
 
   if ! ensure_network_allowed "$url" "$context"; then
     return 1
   fi
+
+  case "$context" in
+    "agent skill")
+      connect_timeout="${PI_INSTALLER_AGENT_SKILL_CONNECT_TIMEOUT:-3}"
+      max_time="${PI_INSTALLER_AGENT_SKILL_MAX_TIME:-8}"
+      retries="${PI_INSTALLER_AGENT_SKILL_RETRIES:-0}"
+      ;;
+    "release checksum manifest"|"checksum file"|"derived checksum file"|"sigstore bundle")
+      connect_timeout="${PI_INSTALLER_META_CONNECT_TIMEOUT:-5}"
+      max_time="${PI_INSTALLER_META_MAX_TIME:-20}"
+      retries="${PI_INSTALLER_META_RETRIES:-2}"
+      ;;
+  esac
 
   if is_local_resource_ref "$url"; then
     local local_path
@@ -332,23 +428,52 @@ fetch_url_to_stdout() {
     return 0
   fi
 
-  curl -fsSL "${PROXY_ARGS[@]}" "$url"
+  curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    --retry "$retries" \
+    --retry-delay "$retry_delay" \
+    --retry-connrefused \
+    "$url"
 }
 
 fetch_effective_url() {
   local url="$1"
   local context="${2:-resource}"
+  local connect_timeout="${PI_INSTALLER_CONNECT_TIMEOUT:-10}"
+  local max_time="${PI_INSTALLER_MAX_TIME:-180}"
+  local retries="${PI_INSTALLER_RETRIES:-2}"
+  local retry_delay="${PI_INSTALLER_RETRY_DELAY:-1}"
 
   if ! ensure_network_allowed "$url" "$context"; then
     return 1
   fi
+
+  case "$context" in
+    "agent skill")
+      connect_timeout="${PI_INSTALLER_AGENT_SKILL_CONNECT_TIMEOUT:-3}"
+      max_time="${PI_INSTALLER_AGENT_SKILL_MAX_TIME:-8}"
+      retries="${PI_INSTALLER_AGENT_SKILL_RETRIES:-0}"
+      ;;
+    "release checksum manifest"|"checksum file"|"derived checksum file"|"sigstore bundle")
+      connect_timeout="${PI_INSTALLER_META_CONNECT_TIMEOUT:-5}"
+      max_time="${PI_INSTALLER_META_MAX_TIME:-20}"
+      retries="${PI_INSTALLER_META_RETRIES:-2}"
+      ;;
+  esac
 
   if is_local_resource_ref "$url"; then
     printf '%s\n' "$url"
     return 0
   fi
 
-  curl -fsSL -o /dev/null -w '%{url_effective}' "${PROXY_ARGS[@]}" "$url"
+  curl -fsSL -o /dev/null -w '%{url_effective}' ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
+    --connect-timeout "$connect_timeout" \
+    --max-time "$max_time" \
+    --retry "$retries" \
+    --retry-delay "$retry_delay" \
+    --retry-connrefused \
+    "$url"
 }
 
 probe_url_head() {
@@ -366,7 +491,7 @@ probe_url_head() {
     return $?
   fi
 
-  curl -fsSLI "${PROXY_ARGS[@]}" --connect-timeout 5 --max-time 10 "$url" >/dev/null 2>&1
+  curl -fsSLI ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} --connect-timeout 5 --max-time 10 "$url" >/dev/null 2>&1
 }
 
 remove_path_recursively() {
@@ -1345,8 +1470,9 @@ verify_download_checksum() {
     checksum_source_kind="artifact-derived"
   else
     if ! fetch_url_to_file "$SHA_URL" "$checksum_file" "release checksum manifest"; then
-      err "Failed to download checksum manifest: $SHA_URL"
-      return 4
+      warn "No SHA256SUMS found in release; skipping checksum verification"
+      CHECKSUM_STATUS="skipped (no SHA256SUMS in release)"
+      return 0
     fi
   fi
 
@@ -1537,21 +1663,29 @@ download_release_binary() {
   if [ -n "$ARTIFACT_URL" ]; then
     candidates+=("$ASSET_NAME|$ARTIFACT_URL")
   else
-    candidates+=("pi-${VERSION}-${TARGET}${EXE_EXT}|https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/pi-${VERSION}-${TARGET}${EXE_EXT}")
-    candidates+=("pi-${TARGET}${EXE_EXT}|https://github.com/${OWNER}/${REPO}/releases/latest/download/pi-${TARGET}${EXE_EXT}")
-    candidates+=("pi-${OS}-${ARCH}${EXE_EXT}|https://github.com/${OWNER}/${REPO}/releases/latest/download/pi-${OS}-${ARCH}${EXE_EXT}")
+    # Try candidates in priority order. dsr bare-binary names first (most common
+    # for local releases), then archive formats, then Rust target-triple names.
+    local base_v="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}"
+    local base_l="https://github.com/${OWNER}/${REPO}/releases/latest/download"
+    # dsr-style naming: pi_<os>_<arch> with underscores (e.g. pi_darwin_arm64)
+    if [ -n "$ASSET_PLATFORM" ]; then
+      local dsr_name="pi_${ASSET_PLATFORM//-/_}${EXE_EXT}"
+      candidates+=("${dsr_name}|${base_v}/${dsr_name}")
+    fi
+    # Bare binary name (dsr uploads Linux as just "pi")
+    candidates+=("pi${EXE_EXT}|${base_v}/pi${EXE_EXT}")
+    # Archive formats (GH Actions output)
     if [ -n "$ASSET_PLATFORM" ]; then
       if [ -n "$EXE_EXT" ]; then
-        candidates+=("pi-${ASSET_PLATFORM}.zip|https://github.com/${OWNER}/${REPO}/releases/latest/download/pi-${ASSET_PLATFORM}.zip")
-        candidates+=("pi-${ASSET_PLATFORM}.zip|https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/pi-${ASSET_PLATFORM}.zip")
+        candidates+=("pi-${ASSET_PLATFORM}.zip|${base_v}/pi-${ASSET_PLATFORM}.zip")
       else
-        candidates+=("pi-${ASSET_PLATFORM}.tar.xz|https://github.com/${OWNER}/${REPO}/releases/latest/download/pi-${ASSET_PLATFORM}.tar.xz")
-        candidates+=("pi-${ASSET_PLATFORM}.tar.xz|https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/pi-${ASSET_PLATFORM}.tar.xz")
-        candidates+=("pi-${ASSET_PLATFORM}.tar.gz|https://github.com/${OWNER}/${REPO}/releases/latest/download/pi-${ASSET_PLATFORM}.tar.gz")
-        candidates+=("pi-${ASSET_PLATFORM}.tar.gz|https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/pi-${ASSET_PLATFORM}.tar.gz")
-        candidates+=("pi-${OS}-${ARCH}.tar.gz|https://github.com/${OWNER}/${REPO}/releases/latest/download/pi-${OS}-${ARCH}.tar.gz")
+        candidates+=("pi-${ASSET_PLATFORM}.tar.xz|${base_v}/pi-${ASSET_PLATFORM}.tar.xz")
+        candidates+=("pi-${ASSET_PLATFORM}.tar.gz|${base_v}/pi-${ASSET_PLATFORM}.tar.gz")
       fi
     fi
+    # Rust target-triple naming
+    candidates+=("pi-${TARGET}${EXE_EXT}|${base_v}/pi-${TARGET}${EXE_EXT}")
+    candidates+=("pi-${OS}-${ARCH}${EXE_EXT}|${base_v}/pi-${OS}-${ARCH}${EXE_EXT}")
   fi
 
   local entry=""
@@ -1559,7 +1693,9 @@ download_release_binary() {
     local candidate="${entry%%|*}"
     local candidate_url="${entry#*|}"
     local artifact_file="$TMP/$candidate"
-    if ! fetch_url_to_file "$candidate_url" "$artifact_file" "release artifact"; then
+    # Suppress stderr for candidate probing — 404s are expected as we try
+    # multiple naming conventions. Only show errors for explicit --artifact-url.
+    if ! fetch_url_to_file "$candidate_url" "$artifact_file" "release artifact" 2>/dev/null; then
       if [ -n "$ARTIFACT_URL" ]; then
         err "Failed to download artifact: $candidate_url"
       fi
@@ -1784,11 +1920,72 @@ install_completions_for_shell() {
   fi
 
   local subcommand=""
-  if "$bin" completions --help >/dev/null 2>&1; then
-    subcommand="completions"
-  elif "$bin" completion --help >/dev/null 2>&1; then
-    subcommand="completion"
+  local probe_timeout="${PI_INSTALLER_COMPLETION_PROBE_TIMEOUT:-3}"
+  local generation_timeout="${PI_INSTALLER_COMPLETION_CMD_TIMEOUT:-10}"
+
+  # Prefer static command discovery from top-level --help (safe, fast path).
+  # If that fails, fall back to legacy subcommand probes guarded by a timeout.
+  local root_help=""
+  local root_help_ok=0
+  local root_help_rc=0
+  local should_probe_subcommands=0
+  if root_help="$(run_command_with_timeout_capture "$probe_timeout" "$bin" --help)"; then
+    root_help_ok=1
   else
+    root_help_rc=$?
+  fi
+
+  if [ "$root_help_ok" -eq 1 ]; then
+    if printf '%s\n' "$root_help" | grep -Eq '^[[:space:]]+completions([[:space:]]|$)'; then
+      subcommand="completions"
+    elif printf '%s\n' "$root_help" | grep -Eq '^[[:space:]]+completion([[:space:]]|$)'; then
+      subcommand="completion"
+    elif printf '%s\n' "$root_help" | grep -Eq '^[[:space:]]*Commands:'; then
+      # Help output is conclusive and lists no completion command.
+      should_probe_subcommands=0
+    else
+      # Help output was available but inconclusive for command discovery.
+      should_probe_subcommands=1
+    fi
+  else
+    should_probe_subcommands=1
+  fi
+
+  if [ "$should_probe_subcommands" -eq 1 ]; then
+    # Help probe was unavailable or inconclusive: guard runtime probes with timeout.
+    local probe_rc=0
+    local probe_timed_out=0
+    if run_command_with_timeout_capture "$probe_timeout" "$bin" completions --help >/dev/null 2>&1; then
+      subcommand="completions"
+    else
+      probe_rc=$?
+      if [ "$probe_rc" -eq 124 ] || [ "$probe_rc" -eq 137 ]; then
+        probe_timed_out=1
+      fi
+      if run_command_with_timeout_capture "$probe_timeout" "$bin" completion --help >/dev/null 2>&1; then
+        subcommand="completion"
+      else
+        probe_rc=$?
+        if [ "$probe_rc" -eq 124 ] || [ "$probe_rc" -eq 137 ]; then
+          probe_timed_out=1
+        fi
+      fi
+    fi
+
+    if [ -z "$subcommand" ] && [ "$probe_timed_out" -eq 1 ]; then
+      COMPLETIONS_STATUS="failed (completion probe timed out)"
+      warn "Shell completions probe timed out; skipping completion installation"
+      return 1
+    fi
+  fi
+
+  if [ -z "$subcommand" ] && [ "$root_help_ok" -eq 0 ] && [ "$root_help_rc" -eq 125 ]; then
+    COMPLETIONS_STATUS="skipped (completion probe unavailable)"
+    info "Shell completions: skipped (unable to safely probe completion support)"
+    return 0
+  fi
+
+  if [ -z "$subcommand" ]; then
     COMPLETIONS_STATUS="skipped (unsupported by this pi build)"
     info "Shell completions: skipped (binary has no completion subcommand)"
     return 0
@@ -1818,7 +2015,14 @@ install_completions_for_shell() {
   fi
 
   local completion_output
-  if ! completion_output=$("$bin" "$subcommand" "$shell_name" 2>/dev/null); then
+  local completion_rc=0
+  completion_output="$(run_command_with_timeout_capture "$generation_timeout" "$bin" "$subcommand" "$shell_name")" || completion_rc=$?
+  if [ "$completion_rc" -ne 0 ]; then
+    if [ "$completion_rc" -eq 124 ] || [ "$completion_rc" -eq 137 ]; then
+      COMPLETIONS_STATUS="failed (completion generation timed out)"
+      warn "Failed to generate $shell_name completions (timed out)"
+      return 1
+    fi
     COMPLETIONS_STATUS="failed (completion generation error)"
     warn "Failed to generate $shell_name completions"
     return 1
@@ -1857,443 +2061,229 @@ maybe_install_completions() {
   install_completions_for_shell "$shell_name" || true
 }
 
-claude_agent_detected() {
-  [ -d "$HOME/.claude" ] \
-    || [ -d "$HOME/.config/claude" ] \
-    || [ -d "$HOME/Library/Application Support/Claude" ] \
-    || command -v claude >/dev/null 2>&1
+is_expected_legacy_agent_settings_path() {
+  local path="$1"
+  local agent="$2"
+  [ -n "$path" ] || return 1
+
+  case "$agent" in
+    claude)
+      case "$path" in
+        "$HOME/.claude/settings.json"|"$HOME/.config/claude/settings.json"|"$HOME/Library/Application Support/Claude/settings.json")
+          return 0
+          ;;
+      esac
+      ;;
+    gemini)
+      case "$path" in
+        "$HOME/.gemini/settings.json"|"$HOME/.gemini-cli/settings.json")
+          return 0
+          ;;
+      esac
+      ;;
+  esac
+
+  return 1
 }
 
-gemini_agent_detected() {
-  [ -d "$HOME/.gemini" ] \
-    || [ -d "$HOME/.gemini-cli" ] \
-    || command -v gemini >/dev/null 2>&1
+cleanup_legacy_settings_entries() {
+  local settings_file="$1"
+  local hook_key="$2"
+  local matcher="$3"
+  local require_name="$4"
+  shift 4
+  local bin_candidates=("$@")
+
+  [ -f "$settings_file" ] || return 0
+  [ "${#bin_candidates[@]}" -gt 0 ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+
+  local py_result=""
+  if ! py_result=$(python3 - "$settings_file" "$hook_key" "$matcher" "$require_name" "${bin_candidates[@]}" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+
+settings_file = sys.argv[1]
+hook_key = sys.argv[2]
+matcher = sys.argv[3]
+require_name = sys.argv[4]
+candidate_bins = [arg for arg in sys.argv[5:] if arg]
+
+if not candidate_bins:
+    print("NO_CANDIDATES")
+    raise SystemExit(0)
+
+
+def command_matches(command: str) -> bool:
+    if not isinstance(command, str):
+        return False
+    cmd = command.strip()
+    if not cmd:
+        return False
+    try:
+        parts = shlex.split(cmd)
+    except Exception:
+        parts = cmd.split()
+    if len(parts) != 1:
+        return False
+    first = parts[0]
+    if not os.path.isabs(first):
+        return False
+    for bin_path in candidate_bins:
+        if first == bin_path:
+            return True
+        try:
+            if os.path.realpath(first) == os.path.realpath(bin_path):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+try:
+    with open(settings_file, "r", encoding="utf-8") as f:
+        settings = json.load(f)
+except Exception:
+    print("SKIP_INVALID_JSON")
+    raise SystemExit(0)
+
+if not isinstance(settings, dict):
+    print("SKIP_INVALID_JSON")
+    raise SystemExit(0)
+
+hooks = settings.get("hooks")
+if not isinstance(hooks, dict):
+    print("NO_HOOKS")
+    raise SystemExit(0)
+
+entries = hooks.get(hook_key)
+if not isinstance(entries, list):
+    print("NO_HOOKS")
+    raise SystemExit(0)
+
+removed = 0
+changed = False
+new_entries = []
+
+for entry in entries:
+    if isinstance(entry, dict) and entry.get("matcher") == matcher:
+        existing_hooks = entry.get("hooks", [])
+        if not isinstance(existing_hooks, list):
+            existing_hooks = []
+
+        kept = []
+        for hook in existing_hooks:
+            should_remove = False
+            if isinstance(hook, dict):
+                command = str(hook.get("command", ""))
+                if require_name:
+                    if (
+                        str(hook.get("name", "")) == require_name
+                        and str(hook.get("type", "")) == "command"
+                        and (set(hook.keys()) <= {"name", "type", "command", "timeout"})
+                        and hook.get("timeout", 5000) in (5000, "5000")
+                        and command_matches(command)
+                    ):
+                        should_remove = True
+                else:
+                    if (
+                        str(hook.get("type", "")) == "command"
+                        and (set(hook.keys()) <= {"type", "command"})
+                        and command_matches(command)
+                    ):
+                        should_remove = True
+
+            if should_remove:
+                removed += 1
+                changed = True
+                continue
+
+            kept.append(hook)
+
+        if kept:
+            entry["hooks"] = kept
+            new_entries.append(entry)
+        elif existing_hooks:
+            changed = True
+    else:
+        new_entries.append(entry)
+
+if not changed:
+    print("ALREADY_ABSENT")
+    raise SystemExit(0)
+
+hooks[hook_key] = new_entries
+if not hooks[hook_key]:
+    del hooks[hook_key]
+if not hooks:
+    settings.pop("hooks", None)
+
+with open(settings_file, "w", encoding="utf-8") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+
+print(f"REMOVED:{removed}")
+PYEOF
+  ); then
+    warn "Legacy settings cleanup failed for $settings_file"
+    return 0
+  fi
+
+  case "$py_result" in
+    REMOVED:*)
+      local count="${py_result#REMOVED:}"
+      if [ "$count" -gt 0 ] 2>/dev/null; then
+        ok "Removed ${count} legacy installer entries from $settings_file"
+      fi
+      ;;
+  esac
 }
 
-codex_agent_detected() {
-  local codex_home="${CODEX_HOME:-$HOME/.codex}"
-  [ -d "$codex_home" ] || command -v codex >/dev/null 2>&1
-}
+cleanup_legacy_agent_settings() {
+  local bin_candidates=()
+  local recorded_bin="${PIAR_INSTALL_BIN:-}"
+  local current_bin="${INSTALL_BIN_PATH:-}"
 
-resolve_claude_settings_path() {
-  local candidates=(
+  if [ -n "$recorded_bin" ]; then
+    bin_candidates+=("$recorded_bin")
+  fi
+  if [ -n "$current_bin" ] && [ "$current_bin" != "$recorded_bin" ]; then
+    bin_candidates+=("$current_bin")
+  fi
+  [ "${#bin_candidates[@]}" -gt 0 ] || return 0
+
+  local claude_candidates=()
+  if [ -n "${PIAR_CLAUDE_HOOK_SETTINGS:-}" ]; then
+    claude_candidates+=("${PIAR_CLAUDE_HOOK_SETTINGS}")
+  fi
+  claude_candidates+=(
     "$HOME/.claude/settings.json"
     "$HOME/.config/claude/settings.json"
     "$HOME/Library/Application Support/Claude/settings.json"
   )
-  local path=""
-  for path in "${candidates[@]}"; do
-    if [ -f "$path" ]; then
-      printf '%s\n' "$path"
-      return 0
-    fi
-  done
-  printf '%s\n' "${candidates[0]}"
-}
 
-resolve_gemini_settings_path() {
-  local candidates=(
+  local gemini_candidates=()
+  if [ -n "${PIAR_GEMINI_HOOK_SETTINGS:-}" ]; then
+    gemini_candidates+=("${PIAR_GEMINI_HOOK_SETTINGS}")
+  fi
+  gemini_candidates+=(
     "$HOME/.gemini/settings.json"
     "$HOME/.gemini-cli/settings.json"
   )
-  local path=""
-  for path in "${candidates[@]}"; do
-    if [ -f "$path" ]; then
-      printf '%s\n' "$path"
-      return 0
+
+  local settings_path=""
+  for settings_path in "${claude_candidates[@]}"; do
+    if is_expected_legacy_agent_settings_path "$settings_path" "claude"; then
+      cleanup_legacy_settings_entries "$settings_path" "PreToolUse" "Bash" "" "${bin_candidates[@]}"
     fi
   done
-  printf '%s\n' "${candidates[0]}"
-}
-
-create_settings_backup() {
-  local settings_file="$1"
-  if [ ! -f "$settings_file" ]; then
-    return 0
-  fi
-  local backup_path=""
-  backup_path="${settings_file}.bak.$(date +%Y%m%d%H%M%S)"
-  cp "$settings_file" "$backup_path"
-  printf '%s\n' "$backup_path"
-}
-
-configure_claude_hook() {
-  CLAUDE_HOOK_BACKUP=""
-  CLAUDE_HOOK_SETTINGS=""
-
-  if ! claude_agent_detected; then
-    CLAUDE_HOOK_STATUS="skipped (not detected)"
-    return 0
-  fi
-
-  CLAUDE_HOOK_SETTINGS="$(resolve_claude_settings_path)"
-  local settings_file="$CLAUDE_HOOK_SETTINGS"
-  local binary_path="$INSTALL_BIN_PATH"
-
-  if [ ! -f "$settings_file" ]; then
-    if ! mkdir -p "$(dirname "$settings_file")" 2>/dev/null; then
-      CLAUDE_HOOK_STATUS="failed (mkdir error)"
-      warn "Failed to prepare Claude settings directory: $(dirname "$settings_file")"
-      return 0
+  for settings_path in "${gemini_candidates[@]}"; do
+    if is_expected_legacy_agent_settings_path "$settings_path" "gemini"; then
+      cleanup_legacy_settings_entries "$settings_path" "BeforeTool" "run_shell_command" "pi-agent-rust" "${bin_candidates[@]}"
     fi
-    local escaped_binary_path
-    escaped_binary_path="$(json_escape_string "$binary_path")"
-    if ! cat > "$settings_file" <<EOF_CLAUDE
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${escaped_binary_path}"
-          }
-        ]
-      }
-    ]
-  }
-}
-EOF_CLAUDE
-    then
-      CLAUDE_HOOK_STATUS="failed (write error)"
-      warn "Failed to write Claude settings file: $settings_file"
-      return 0
-    fi
-    CLAUDE_HOOK_STATUS="created"
-    ok "Configured Claude Code hook: $settings_file"
-    return 0
-  fi
-
-  if ! command -v python3 >/dev/null 2>&1; then
-    CLAUDE_HOOK_STATUS="failed (python3 missing)"
-    warn "python3 not found; cannot merge Claude hook settings"
-    return 0
-  fi
-
-  local backup_path=""
-  backup_path="$(create_settings_backup "$settings_file" 2>/dev/null || true)"
-  if [ -f "$settings_file" ] && [ -z "$backup_path" ]; then
-    CLAUDE_HOOK_STATUS="failed (backup error)"
-    warn "Failed to create Claude settings backup: $settings_file"
-    return 0
-  fi
-  CLAUDE_HOOK_BACKUP="$backup_path"
-
-  local merge_result=""
-  if ! merge_result=$(python3 - "$settings_file" "$binary_path" <<'PYEOF'
-import json
-import os
-import shlex
-import sys
-
-settings_file = sys.argv[1]
-binary_path = sys.argv[2]
-binary_name = binary_path.rsplit("/", 1)[-1]
-
-try:
-    with open(settings_file, "r", encoding="utf-8") as f:
-        settings = json.load(f)
-except Exception:
-    settings = {}
-
-if not isinstance(settings, dict):
-    settings = {}
-
-hooks = settings.get("hooks")
-if not isinstance(hooks, dict):
-    hooks = {}
-    settings["hooks"] = hooks
-
-pre = hooks.get("PreToolUse")
-if not isinstance(pre, list):
-    pre = []
-    hooks["PreToolUse"] = pre
-
-bash_hooks = []
-other_entries = []
-for entry in pre:
-    if isinstance(entry, dict) and entry.get("matcher") == "Bash":
-        for hook in entry.get("hooks", []):
-            if hook not in bash_hooks:
-                bash_hooks.append(hook)
-    else:
-        other_entries.append(entry)
-
-def matches_binary(command: str) -> bool:
-    if not isinstance(command, str):
-        return False
-    cmd = command.strip()
-    if not cmd:
-        return False
-    if cmd == binary_path:
-        return True
-    try:
-        parts = shlex.split(cmd)
-    except Exception:
-        parts = cmd.split()
-    if not parts:
-        return False
-    first = parts[0]
-    if first == binary_path:
-        return True
-    if os.path.isabs(first):
-        try:
-            if os.path.realpath(first) == os.path.realpath(binary_path):
-                return True
-        except Exception:
-            pass
-    return False
-
-for hook in bash_hooks:
-    if isinstance(hook, dict):
-        command = str(hook.get("command", ""))
-        if matches_binary(command):
-            print("ALREADY")
-            raise SystemExit(0)
-
-bash_hooks.insert(0, {"type": "command", "command": binary_path})
-hooks["PreToolUse"] = [{"matcher": "Bash", "hooks": bash_hooks}] + other_entries
-
-with open(settings_file, "w", encoding="utf-8") as f:
-    json.dump(settings, f, indent=2)
-    f.write("\n")
-
-print("MERGED")
-PYEOF
-  ); then
-    if [ -n "$backup_path" ]; then
-      mv "$backup_path" "$settings_file" 2>/dev/null || true
-      CLAUDE_HOOK_BACKUP=""
-    fi
-    CLAUDE_HOOK_STATUS="failed (merge error)"
-    warn "Failed to merge Claude settings: $settings_file"
-    return 0
-  fi
-
-  case "$merge_result" in
-    ALREADY)
-      CLAUDE_HOOK_STATUS="already"
-      if [ -n "$backup_path" ]; then
-        rm -f "$backup_path" 2>/dev/null || true
-        CLAUDE_HOOK_BACKUP=""
-      fi
-      ;;
-    MERGED)
-      CLAUDE_HOOK_STATUS="merged"
-      ok "Updated Claude Code hook settings: $settings_file"
-      ;;
-    *)
-      if [ -n "$backup_path" ]; then
-        mv "$backup_path" "$settings_file" 2>/dev/null || true
-        CLAUDE_HOOK_BACKUP=""
-      fi
-      CLAUDE_HOOK_STATUS="failed (unexpected merge output)"
-      warn "Unexpected Claude hook merge result for $settings_file"
-      ;;
-  esac
-}
-
-configure_gemini_hook() {
-  GEMINI_HOOK_BACKUP=""
-  GEMINI_HOOK_SETTINGS=""
-
-  if ! gemini_agent_detected; then
-    GEMINI_HOOK_STATUS="skipped (not detected)"
-    return 0
-  fi
-
-  GEMINI_HOOK_SETTINGS="$(resolve_gemini_settings_path)"
-  local settings_file="$GEMINI_HOOK_SETTINGS"
-  local binary_path="$INSTALL_BIN_PATH"
-
-  if [ ! -f "$settings_file" ]; then
-    if ! mkdir -p "$(dirname "$settings_file")" 2>/dev/null; then
-      GEMINI_HOOK_STATUS="failed (mkdir error)"
-      warn "Failed to prepare Gemini settings directory: $(dirname "$settings_file")"
-      return 0
-    fi
-    local escaped_binary_path
-    escaped_binary_path="$(json_escape_string "$binary_path")"
-    if ! cat > "$settings_file" <<EOF_GEMINI
-{
-  "hooks": {
-    "BeforeTool": [
-      {
-        "matcher": "run_shell_command",
-        "hooks": [
-          {
-            "name": "pi-agent-rust",
-            "type": "command",
-            "command": "${escaped_binary_path}",
-            "timeout": 5000
-          }
-        ]
-      }
-    ]
-  }
-}
-EOF_GEMINI
-    then
-      GEMINI_HOOK_STATUS="failed (write error)"
-      warn "Failed to write Gemini settings file: $settings_file"
-      return 0
-    fi
-    GEMINI_HOOK_STATUS="created"
-    ok "Configured Gemini hook: $settings_file"
-    return 0
-  fi
-
-  if ! command -v python3 >/dev/null 2>&1; then
-    GEMINI_HOOK_STATUS="failed (python3 missing)"
-    warn "python3 not found; cannot merge Gemini hook settings"
-    return 0
-  fi
-
-  local backup_path=""
-  backup_path="$(create_settings_backup "$settings_file" 2>/dev/null || true)"
-  if [ -f "$settings_file" ] && [ -z "$backup_path" ]; then
-    GEMINI_HOOK_STATUS="failed (backup error)"
-    warn "Failed to create Gemini settings backup: $settings_file"
-    return 0
-  fi
-  GEMINI_HOOK_BACKUP="$backup_path"
-
-  local merge_result=""
-  if ! merge_result=$(python3 - "$settings_file" "$binary_path" <<'PYEOF'
-import json
-import os
-import shlex
-import sys
-
-settings_file = sys.argv[1]
-binary_path = sys.argv[2]
-binary_name = binary_path.rsplit("/", 1)[-1]
-
-try:
-    with open(settings_file, "r", encoding="utf-8") as f:
-        settings = json.load(f)
-except Exception:
-    settings = {}
-
-if not isinstance(settings, dict):
-    settings = {}
-
-hooks = settings.get("hooks")
-if not isinstance(hooks, dict):
-    hooks = {}
-    settings["hooks"] = hooks
-
-before = hooks.get("BeforeTool")
-if not isinstance(before, list):
-    before = []
-    hooks["BeforeTool"] = before
-
-shell_hooks = []
-other_entries = []
-for entry in before:
-    if isinstance(entry, dict) and entry.get("matcher") == "run_shell_command":
-        for hook in entry.get("hooks", []):
-            if hook not in shell_hooks:
-                shell_hooks.append(hook)
-    else:
-        other_entries.append(entry)
-
-def matches_binary(command: str) -> bool:
-    if not isinstance(command, str):
-        return False
-    cmd = command.strip()
-    if not cmd:
-        return False
-    if cmd == binary_path:
-        return True
-    try:
-        parts = shlex.split(cmd)
-    except Exception:
-        parts = cmd.split()
-    if not parts:
-        return False
-    first = parts[0]
-    if first == binary_path:
-        return True
-    if os.path.isabs(first):
-        try:
-            if os.path.realpath(first) == os.path.realpath(binary_path):
-                return True
-        except Exception:
-            pass
-    return False
-
-for hook in shell_hooks:
-    if isinstance(hook, dict):
-        command = str(hook.get("command", ""))
-        if matches_binary(command):
-            print("ALREADY")
-            raise SystemExit(0)
-
-shell_hooks.insert(
-    0,
-    {
-        "name": "pi-agent-rust",
-        "type": "command",
-        "command": binary_path,
-        "timeout": 5000,
-    },
-)
-hooks["BeforeTool"] = [{"matcher": "run_shell_command", "hooks": shell_hooks}] + other_entries
-
-with open(settings_file, "w", encoding="utf-8") as f:
-    json.dump(settings, f, indent=2)
-    f.write("\n")
-
-print("MERGED")
-PYEOF
-  ); then
-    if [ -n "$backup_path" ]; then
-      mv "$backup_path" "$settings_file" 2>/dev/null || true
-      GEMINI_HOOK_BACKUP=""
-    fi
-    GEMINI_HOOK_STATUS="failed (merge error)"
-    warn "Failed to merge Gemini settings: $settings_file"
-    return 0
-  fi
-
-  case "$merge_result" in
-    ALREADY)
-      GEMINI_HOOK_STATUS="already"
-      if [ -n "$backup_path" ]; then
-        rm -f "$backup_path" 2>/dev/null || true
-        GEMINI_HOOK_BACKUP=""
-      fi
-      ;;
-    MERGED)
-      GEMINI_HOOK_STATUS="merged"
-      ok "Updated Gemini hook settings: $settings_file"
-      ;;
-    *)
-      if [ -n "$backup_path" ]; then
-        mv "$backup_path" "$settings_file" 2>/dev/null || true
-        GEMINI_HOOK_BACKUP=""
-      fi
-      GEMINI_HOOK_STATUS="failed (unexpected merge output)"
-      warn "Unexpected Gemini hook merge result for $settings_file"
-      ;;
-  esac
-}
-
-configure_codex_hook_status() {
-  if codex_agent_detected; then
-    CODEX_HOOK_STATUS="unsupported (Codex has no pre-exec hooks)"
-  else
-    CODEX_HOOK_STATUS="skipped (not detected)"
-  fi
-}
-
-configure_agent_hooks() {
-  info "Scanning AI agents and applying hook auto-configuration"
-  configure_claude_hook
-  configure_gemini_hook
-  configure_codex_hook_status
+  done
 }
 
 is_installer_managed_skill_file() {
@@ -2774,13 +2764,6 @@ write_state() {
     printf 'PIAR_CHECKSUM_STATUS=%q\n' "$CHECKSUM_STATUS"
     printf 'PIAR_SIGSTORE_STATUS=%q\n' "$SIGSTORE_STATUS"
     printf 'PIAR_COMPLETIONS_STATUS=%q\n' "$COMPLETIONS_STATUS"
-    printf 'PIAR_CLAUDE_HOOK_STATUS=%q\n' "$CLAUDE_HOOK_STATUS"
-    printf 'PIAR_GEMINI_HOOK_STATUS=%q\n' "$GEMINI_HOOK_STATUS"
-    printf 'PIAR_CODEX_HOOK_STATUS=%q\n' "$CODEX_HOOK_STATUS"
-    printf 'PIAR_CLAUDE_HOOK_SETTINGS=%q\n' "$CLAUDE_HOOK_SETTINGS"
-    printf 'PIAR_GEMINI_HOOK_SETTINGS=%q\n' "$GEMINI_HOOK_SETTINGS"
-    printf 'PIAR_CLAUDE_HOOK_BACKUP=%q\n' "$CLAUDE_HOOK_BACKUP"
-    printf 'PIAR_GEMINI_HOOK_BACKUP=%q\n' "$GEMINI_HOOK_BACKUP"
     printf 'PIAR_AGENT_SKILL_STATUS=%q\n' "$AGENT_SKILL_STATUS"
     printf 'PIAR_AGENT_SKILL_CLAUDE_PATH=%q\n' "$AGENT_SKILL_CLAUDE_PATH"
     printf 'PIAR_AGENT_SKILL_CODEX_PATH=%q\n' "$AGENT_SKILL_CODEX_PATH"
@@ -2832,21 +2815,6 @@ print_summary() {
   fi
   if [ "$WSL_DETECTED" -eq 1 ]; then
     lines+=("Platform:  WSL detected")
-  fi
-  lines+=("Claude hook: $CLAUDE_HOOK_STATUS")
-  lines+=("Gemini hook: $GEMINI_HOOK_STATUS")
-  lines+=("Codex hook:  $CODEX_HOOK_STATUS")
-  if [ -n "$CLAUDE_HOOK_SETTINGS" ]; then
-    lines+=("Claude cfg:  $CLAUDE_HOOK_SETTINGS")
-  fi
-  if [ -n "$GEMINI_HOOK_SETTINGS" ]; then
-    lines+=("Gemini cfg:  $GEMINI_HOOK_SETTINGS")
-  fi
-  if [ -n "$CLAUDE_HOOK_BACKUP" ]; then
-    lines+=("Claude bak:  $CLAUDE_HOOK_BACKUP")
-  fi
-  if [ -n "$GEMINI_HOOK_BACKUP" ]; then
-    lines+=("Gemini bak:  $GEMINI_HOOK_BACKUP")
   fi
   lines+=("Skills:    $AGENT_SKILL_STATUS")
   if [ -n "$AGENT_SKILL_CLAUDE_PATH" ] && [ -f "$AGENT_SKILL_CLAUDE_PATH/SKILL.md" ]; then
@@ -2933,7 +2901,7 @@ main() {
     fi
     maybe_add_path
     maybe_install_completions
-    configure_agent_hooks
+    cleanup_legacy_agent_settings
     install_agent_skills
     write_state
     print_summary
@@ -2995,7 +2963,7 @@ main() {
 
   maybe_add_path
   maybe_install_completions
-  configure_agent_hooks
+  cleanup_legacy_agent_settings
   install_agent_skills
   write_state
   INSTALL_COMMITTED=1

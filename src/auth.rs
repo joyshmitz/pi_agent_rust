@@ -3,8 +3,9 @@
 //! Auth file: ~/.pi/agent/auth.json
 
 use crate::agent_cx::AgentCx;
+use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::provider_metadata::{canonical_provider_id, provider_auth_env_keys};
+use crate::provider_metadata::{canonical_provider_id, provider_auth_env_keys, provider_metadata};
 use asupersync::channel::oneshot;
 use base64::Engine as _;
 use fs4::fs_std::FileExt;
@@ -13,9 +14,21 @@ use sha2::Digest as _;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use tempfile::NamedTempFile;
+
+fn finish_auth_task<T, E>(
+    handle: std::thread::JoinHandle<()>,
+    recv_result: std::result::Result<Result<T>, E>,
+    cancelled_message: &'static str,
+) -> Result<T> {
+    if let Err(panic_payload) = handle.join() {
+        std::panic::resume_unwind(panic_payload);
+    }
+    recv_result.map_err(|_| Error::auth(cancelled_message.to_string()))?
+}
 
 const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const ANTHROPIC_OAUTH_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
@@ -54,6 +67,10 @@ const GOOGLE_ANTIGRAVITY_PROJECT_DISCOVERY_ENDPOINTS: [&str; 2] = [
     "https://daily-cloudcode-pa.sandbox.googleapis.com",
 ];
 
+/// Internal marker used to preserve OAuth-vs-API-key lane information when
+/// passing Anthropic credentials through provider-agnostic key plumbing.
+const ANTHROPIC_OAUTH_BEARER_MARKER: &str = "__pi_anthropic_oauth_bearer__:";
+
 // ── GitHub / Copilot OAuth constants ──────────────────────────────
 const GITHUB_OAUTH_AUTHORIZE_URL: &str = "https://github.com/login/oauth/authorize";
 const GITHUB_OAUTH_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
@@ -67,6 +84,14 @@ const GITLAB_OAUTH_TOKEN_PATH: &str = "/oauth/token";
 const GITLAB_DEFAULT_BASE_URL: &str = "https://gitlab.com";
 /// Default scopes for GitLab AI features.
 const GITLAB_DEFAULT_SCOPES: &str = "api read_api read_user";
+
+// ── Kimi Code OAuth constants ─────────────────────────────────────
+const KIMI_CODE_OAUTH_CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
+const KIMI_CODE_OAUTH_DEFAULT_HOST: &str = "https://auth.kimi.com";
+const KIMI_CODE_OAUTH_HOST_ENV_KEYS: [&str; 2] = ["KIMI_CODE_OAUTH_HOST", "KIMI_OAUTH_HOST"];
+const KIMI_SHARE_DIR_ENV_KEY: &str = "KIMI_SHARE_DIR";
+const KIMI_CODE_DEVICE_AUTHORIZATION_PATH: &str = "/api/oauth/device_authorization";
+const KIMI_CODE_TOKEN_PATH: &str = "/api/oauth/token";
 
 /// Credentials stored in auth.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +142,10 @@ pub enum AuthCredential {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         service_url: Option<String>,
     },
+    /// Preserves malformed or legacy credential entries during migration/saving
+    /// so that we don't drop them if the schema evolves.
+    #[serde(untagged)]
+    Unknown(serde_json::Value),
 }
 
 /// Canonical credential status for a provider in auth.json.
@@ -142,6 +171,12 @@ pub struct AuthFile {
     pub entries: HashMap<String, AuthCredential>,
 }
 
+#[derive(Serialize)]
+struct AuthFileRef<'a> {
+    #[serde(flatten)]
+    entries: &'a HashMap<String, AuthCredential>,
+}
+
 /// Auth storage wrapper with file locking.
 #[derive(Debug, Clone)]
 pub struct AuthStorage {
@@ -150,21 +185,61 @@ pub struct AuthStorage {
 }
 
 impl AuthStorage {
+    fn allow_external_provider_lookup(&self) -> bool {
+        // External credential auto-detection is intended for Pi's global auth
+        // file (typically `~/.pi/agent/auth.json`). Scoping it this way keeps
+        // tests and custom auth sandboxes deterministic.
+        self.path == Config::auth_path()
+    }
+
+    fn entry_case_insensitive(&self, key: &str) -> Option<&AuthCredential> {
+        self.entries.iter().find_map(|(existing, credential)| {
+            existing.eq_ignore_ascii_case(key).then_some(credential)
+        })
+    }
+
+    fn credential_for_provider(&self, provider: &str) -> Option<&AuthCredential> {
+        if let Some(credential) = self
+            .entries
+            .get(provider)
+            .or_else(|| self.entry_case_insensitive(provider))
+        {
+            return Some(credential);
+        }
+
+        let metadata = provider_metadata(provider)?;
+        if let Some(credential) = self
+            .entries
+            .get(metadata.canonical_id)
+            .or_else(|| self.entry_case_insensitive(metadata.canonical_id))
+        {
+            return Some(credential);
+        }
+
+        metadata.aliases.iter().find_map(|alias| {
+            self.entries
+                .get(*alias)
+                .or_else(|| self.entry_case_insensitive(alias))
+        })
+    }
+
     /// Load auth.json (creates empty if missing).
     pub fn load(path: PathBuf) -> Result<Self> {
         let entries = if path.exists() {
-            let file = File::open(&path).map_err(|e| Error::auth(format!("auth.json: {e}")))?;
-            let mut locked = lock_file(file, Duration::from_secs(30))?;
-            // Read from the locked file handle, not a new handle
-            let mut content = String::new();
-            locked.as_file_mut().read_to_string(&mut content)?;
+            let lock_handle = open_auth_lock_file(&path)?;
+            let _locked = lock_file_shared(lock_handle, Duration::from_secs(30))?;
+            let content =
+                fs::read_to_string(&path).map_err(|e| Error::auth(format!("auth.json: {e}")))?;
             let parsed: AuthFile = match serde_json::from_str(&content) {
                 Ok(file) => file,
                 Err(e) => {
+                    let backup_path = path.with_extension("json.corrupt");
+                    let _ = fs::copy(&path, &backup_path);
                     tracing::warn!(
                         event = "pi.auth.parse_error",
                         error = %e,
-                        "auth.json is corrupted; starting with empty credentials"
+                        backup = %backup_path.display(),
+                        "auth.json is corrupted; backed up and starting with empty credentials"
                     );
                     AuthFile::default()
                 }
@@ -180,70 +255,77 @@ impl AuthStorage {
     /// Load auth.json asynchronously (creates empty if missing).
     pub async fn load_async(path: PathBuf) -> Result<Self> {
         let (tx, rx) = oneshot::channel();
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let res = Self::load(path);
             let cx = AgentCx::for_request();
             let _ = tx.send(cx.cx(), res);
         });
 
         let cx = AgentCx::for_request();
-        rx.recv(cx.cx())
-            .await
-            .map_err(|_| Error::auth("Load task cancelled".to_string()))?
+        let recv_result = rx.recv(cx.cx()).await;
+        finish_auth_task(handle, recv_result, "Load task cancelled")
     }
 
     /// Persist auth.json (atomic write + permissions).
     pub fn save(&self) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.path)?;
-        let mut locked = lock_file(file, Duration::from_secs(30))?;
-
-        let data = serde_json::to_string_pretty(&AuthFile {
-            entries: self.entries.clone(),
+        let data = serde_json::to_string_pretty(&AuthFileRef {
+            entries: &self.entries,
         })?;
-
-        // Write to the locked file handle, not a new handle
-        let f = locked.as_file_mut();
-        f.seek(SeekFrom::Start(0))?;
-        f.set_len(0)?; // Truncate after seeking to avoid data loss
-        f.write_all(data.as_bytes())?;
-        f.flush()?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = fs::Permissions::from_mode(0o600);
-            fs::set_permissions(&self.path, perms)?;
-        }
-
-        Ok(())
+        Self::save_data_sync(&self.path, &data)
     }
 
     /// Persist auth.json asynchronously.
     pub async fn save_async(&self) -> Result<()> {
+        let data = serde_json::to_string_pretty(&AuthFileRef {
+            entries: &self.entries,
+        })?;
         let (tx, rx) = oneshot::channel();
-        let this = self.clone();
+        let path = self.path.clone();
 
-        std::thread::spawn(move || {
-            let res = this.save();
+        let handle = std::thread::spawn(move || {
+            let res = Self::save_data_sync(&path, &data);
             let cx = AgentCx::for_request();
             let _ = tx.send(cx.cx(), res);
         });
 
         let cx = AgentCx::for_request();
-        rx.recv(cx.cx())
-            .await
-            .map_err(|_| Error::auth("Save task cancelled".to_string()))?
+        let recv_result = rx.recv(cx.cx()).await;
+        finish_auth_task(handle, recv_result, "Save task cancelled")
     }
 
+    fn save_data_sync(path: &Path, data: &str) -> Result<()> {
+        Self::save_data_sync_with_hook(path, data, |_| Ok(()))
+    }
+
+    fn save_data_sync_with_hook<F>(path: &Path, data: &str, before_persist: F) -> Result<()>
+    where
+        F: FnOnce(&NamedTempFile) -> std::io::Result<()>,
+    {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let lock_handle = open_auth_lock_file(path)?;
+        let _locked = lock_file(lock_handle, Duration::from_secs(30))?;
+
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut temp = NamedTempFile::new_in(parent)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            temp.as_file()
+                .set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+
+        temp.write_all(data.as_bytes())?;
+        temp.as_file().sync_all()?;
+        before_persist(&temp)?;
+        temp.persist(path).map_err(|err| err.error)?;
+        sync_parent_dir(path)?;
+
+        Ok(())
+    }
     /// Get raw credential.
     pub fn get(&self, provider: &str) -> Option<&AuthCredential> {
         self.entries.get(provider)
@@ -267,26 +349,8 @@ impl AuthStorage {
     /// credential set should use [`get`] instead).
     /// For `ServiceKey` this returns `None` because a token exchange is required first.
     pub fn api_key(&self, provider: &str) -> Option<String> {
-        match self.entries.get(provider) {
-            Some(AuthCredential::ApiKey { key }) => Some(key.clone()),
-            Some(AuthCredential::OAuth {
-                access_token,
-                expires,
-                ..
-            }) => {
-                let now = chrono::Utc::now().timestamp_millis();
-                if *expires > now {
-                    Some(access_token.clone())
-                } else {
-                    None
-                }
-            }
-            Some(AuthCredential::BearerToken { token }) => Some(token.clone()),
-            Some(AuthCredential::AwsCredentials { access_key_id, .. }) => {
-                Some(access_key_id.clone())
-            }
-            Some(AuthCredential::ServiceKey { .. }) | None => None,
-        }
+        self.credential_for_provider(provider)
+            .and_then(api_key_from_credential)
     }
 
     /// Return the names of all providers that have stored credentials.
@@ -299,14 +363,12 @@ impl AuthStorage {
     /// Return stored credential status for a provider, including canonical alias fallback.
     pub fn credential_status(&self, provider: &str) -> CredentialStatus {
         let now = chrono::Utc::now().timestamp_millis();
-        let canonical = canonical_provider_id(provider);
-        let cred = self
-            .entries
-            .get(provider)
-            .or_else(|| canonical.and_then(|id| self.entries.get(id)));
+        let cred = self.credential_for_provider(provider);
 
         let Some(cred) = cred else {
-            return if resolve_external_provider_api_key(provider).is_some() {
+            return if self.allow_external_provider_lookup()
+                && resolve_external_provider_api_key(provider).is_some()
+            {
                 CredentialStatus::ApiKey
             } else {
                 CredentialStatus::Missing
@@ -326,21 +388,57 @@ impl AuthStorage {
             AuthCredential::BearerToken { .. } => CredentialStatus::BearerToken,
             AuthCredential::AwsCredentials { .. } => CredentialStatus::AwsCredentials,
             AuthCredential::ServiceKey { .. } => CredentialStatus::ServiceKey,
+            AuthCredential::Unknown(_) => CredentialStatus::Missing,
         }
+    }
+
+    /// Remove stored credentials for `provider` and any known aliases/canonical IDs.
+    ///
+    /// Matching is case-insensitive to clean up legacy mixed-case auth entries.
+    pub fn remove_provider_aliases(&mut self, provider: &str) -> bool {
+        let trimmed = provider.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        let mut targets: Vec<String> = vec![trimmed.to_ascii_lowercase()];
+        if let Some(metadata) = provider_metadata(trimmed) {
+            targets.push(metadata.canonical_id.to_ascii_lowercase());
+            targets.extend(
+                metadata
+                    .aliases
+                    .iter()
+                    .map(|alias| alias.to_ascii_lowercase()),
+            );
+        }
+        targets.sort();
+        targets.dedup();
+
+        let mut removed = false;
+        self.entries.retain(|key, _| {
+            let should_remove = targets
+                .iter()
+                .any(|target| key.eq_ignore_ascii_case(target));
+            if should_remove {
+                removed = true;
+            }
+            !should_remove
+        });
+        removed
     }
 
     /// Returns true when auth.json contains a credential for `provider`
     /// (including canonical alias fallback).
     pub fn has_stored_credential(&self, provider: &str) -> bool {
-        self.entries.contains_key(provider)
-            || canonical_provider_id(provider)
-                .filter(|canonical| *canonical != provider)
-                .is_some_and(|canonical| self.entries.contains_key(canonical))
+        self.credential_for_provider(provider).is_some()
     }
 
     /// Return a human-readable source label when credentials can be auto-detected
     /// from other locally-installed coding CLIs.
     pub fn external_setup_source(&self, provider: &str) -> Option<&'static str> {
+        if !self.allow_external_provider_lookup() {
+            return None;
+        }
         external_setup_source(provider)
     }
 
@@ -362,6 +460,25 @@ impl AuthStorage {
             return Some(key.to_string());
         }
 
+        // Prefer explicit stored OAuth/Bearer credentials over ambient env vars.
+        // This prevents stale shell env keys from silently overriding successful `/login` flows.
+        if let Some(credential) = self.credential_for_provider(provider)
+            && let Some(key) = match credential {
+                AuthCredential::OAuth { .. }
+                    if canonical_provider_id(provider).unwrap_or(provider) == "anthropic" =>
+                {
+                    api_key_from_credential(credential)
+                        .map(|token| mark_anthropic_oauth_bearer_token(&token))
+                }
+                AuthCredential::OAuth { .. } | AuthCredential::BearerToken { .. } => {
+                    api_key_from_credential(credential)
+                }
+                _ => None,
+            }
+        {
+            return Some(key);
+        }
+
         if let Some(key) = env_keys_for_provider(provider).iter().find_map(|var| {
             env_lookup(var).and_then(|value| {
                 let trimmed = value.trim();
@@ -379,15 +496,20 @@ impl AuthStorage {
             return Some(key);
         }
 
-        if let Some(key) = resolve_external_provider_api_key(provider) {
-            return Some(key);
+        if self.allow_external_provider_lookup() {
+            if let Some(key) = resolve_external_provider_api_key(provider) {
+                return Some(key);
+            }
         }
 
         canonical_provider_id(provider)
             .filter(|canonical| *canonical != provider)
             .and_then(|canonical| {
-                self.api_key(canonical)
-                    .or_else(|| resolve_external_provider_api_key(canonical))
+                self.api_key(canonical).or_else(|| {
+                    self.allow_external_provider_lookup()
+                        .then(|| resolve_external_provider_api_key(canonical))
+                        .flatten()
+                })
             })
     }
 
@@ -404,6 +526,7 @@ impl AuthStorage {
     ///
     /// This is primarily intended for tests and deterministic harnesses (e.g. VCR playback),
     /// but is also useful for callers that want to supply a custom HTTP implementation.
+    #[allow(clippy::too_many_lines)]
     pub async fn refresh_expired_oauth_tokens_with_client(
         &mut self,
         client: &crate::http::client::Client,
@@ -437,6 +560,7 @@ impl AuthStorage {
         }
 
         let mut failed_providers = Vec::new();
+        let mut needs_save = false;
 
         for (provider, access_token, refresh_token, stored_token_url, stored_client_id) in refreshes
         {
@@ -474,6 +598,17 @@ impl AuthStorage {
                     ))
                     .await
                 }
+                "kimi-for-coding" => {
+                    let token_url = stored_token_url
+                        .clone()
+                        .unwrap_or_else(kimi_code_token_endpoint);
+                    Box::pin(refresh_kimi_code_oauth_token(
+                        client,
+                        &token_url,
+                        &refresh_token,
+                    ))
+                    .await
+                }
                 _ => {
                     if let (Some(url), Some(cid)) = (&stored_token_url, &stored_client_id) {
                         Box::pin(refresh_self_contained_oauth_token(
@@ -493,16 +628,19 @@ impl AuthStorage {
 
             match result {
                 Ok(refreshed) => {
-                    let name = provider.clone();
                     self.entries.insert(provider, refreshed);
-                    if let Err(e) = self.save_async().await {
-                        tracing::warn!("Failed to save auth.json after refreshing {name}: {e}");
-                    }
+                    needs_save = true;
                 }
                 Err(e) => {
                     tracing::warn!("Failed to refresh OAuth token for {provider}: {e}");
-                    failed_providers.push(provider);
+                    failed_providers.push(format!("{provider} ({e})"));
                 }
+            }
+        }
+
+        if needs_save {
+            if let Err(e) = self.save_async().await {
+                tracing::warn!("Failed to save auth.json after refreshing OAuth tokens: {e}");
             }
         }
 
@@ -544,7 +682,11 @@ impl AuthStorage {
                 // Skip built-in providers (handled by refresh_expired_oauth_tokens_with_client).
                 if matches!(
                     provider.as_str(),
-                    "anthropic" | "openai-codex" | "google-gemini-cli" | "google-antigravity"
+                    "anthropic"
+                        | "openai-codex"
+                        | "google-gemini-cli"
+                        | "google-antigravity"
+                        | "kimi-for-coding"
                 ) {
                     continue;
                 }
@@ -569,6 +711,8 @@ impl AuthStorage {
             );
         }
         let mut failed_providers: Vec<String> = Vec::new();
+        let mut needs_save = false;
+
         for (provider, refresh_token, config) in refreshes {
             let start = std::time::Instant::now();
             match refresh_extension_oauth_token(client, &config, &refresh_token).await {
@@ -580,7 +724,7 @@ impl AuthStorage {
                         "Extension OAuth token refreshed"
                     );
                     self.entries.insert(provider, refreshed);
-                    self.save_async().await?;
+                    needs_save = true;
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -590,10 +734,19 @@ impl AuthStorage {
                         elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
                         "Failed to refresh extension OAuth token; continuing with remaining providers"
                     );
-                    failed_providers.push(provider);
+                    failed_providers.push(format!("{provider} ({e})"));
                 }
             }
         }
+
+        if needs_save {
+            if let Err(e) = self.save_async().await {
+                tracing::warn!(
+                    "Failed to save auth.json after refreshing extension OAuth tokens: {e}"
+                );
+            }
+        }
+
         if failed_providers.is_empty() {
             Ok(())
         } else {
@@ -642,8 +795,37 @@ impl AuthStorage {
     }
 }
 
+fn api_key_from_credential(credential: &AuthCredential) -> Option<String> {
+    match credential {
+        AuthCredential::ApiKey { key } => Some(key.clone()),
+        AuthCredential::OAuth {
+            access_token,
+            expires,
+            ..
+        } => {
+            let now = chrono::Utc::now().timestamp_millis();
+            if *expires > now {
+                Some(access_token.clone())
+            } else {
+                None
+            }
+        }
+        AuthCredential::BearerToken { token } => Some(token.clone()),
+        AuthCredential::AwsCredentials { access_key_id, .. } => Some(access_key_id.clone()),
+        AuthCredential::ServiceKey { .. } | AuthCredential::Unknown(_) => None,
+    }
+}
+
 fn env_key_for_provider(provider: &str) -> Option<&'static str> {
     env_keys_for_provider(provider).first().copied()
+}
+
+fn mark_anthropic_oauth_bearer_token(token: &str) -> String {
+    format!("{ANTHROPIC_OAUTH_BEARER_MARKER}{token}")
+}
+
+pub(crate) fn unmark_anthropic_oauth_bearer_token(token: &str) -> Option<&str> {
+    token.strip_prefix(ANTHROPIC_OAUTH_BEARER_MARKER)
 }
 
 fn env_keys_for_provider(provider: &str) -> &'static [&'static str] {
@@ -653,11 +835,15 @@ fn env_keys_for_provider(provider: &str) -> &'static [&'static str] {
 fn resolve_external_provider_api_key(provider: &str) -> Option<String> {
     let canonical = canonical_provider_id(provider).unwrap_or(provider);
     match canonical {
-        "anthropic" => read_external_claude_access_token(),
-        "openai" => read_external_codex_openai_api_key().or_else(read_external_codex_access_token),
+        "anthropic" => read_external_claude_access_token()
+            .map(|token| mark_anthropic_oauth_bearer_token(&token)),
+        // Keep OpenAI API-key auth distinct from Codex OAuth token auth.
+        // Codex access tokens are only valid on Codex-specific routes.
+        "openai" => read_external_codex_openai_api_key(),
         "openai-codex" => read_external_codex_access_token(),
         "google-gemini-cli" => {
-            let project = google_project_id_from_env();
+            let project =
+                google_project_id_from_env().or_else(google_project_id_from_gcloud_config);
             read_external_gemini_access_payload(project.as_deref())
         }
         "google-antigravity" => {
@@ -665,6 +851,7 @@ fn resolve_external_provider_api_key(provider: &str) -> Option<String> {
                 .unwrap_or_else(|| GOOGLE_ANTIGRAVITY_DEFAULT_PROJECT_ID.to_string());
             read_external_gemini_access_payload(Some(project.as_str()))
         }
+        "kimi-for-coding" => read_external_kimi_code_access_token(),
         _ => None,
     }
 }
@@ -677,12 +864,31 @@ pub fn external_setup_source(provider: &str) -> Option<&'static str> {
         "anthropic" if read_external_claude_access_token().is_some() => {
             Some("Claude Code (~/.claude/.credentials.json)")
         }
+        "openai" if read_external_codex_openai_api_key().is_some() => {
+            Some("Codex (~/.codex/auth.json)")
+        }
         "openai-codex" if read_external_codex_access_token().is_some() => {
             Some("Codex (~/.codex/auth.json)")
         }
-        "google-gemini-cli" if read_external_gemini_access_payload(None).is_some() => {
-            Some("Gemini CLI (~/.gemini/oauth_creds.json)")
+        "google-gemini-cli" => {
+            let project =
+                google_project_id_from_env().or_else(google_project_id_from_gcloud_config);
+            read_external_gemini_access_payload(project.as_deref())
+                .is_some()
+                .then_some("Gemini CLI (~/.gemini/oauth_creds.json)")
         }
+        "google-antigravity" => {
+            let project = google_project_id_from_env()
+                .unwrap_or_else(|| GOOGLE_ANTIGRAVITY_DEFAULT_PROJECT_ID.to_string());
+            if read_external_gemini_access_payload(Some(project.as_str())).is_some() {
+                Some("Gemini CLI (~/.gemini/oauth_creds.json)")
+            } else {
+                None
+            }
+        }
+        "kimi-for-coding" if read_external_kimi_code_access_token().is_some() => Some(
+            "Kimi CLI (~/.kimi/credentials/kimi-code.json or $KIMI_SHARE_DIR/credentials/kimi-code.json)",
+        ),
         _ => None,
     }
 }
@@ -693,8 +899,7 @@ fn read_external_json(path: &Path) -> Option<serde_json::Value> {
 }
 
 fn read_external_claude_access_token() -> Option<String> {
-    let home = std::env::var_os("HOME")?;
-    let path = Path::new(&home).join(".claude").join(".credentials.json");
+    let path = home_dir()?.join(".claude").join(".credentials.json");
     let value = read_external_json(&path)?;
     let token = value
         .get("claudeAiOauth")
@@ -706,40 +911,95 @@ fn read_external_claude_access_token() -> Option<String> {
 }
 
 fn read_external_codex_auth() -> Option<serde_json::Value> {
-    let home = std::env::var_os("HOME")?;
-    let path = Path::new(&home).join(".codex").join("auth.json");
-    read_external_json(&path)
+    let home = home_dir()?;
+    let candidates = [
+        home.join(".codex").join("auth.json"),
+        home.join(".config").join("codex").join("auth.json"),
+    ];
+    for path in candidates {
+        if let Some(value) = read_external_json(&path) {
+            return Some(value);
+        }
+    }
+    None
 }
 
 fn read_external_codex_access_token() -> Option<String> {
     let value = read_external_codex_auth()?;
-    let token = value
-        .get("tokens")
-        .and_then(|tokens| tokens.get("access_token"))
-        .and_then(serde_json::Value::as_str)?
-        .trim()
-        .to_string();
-    if token.is_empty() { None } else { Some(token) }
+    codex_access_token_from_value(&value)
 }
 
 fn read_external_codex_openai_api_key() -> Option<String> {
     let value = read_external_codex_auth()?;
-    let key = value
-        .get("OPENAI_API_KEY")
-        .and_then(serde_json::Value::as_str)?
-        .trim()
-        .to_string();
-    if key.is_empty() { None } else { Some(key) }
+    codex_openai_api_key_from_value(&value)
+}
+
+fn codex_access_token_from_value(value: &serde_json::Value) -> Option<String> {
+    let candidates = [
+        // Canonical codex CLI shape.
+        value
+            .get("tokens")
+            .and_then(|tokens| tokens.get("access_token"))
+            .and_then(serde_json::Value::as_str),
+        // CamelCase variant.
+        value
+            .get("tokens")
+            .and_then(|tokens| tokens.get("accessToken"))
+            .and_then(serde_json::Value::as_str),
+        // Flat variants.
+        value
+            .get("access_token")
+            .and_then(serde_json::Value::as_str),
+        value.get("accessToken").and_then(serde_json::Value::as_str),
+        value.get("token").and_then(serde_json::Value::as_str),
+    ];
+
+    candidates
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|token| !token.is_empty() && !token.starts_with("sk-"))
+        .map(std::string::ToString::to_string)
+}
+
+fn codex_openai_api_key_from_value(value: &serde_json::Value) -> Option<String> {
+    let candidates = [
+        value
+            .get("OPENAI_API_KEY")
+            .and_then(serde_json::Value::as_str),
+        value
+            .get("openai_api_key")
+            .and_then(serde_json::Value::as_str),
+        value
+            .get("openaiApiKey")
+            .and_then(serde_json::Value::as_str),
+        value
+            .get("env")
+            .and_then(|env| env.get("OPENAI_API_KEY"))
+            .and_then(serde_json::Value::as_str),
+        value
+            .get("env")
+            .and_then(|env| env.get("openai_api_key"))
+            .and_then(serde_json::Value::as_str),
+        value
+            .get("env")
+            .and_then(|env| env.get("openaiApiKey"))
+            .and_then(serde_json::Value::as_str),
+    ];
+
+    candidates
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|key| !key.is_empty())
+        .map(std::string::ToString::to_string)
 }
 
 fn read_external_gemini_access_payload(project_id: Option<&str>) -> Option<String> {
-    let home = std::env::var_os("HOME")?;
+    let home = home_dir()?;
     let candidates = [
-        Path::new(&home).join(".gemini").join("oauth_creds.json"),
-        Path::new(&home)
-            .join(".config")
-            .join("gemini")
-            .join("credentials.json"),
+        home.join(".gemini").join("oauth_creds.json"),
+        home.join(".config").join("gemini").join("credentials.json"),
     ];
 
     for path in candidates {
@@ -766,12 +1026,46 @@ fn read_external_gemini_access_payload(project_id: Option<&str>) -> Option<Strin
                     .filter(|s| !s.is_empty())
                     .map(std::string::ToString::to_string)
             })
-            .unwrap_or_else(|| "default-project".to_string());
+            .or_else(google_project_id_from_gcloud_config)?;
+        let project = project.trim();
+        if project.is_empty() {
+            continue;
+        }
 
-        return Some(encode_project_scoped_access_token(token, &project));
+        return Some(encode_project_scoped_access_token(token, project));
     }
 
     None
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn read_external_kimi_code_access_token() -> Option<String> {
+    let share_dir = kimi_share_dir()?;
+    read_external_kimi_code_access_token_from_share_dir(&share_dir)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn read_external_kimi_code_access_token_from_share_dir(share_dir: &Path) -> Option<String> {
+    let path = share_dir.join("credentials").join("kimi-code.json");
+    let value = read_external_json(&path)?;
+
+    let token = value
+        .get("access_token")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty())?;
+
+    let expires_at = value
+        .get("expires_at")
+        .and_then(|raw| raw.as_f64().or_else(|| raw.as_i64().map(|v| v as f64)));
+    if let Some(expires_at) = expires_at {
+        let now_seconds = chrono::Utc::now().timestamp() as f64;
+        if expires_at <= now_seconds {
+            return None;
+        }
+    }
+
+    Some(token.to_string())
 }
 
 fn google_project_id_from_env() -> Option<String> {
@@ -780,6 +1074,93 @@ fn google_project_id_from_env() -> Option<String> {
         .or_else(|| std::env::var("GOOGLE_CLOUD_PROJECT_ID").ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn gcloud_config_dir_with_env_lookup<F>(env_lookup: F) -> Option<PathBuf>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    env_lookup("CLOUDSDK_CONFIG")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env_lookup("APPDATA")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(|value| PathBuf::from(value).join("gcloud"))
+        })
+        .or_else(|| {
+            env_lookup("XDG_CONFIG_HOME")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(|value| PathBuf::from(value).join("gcloud"))
+        })
+        .or_else(|| {
+            home_dir_with_env_lookup(env_lookup).map(|home| home.join(".config").join("gcloud"))
+        })
+}
+
+fn gcloud_active_config_name_with_env_lookup<F>(env_lookup: F) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    env_lookup("CLOUDSDK_ACTIVE_CONFIG_NAME")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "default".to_string())
+}
+
+fn google_project_id_from_gcloud_config_with_env_lookup<F>(env_lookup: F) -> Option<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let config_dir = gcloud_config_dir_with_env_lookup(&env_lookup)?;
+    let config_name = gcloud_active_config_name_with_env_lookup(&env_lookup);
+    let config_file = config_dir
+        .join("configurations")
+        .join(format!("config_{config_name}"));
+    let Ok(content) = std::fs::read_to_string(config_file) else {
+        return None;
+    };
+
+    let mut section: Option<&str> = None;
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+
+        if let Some(rest) = line
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            section = Some(rest.trim());
+            continue;
+        }
+
+        if section != Some("core") {
+            continue;
+        }
+
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "project" {
+            continue;
+        }
+        let project = value.trim();
+        if project.is_empty() {
+            continue;
+        }
+        return Some(project.to_string());
+    }
+
+    None
+}
+
+fn google_project_id_from_gcloud_config() -> Option<String> {
+    google_project_id_from_gcloud_config_with_env_lookup(|key| std::env::var(key).ok())
 }
 
 fn encode_project_scoped_access_token(token: &str, project_id: &str) -> String {
@@ -880,7 +1261,7 @@ where
 
     // 3. Stored credentials in auth.json
     let provider = "amazon-bedrock";
-    match auth.get(provider) {
+    match auth.credential_for_provider(provider) {
         Some(AuthCredential::AwsCredentials {
             access_key_id,
             secret_access_key,
@@ -973,7 +1354,7 @@ where
         client_secret,
         token_url,
         service_url,
-    }) = auth.get(provider)
+    }) = auth.credential_for_provider(provider)
     {
         if let (Some(id), Some(secret), Some(turl), Some(surl)) = (
             client_id.as_ref(),
@@ -1166,12 +1547,236 @@ fn is_sensitive_json_key(key: &str) -> bool {
         || normalized.contains("authorization")
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct OAuthStartInfo {
     pub provider: String,
     pub url: String,
     pub verifier: String,
     pub instructions: Option<String>,
+    /// The redirect URI used in the authorization request.
+    /// When this points to localhost, a local callback server should be started.
+    pub redirect_uri: Option<String>,
+    /// Pre-bound callback server (already listening).
+    ///
+    /// When a provider binds a random-port localhost listener at start time
+    /// (e.g. GitHub Copilot, GitLab), the server is stored here so the caller
+    /// does not need to bind a second time.  If `Some`, the caller should use
+    /// this server directly instead of calling [`start_oauth_callback_server`].
+    pub callback_server: Option<OAuthCallbackServer>,
+}
+
+// ── Local OAuth callback server ─────────────────────────────────
+
+/// Handle for a background TCP listener that receives the OAuth redirect callback.
+///
+/// When the OAuth provider redirects the browser to a `localhost` URI, this
+/// server accepts a single connection, extracts the full request URL (which
+/// contains the `code` and `state` query parameters), sends a success HTML
+/// page to the browser, and delivers the URL through the returned receiver.
+pub struct OAuthCallbackServer {
+    /// Receives the full request path+query (e.g. `/auth/callback?code=abc&state=xyz`).
+    pub rx: std::sync::mpsc::Receiver<String>,
+    /// The port the server is listening on (for logging/diagnostics).
+    pub port: u16,
+    // Note: `_handle` is kept for the thread join handle, which keeps the
+    // listener thread alive until this struct is dropped.
+    _handle: std::thread::JoinHandle<()>,
+}
+
+impl std::fmt::Debug for OAuthCallbackServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthCallbackServer")
+            .field("port", &self.port)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Start a local TCP listener on the port specified in `redirect_uri`.
+///
+/// The server accepts exactly one connection, responds with a friendly HTML page
+/// so the browser shows "You can close this tab", and sends the full callback URL
+/// through the returned `OAuthCallbackServer.rx`.
+///
+/// Returns `Err` if the redirect URI does not contain a parseable port or the
+/// port cannot be bound.
+pub fn start_oauth_callback_server(redirect_uri: &str) -> Result<OAuthCallbackServer> {
+    // Parse the port from the redirect URI (e.g. "http://localhost:1455/auth/callback").
+    let port = parse_port_from_uri(redirect_uri).ok_or_else(|| {
+        Error::auth(format!(
+            "Cannot parse port from OAuth redirect URI: {redirect_uri}"
+        ))
+    })?;
+
+    let listener = std::net::TcpListener::bind(format!("127.0.0.1:{port}")).map_err(|e| {
+        Error::auth(format!(
+            "Failed to bind OAuth callback server on port {port}: {e}"
+        ))
+    })?;
+
+    // Set a generous timeout so the thread doesn't hang forever if the user
+    // cancels. The thread will exit when the listener is dropped or when a
+    // connection arrives.
+    listener
+        .set_nonblocking(false)
+        .map_err(|e| Error::auth(format!("Failed to configure callback listener: {e}")))?;
+
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+
+    let handle = std::thread::spawn(move || {
+        // Accept exactly one connection.
+        let Ok((mut stream, _addr)) = listener.accept() else {
+            return;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+
+        // Read the HTTP request (we only need the first line: `GET /path?query HTTP/1.1`).
+        let mut buf = [0u8; 4096];
+        let Ok(n) = stream.read(&mut buf) else {
+            return;
+        };
+
+        let request = String::from_utf8_lossy(&buf[..n]);
+        let request_path = request
+            .lines()
+            .next()
+            .and_then(|line| {
+                // "GET /auth/callback?code=abc&state=xyz HTTP/1.1"
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    Some(parts[1].to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+
+        // Send a friendly response so the browser shows a success page.
+        let html = r#"<!DOCTYPE html>
+<html><head><title>Pi Agent — OAuth Complete</title></head>
+<body style="font-family:system-ui,sans-serif;text-align:center;padding:60px 20px;background:#f8f9fa">
+<h1 style="color:#2d7d46">&#10003; Authorization successful</h1>
+<p>You can close this browser tab and return to Pi Agent.</p>
+</body></html>"#;
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+            html.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+
+        // Deliver the callback URL to the waiting caller.
+        let _ = tx.send(request_path);
+    });
+
+    Ok(OAuthCallbackServer {
+        rx,
+        port,
+        _handle: handle,
+    })
+}
+
+/// Extract the port number from a localhost redirect URI.
+///
+/// Supports formats like `http://localhost:1455/auth/callback` and
+/// `http://127.0.0.1:8085/oauth2callback`.
+fn parse_port_from_uri(uri: &str) -> Option<u16> {
+    // Strip scheme
+    let without_scheme = uri
+        .strip_prefix("http://")
+        .or_else(|| uri.strip_prefix("https://"))?;
+    // Take host:port part (before the path)
+    let host_port = without_scheme.split('/').next()?;
+    // Extract port after the last colon
+    let port_str = host_port.rsplit(':').next()?;
+    port_str.parse::<u16>().ok()
+}
+
+/// Returns `true` if this redirect URI points to localhost (and therefore
+/// needs a local callback server).
+pub fn redirect_uri_needs_callback_server(redirect_uri: &str) -> bool {
+    let lower = redirect_uri.to_lowercase();
+    lower.starts_with("http://localhost:") || lower.starts_with("http://127.0.0.1:")
+}
+
+/// Start a local TCP listener on a random available port and return both the
+/// callback server and the `http://localhost:{port}/callback` redirect URI.
+///
+/// This is useful for OAuth providers (like GitHub Copilot and GitLab) that
+/// accept localhost redirect URIs but don't have a fixed port pre-registered.
+/// The caller should include the returned `redirect_uri` in the authorization
+/// URL query parameters.
+pub fn start_oauth_callback_server_random_port() -> Result<(OAuthCallbackServer, String)> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| {
+        Error::auth(format!(
+            "Failed to bind OAuth callback server on random port: {e}"
+        ))
+    })?;
+
+    let port = listener.local_addr().map_err(|e| {
+        Error::auth(format!(
+            "Failed to get local address of OAuth callback listener: {e}"
+        ))
+    })?.port();
+
+    let redirect_uri = format!("http://localhost:{port}/callback");
+
+    listener
+        .set_nonblocking(false)
+        .map_err(|e| Error::auth(format!("Failed to configure callback listener: {e}")))?;
+
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+
+    let handle = std::thread::spawn(move || {
+        let Ok((mut stream, _addr)) = listener.accept() else {
+            return;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+
+        let mut buf = [0u8; 4096];
+        let Ok(n) = stream.read(&mut buf) else {
+            return;
+        };
+
+        let request = String::from_utf8_lossy(&buf[..n]);
+        let request_path = request
+            .lines()
+            .next()
+            .and_then(|line| {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    Some(parts[1].to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+
+        let html = r#"<!DOCTYPE html>
+<html><head><title>Pi Agent — OAuth Complete</title></head>
+<body style="font-family:system-ui,sans-serif;text-align:center;padding:60px 20px;background:#f8f9fa">
+<h1 style="color:#2d7d46">&#10003; Authorization successful</h1>
+<p>You can close this browser tab and return to Pi Agent.</p>
+</body></html>"#;
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+            html.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+
+        let _ = tx.send(request_path);
+    });
+
+    Ok((
+        OAuthCallbackServer {
+            rx,
+            port,
+            _handle: handle,
+        },
+        redirect_uri,
+    ))
 }
 
 // ── Device Flow (RFC 8628) ──────────────────────────────────────
@@ -1327,6 +1932,222 @@ fn build_url_with_query(base: &str, params: &[(&str, &str)]) -> String {
     url
 }
 
+fn kimi_code_oauth_host_with_env_lookup<F>(env_lookup: F) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    KIMI_CODE_OAUTH_HOST_ENV_KEYS
+        .iter()
+        .find_map(|key| {
+            env_lookup(key)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| KIMI_CODE_OAUTH_DEFAULT_HOST.to_string())
+}
+
+fn kimi_code_oauth_host() -> String {
+    kimi_code_oauth_host_with_env_lookup(|key| std::env::var(key).ok())
+}
+
+fn kimi_code_endpoint_for_host(host: &str, path: &str) -> String {
+    format!("{}{}", trim_trailing_slash(host), path)
+}
+
+fn kimi_code_token_endpoint() -> String {
+    kimi_code_endpoint_for_host(&kimi_code_oauth_host(), KIMI_CODE_TOKEN_PATH)
+}
+
+fn home_dir_with_env_lookup<F>(env_lookup: F) -> Option<PathBuf>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    env_lookup("HOME")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env_lookup("USERPROFILE")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| {
+            let drive = env_lookup("HOMEDRIVE")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())?;
+            let path = env_lookup("HOMEPATH")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())?;
+            if path.starts_with('\\') || path.starts_with('/') {
+                Some(PathBuf::from(format!("{drive}{path}")))
+            } else {
+                let mut combined = PathBuf::from(drive);
+                combined.push(path);
+                Some(combined)
+            }
+        })
+}
+
+fn home_dir() -> Option<PathBuf> {
+    home_dir_with_env_lookup(|key| std::env::var(key).ok())
+}
+
+fn kimi_share_dir_with_env_lookup<F>(env_lookup: F) -> Option<PathBuf>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    env_lookup(KIMI_SHARE_DIR_ENV_KEY)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_dir_with_env_lookup(env_lookup).map(|home| home.join(".kimi")))
+}
+
+fn kimi_share_dir() -> Option<PathBuf> {
+    kimi_share_dir_with_env_lookup(|key| std::env::var(key).ok())
+}
+
+fn sanitize_ascii_header_value(value: &str, fallback: &str) -> String {
+    if value.is_ascii() && !value.trim().is_empty() {
+        return value.to_string();
+    }
+
+    let sanitized = value
+        .chars()
+        .filter(char::is_ascii)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if sanitized.is_empty() {
+        fallback.to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn kimi_device_id_paths() -> Option<(PathBuf, PathBuf)> {
+    let primary = kimi_share_dir()?.join("device_id");
+    let legacy = home_dir().map_or_else(
+        || primary.clone(),
+        |home| home.join(".pi").join("agent").join("kimi-device-id"),
+    );
+    Some((primary, legacy))
+}
+
+fn kimi_device_id() -> String {
+    let generated = uuid::Uuid::new_v4().simple().to_string();
+    let Some((primary, legacy)) = kimi_device_id_paths() else {
+        return generated;
+    };
+
+    for path in [&primary, &legacy] {
+        if let Ok(existing) = fs::read_to_string(path) {
+            let existing = existing.trim();
+            if !existing.is_empty() {
+                return existing.to_string();
+            }
+        }
+    }
+
+    if let Some(parent) = primary.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    if let Ok(mut file) = options.open(&primary) {
+        let _ = file.write_all(generated.as_bytes());
+    }
+
+    generated
+}
+
+fn kimi_common_headers() -> Vec<(String, String)> {
+    let device_name = std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .unwrap_or_else(|| "unknown".to_string());
+    let device_model = format!("{} {}", std::env::consts::OS, std::env::consts::ARCH);
+    let os_version = std::env::consts::OS.to_string();
+
+    vec![
+        (
+            "X-Msh-Platform".to_string(),
+            sanitize_ascii_header_value("kimi_cli", "unknown"),
+        ),
+        (
+            "X-Msh-Version".to_string(),
+            sanitize_ascii_header_value(env!("CARGO_PKG_VERSION"), "unknown"),
+        ),
+        (
+            "X-Msh-Device-Name".to_string(),
+            sanitize_ascii_header_value(&device_name, "unknown"),
+        ),
+        (
+            "X-Msh-Device-Model".to_string(),
+            sanitize_ascii_header_value(&device_model, "unknown"),
+        ),
+        (
+            "X-Msh-Os-Version".to_string(),
+            sanitize_ascii_header_value(&os_version, "unknown"),
+        ),
+        (
+            "X-Msh-Device-Id".to_string(),
+            sanitize_ascii_header_value(&kimi_device_id(), "unknown"),
+        ),
+    ]
+}
+
+fn auth_lock_path(path: &Path) -> PathBuf {
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map_or_else(|| "lock".to_string(), |ext| format!("{ext}.lock"));
+    path.with_extension(extension)
+}
+
+fn open_auth_lock_file(path: &Path) -> Result<File> {
+    let lock_path = auth_lock_path(path);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut options = File::options();
+    options.read(true).write(true).create(true).truncate(false);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    options
+        .open(lock_path)
+        .map_err(|err| Error::auth(format!("auth lock file: {err}")))
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Start Anthropic OAuth by generating an authorization URL and PKCE verifier.
 pub fn start_anthropic_oauth() -> Result<OAuthStartInfo> {
     let (verifier, challenge) = generate_pkce();
@@ -1353,6 +2174,8 @@ pub fn start_anthropic_oauth() -> Result<OAuthStartInfo> {
             "Open the URL, complete login, then paste the callback URL or authorization code."
                 .to_string(),
         ),
+        redirect_uri: Some(ANTHROPIC_OAUTH_REDIRECT_URI.to_string()),
+        callback_server: None,
     })
 }
 
@@ -1365,6 +2188,9 @@ pub async fn complete_anthropic_oauth(code_input: &str, verifier: &str) -> Resul
     };
 
     let state = state.unwrap_or_else(|| verifier.to_string());
+    if state != verifier {
+        return Err(Error::auth("State mismatch".to_string()));
+    }
 
     let client = crate::http::client::Client::new();
     let request = client
@@ -1475,6 +2301,8 @@ pub fn start_openai_codex_oauth() -> Result<OAuthStartInfo> {
             "Open the URL, complete login, then paste the callback URL or authorization code."
                 .to_string(),
         ),
+        redirect_uri: Some(OPENAI_CODEX_OAUTH_REDIRECT_URI.to_string()),
+        callback_server: None,
     })
 }
 
@@ -1561,6 +2389,8 @@ pub fn start_google_gemini_cli_oauth() -> Result<OAuthStartInfo> {
             "Open the URL, complete login, then paste the callback URL or authorization code."
                 .to_string(),
         ),
+        redirect_uri: Some(GOOGLE_GEMINI_CLI_OAUTH_REDIRECT_URI.to_string()),
+        callback_server: None,
     })
 }
 
@@ -1590,6 +2420,8 @@ pub fn start_google_antigravity_oauth() -> Result<OAuthStartInfo> {
             "Open the URL, complete login, then paste the callback URL or authorization code."
                 .to_string(),
         ),
+        redirect_uri: Some(GOOGLE_ANTIGRAVITY_OAUTH_REDIRECT_URI.to_string()),
+        callback_server: None,
     })
 }
 
@@ -1911,6 +2743,181 @@ async fn refresh_google_antigravity_oauth_token(
     .await
 }
 
+/// Start Kimi Code OAuth device flow.
+pub async fn start_kimi_code_device_flow() -> Result<DeviceCodeResponse> {
+    let client = crate::http::client::Client::new();
+    start_kimi_code_device_flow_with_client(&client, &kimi_code_oauth_host()).await
+}
+
+async fn start_kimi_code_device_flow_with_client(
+    client: &crate::http::client::Client,
+    oauth_host: &str,
+) -> Result<DeviceCodeResponse> {
+    let url = kimi_code_endpoint_for_host(oauth_host, KIMI_CODE_DEVICE_AUTHORIZATION_PATH);
+    let form_body = format!(
+        "client_id={}",
+        percent_encode_component(KIMI_CODE_OAUTH_CLIENT_ID)
+    );
+    let mut request = client
+        .post(&url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
+        .body(form_body.into_bytes());
+    for (name, value) in kimi_common_headers() {
+        request = request.header(name, value);
+    }
+
+    let response = Box::pin(request.send())
+        .await
+        .map_err(|e| Error::auth(format!("Kimi device authorization request failed: {e}")))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "<failed to read body>".to_string());
+    let redacted_text = redact_known_secrets(&text, &[KIMI_CODE_OAUTH_CLIENT_ID]);
+    if !(200..300).contains(&status) {
+        return Err(Error::auth(format!(
+            "Kimi device authorization failed (HTTP {status}): {redacted_text}"
+        )));
+    }
+
+    serde_json::from_str(&text)
+        .map_err(|e| Error::auth(format!("Invalid Kimi device authorization response: {e}")))
+}
+
+/// Poll Kimi Code OAuth device flow.
+pub async fn poll_kimi_code_device_flow(device_code: &str) -> DeviceFlowPollResult {
+    let client = crate::http::client::Client::new();
+    poll_kimi_code_device_flow_with_client(&client, &kimi_code_oauth_host(), device_code).await
+}
+
+async fn poll_kimi_code_device_flow_with_client(
+    client: &crate::http::client::Client,
+    oauth_host: &str,
+    device_code: &str,
+) -> DeviceFlowPollResult {
+    let token_url = kimi_code_endpoint_for_host(oauth_host, KIMI_CODE_TOKEN_PATH);
+    let form_body = format!(
+        "client_id={}&device_code={}&grant_type={}",
+        percent_encode_component(KIMI_CODE_OAUTH_CLIENT_ID),
+        percent_encode_component(device_code),
+        percent_encode_component("urn:ietf:params:oauth:grant-type:device_code"),
+    );
+    let mut request = client
+        .post(&token_url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
+        .body(form_body.into_bytes());
+    for (name, value) in kimi_common_headers() {
+        request = request.header(name, value);
+    }
+
+    let response = match Box::pin(request.send()).await {
+        Ok(response) => response,
+        Err(err) => return DeviceFlowPollResult::Error(format!("Poll request failed: {err}")),
+    };
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "<failed to read body>".to_string());
+    let json: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(err) => {
+            return DeviceFlowPollResult::Error(format!("Invalid poll response JSON: {err}"));
+        }
+    };
+
+    if let Some(error) = json.get("error").and_then(serde_json::Value::as_str) {
+        return match error {
+            "authorization_pending" => DeviceFlowPollResult::Pending,
+            "slow_down" => DeviceFlowPollResult::SlowDown,
+            "expired_token" => DeviceFlowPollResult::Expired,
+            "access_denied" => DeviceFlowPollResult::AccessDenied,
+            other => {
+                let detail = json
+                    .get("error_description")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown error");
+                DeviceFlowPollResult::Error(format!("Kimi device flow error: {other}: {detail}"))
+            }
+        };
+    }
+
+    if !(200..300).contains(&status) {
+        return DeviceFlowPollResult::Error(format!(
+            "Kimi device flow polling failed (HTTP {status}): {}",
+            redact_known_secrets(&text, &[device_code]),
+        ));
+    }
+
+    let oauth_response: OAuthTokenResponse = match serde_json::from_value(json) {
+        Ok(response) => response,
+        Err(err) => {
+            return DeviceFlowPollResult::Error(format!(
+                "Invalid Kimi token response payload: {err}"
+            ));
+        }
+    };
+
+    DeviceFlowPollResult::Success(AuthCredential::OAuth {
+        access_token: oauth_response.access_token,
+        refresh_token: oauth_response.refresh_token,
+        expires: oauth_expires_at_ms(oauth_response.expires_in),
+        token_url: Some(token_url),
+        client_id: Some(KIMI_CODE_OAUTH_CLIENT_ID.to_string()),
+    })
+}
+
+async fn refresh_kimi_code_oauth_token(
+    client: &crate::http::client::Client,
+    token_url: &str,
+    refresh_token: &str,
+) -> Result<AuthCredential> {
+    let form_body = format!(
+        "client_id={}&grant_type=refresh_token&refresh_token={}",
+        percent_encode_component(KIMI_CODE_OAUTH_CLIENT_ID),
+        percent_encode_component(refresh_token),
+    );
+    let mut request = client
+        .post(token_url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .header("Accept", "application/json")
+        .body(form_body.into_bytes());
+    for (name, value) in kimi_common_headers() {
+        request = request.header(name, value);
+    }
+
+    let response = Box::pin(request.send())
+        .await
+        .map_err(|e| Error::auth(format!("Kimi token refresh failed: {e}")))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "<failed to read body>".to_string());
+    let redacted_text = redact_known_secrets(&text, &[refresh_token]);
+    if !(200..300).contains(&status) {
+        return Err(Error::auth(format!(
+            "Kimi token refresh failed (HTTP {status}): {redacted_text}"
+        )));
+    }
+
+    let oauth_response: OAuthRefreshTokenResponse = serde_json::from_str(&text)
+        .map_err(|e| Error::auth(format!("Invalid Kimi refresh response: {e}")))?;
+
+    Ok(AuthCredential::OAuth {
+        access_token: oauth_response.access_token,
+        refresh_token: oauth_response
+            .refresh_token
+            .unwrap_or_else(|| refresh_token.to_string()),
+        expires: oauth_expires_at_ms(oauth_response.expires_in),
+        token_url: Some(token_url.to_string()),
+        client_id: Some(KIMI_CODE_OAUTH_CLIENT_ID.to_string()),
+    })
+}
+
 /// Start OAuth for an extension-registered provider using its [`OAuthConfig`](crate::models::OAuthConfig).
 pub fn start_extension_oauth(
     provider_name: &str,
@@ -1943,6 +2950,8 @@ pub fn start_extension_oauth(
             "Open the URL, complete login, then paste the callback URL or authorization code."
                 .to_string(),
         ),
+        redirect_uri: config.redirect_uri.clone(),
+        callback_server: None,
     })
 }
 
@@ -1959,6 +2968,9 @@ pub async fn complete_extension_oauth(
     };
 
     let state = state.unwrap_or_else(|| verifier.to_string());
+    if state != verifier {
+        return Err(Error::auth("State mismatch".to_string()));
+    }
 
     let client = crate::http::client::Client::new();
 
@@ -2120,17 +3132,26 @@ pub fn start_copilot_browser_oauth(config: &CopilotOAuthConfig) -> Result<OAuthS
         )
     };
 
-    let url = build_url_with_query(
-        &auth_url,
-        &[
-            ("client_id", &config.client_id),
-            ("response_type", "code"),
-            ("scope", &config.scopes),
-            ("code_challenge", &challenge),
-            ("code_challenge_method", "S256"),
-            ("state", &verifier),
-        ],
-    );
+    // Bind a localhost callback server on a random port so the browser redirect
+    // is captured automatically (issue #22).  GitHub OAuth supports any
+    // localhost redirect URI for public OAuth Apps.
+    let callback = start_oauth_callback_server_random_port().ok();
+    let redirect_uri = callback.as_ref().map(|(_, uri)| uri.clone());
+
+    let mut params: Vec<(&str, &str)> = vec![
+        ("client_id", &config.client_id),
+        ("response_type", "code"),
+        ("scope", &config.scopes),
+        ("code_challenge", &challenge),
+        ("code_challenge_method", "S256"),
+        ("state", &verifier),
+    ];
+    let redirect_ref = redirect_uri.as_deref();
+    if let Some(uri) = redirect_ref {
+        params.push(("redirect_uri", uri));
+    }
+
+    let url = build_url_with_query(&auth_url, &params);
 
     Ok(OAuthStartInfo {
         provider: "github-copilot".to_string(),
@@ -2141,6 +3162,10 @@ pub fn start_copilot_browser_oauth(config: &CopilotOAuthConfig) -> Result<OAuthS
              then paste the callback URL or authorization code."
                 .to_string(),
         ),
+        redirect_uri,
+        // Pre-bound callback server — caller should use this instead of
+        // starting a new one (the port is already bound).
+        callback_server: callback.map(|(server, _)| server),
     })
 }
 
@@ -2149,6 +3174,7 @@ pub async fn complete_copilot_browser_oauth(
     config: &CopilotOAuthConfig,
     code_input: &str,
     verifier: &str,
+    redirect_uri: Option<&str>,
 ) -> Result<AuthCredential> {
     let (code, state) = parse_oauth_code_input(code_input);
 
@@ -2160,6 +3186,9 @@ pub async fn complete_copilot_browser_oauth(
     };
 
     let state = state.unwrap_or_else(|| verifier.to_string());
+    if state != verifier {
+        return Err(Error::auth("State mismatch".to_string()));
+    }
 
     let token_url_str = if config.github_base_url == "https://github.com" {
         GITHUB_OAUTH_TOKEN_URL.to_string()
@@ -2171,16 +3200,22 @@ pub async fn complete_copilot_browser_oauth(
     };
 
     let client = crate::http::client::Client::new();
+    let mut body = serde_json::json!({
+        "grant_type": "authorization_code",
+        "client_id": config.client_id,
+        "code": code,
+        "state": state,
+        "code_verifier": verifier,
+    });
+    // RFC 6749 §4.1.3: redirect_uri MUST be included in the token request
+    // if it was included in the authorization request.
+    if let Some(uri) = redirect_uri {
+        body["redirect_uri"] = serde_json::Value::String(uri.to_string());
+    }
     let request = client
         .post(&token_url_str)
         .header("Accept", "application/json")
-        .json(&serde_json::json!({
-            "grant_type": "authorization_code",
-            "client_id": config.client_id,
-            "code": code,
-            "state": state,
-            "code_verifier": verifier,
-        }))?;
+        .json(&body)?;
 
     let response = Box::pin(request.send())
         .await
@@ -2413,6 +3448,17 @@ pub fn start_gitlab_oauth(config: &GitLabOAuthConfig) -> Result<OAuthStartInfo> 
     let base = trim_trailing_slash(&config.base_url);
     let auth_url = format!("{base}{GITLAB_OAUTH_AUTHORIZE_PATH}");
 
+    // If no redirect_uri is configured, bind a random-port localhost callback
+    // server so the browser redirect is captured automatically (issue #22).
+    let (redirect_uri, callback_server) = if config.redirect_uri.is_some() {
+        (config.redirect_uri.clone(), None)
+    } else {
+        match start_oauth_callback_server_random_port() {
+            Ok((server, uri)) => (Some(uri), Some(server)),
+            Err(_) => (None, None),
+        }
+    };
+
     let mut params: Vec<(&str, &str)> = vec![
         ("client_id", &config.client_id),
         ("response_type", "code"),
@@ -2422,7 +3468,7 @@ pub fn start_gitlab_oauth(config: &GitLabOAuthConfig) -> Result<OAuthStartInfo> 
         ("state", &verifier),
     ];
 
-    let redirect_ref = config.redirect_uri.as_deref();
+    let redirect_ref = redirect_uri.as_deref();
     if let Some(uri) = redirect_ref {
         params.push(("redirect_uri", uri));
     }
@@ -2437,6 +3483,8 @@ pub fn start_gitlab_oauth(config: &GitLabOAuthConfig) -> Result<OAuthStartInfo> 
             "Open the URL to authorize GitLab access on {base}, \
              then paste the callback URL or authorization code."
         )),
+        redirect_uri,
+        callback_server,
     })
 }
 
@@ -2445,6 +3493,7 @@ pub async fn complete_gitlab_oauth(
     config: &GitLabOAuthConfig,
     code_input: &str,
     verifier: &str,
+    redirect_uri: Option<&str>,
 ) -> Result<AuthCredential> {
     let (code, state) = parse_oauth_code_input(code_input);
 
@@ -2456,6 +3505,9 @@ pub async fn complete_gitlab_oauth(
     };
 
     let state = state.unwrap_or_else(|| verifier.to_string());
+    if state != verifier {
+        return Err(Error::auth("State mismatch".to_string()));
+    }
     let base = trim_trailing_slash(&config.base_url);
     let token_url = format!("{base}{GITLAB_OAUTH_TOKEN_PATH}");
 
@@ -2469,8 +3521,8 @@ pub async fn complete_gitlab_oauth(
         "code_verifier": verifier,
     });
 
-    if let Some(ref redirect_uri) = config.redirect_uri {
-        body["redirect_uri"] = serde_json::Value::String(redirect_uri.clone());
+    if let Some(uri) = redirect_uri {
+        body["redirect_uri"] = serde_json::Value::String(uri.to_string());
     }
 
     let request = client
@@ -2636,6 +3688,35 @@ fn lock_file(file: File, timeout: Duration) -> Result<LockedFile> {
     }
 }
 
+fn lock_file_shared(file: File, timeout: Duration) -> Result<LockedFile> {
+    let start = Instant::now();
+    let mut attempt: u32 = 0;
+    loop {
+        match FileExt::try_lock_shared(&file) {
+            Ok(true) => return Ok(LockedFile { file }),
+            Ok(false) => {} // Lock held by another process exclusively, retry
+            Err(e) => {
+                return Err(Error::auth(format!("Failed to shared-lock auth file: {e}")));
+            }
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(Error::auth("Timed out waiting for auth lock".to_string()));
+        }
+
+        let base_ms: u64 = 10;
+        let cap_ms: u64 = 500;
+        let sleep_ms = base_ms
+            .checked_shl(attempt.min(5))
+            .unwrap_or(cap_ms)
+            .min(cap_ms);
+        let jitter = u64::from(start.elapsed().subsec_nanos()) % (sleep_ms / 2 + 1);
+        let delay = sleep_ms / 2 + jitter;
+        std::thread::sleep(Duration::from_millis(delay));
+        attempt = attempt.saturating_add(1);
+    }
+}
+
 /// A file handle with an exclusive lock. Unlocks on drop.
 struct LockedFile {
     file: File,
@@ -2669,6 +3750,45 @@ mod tests {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             .to_string()
+    }
+
+    #[test]
+    fn test_finish_auth_task_propagates_panic_before_cancellation() {
+        let handle = std::thread::spawn(|| -> () {
+            panic!("auth worker panic");
+        });
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<()> = finish_auth_task(handle, Err(()), "Load task cancelled");
+        }));
+
+        assert!(
+            panic.is_err(),
+            "worker panic should not be masked as cancellation"
+        );
+    }
+
+    #[test]
+    fn test_finish_auth_task_maps_nonpanic_cancellation_to_auth_error() {
+        let handle = std::thread::spawn(|| {});
+
+        let err =
+            finish_auth_task::<(), _>(handle, Err(()), "Load task cancelled").expect_err("error");
+
+        assert!(
+            err.to_string().contains("Load task cancelled"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_finish_auth_task_returns_success_payload() {
+        let handle = std::thread::spawn(|| {});
+
+        let value =
+            finish_auth_task::<usize, ()>(handle, Ok(Ok(7usize)), "task cancelled").unwrap();
+
+        assert_eq!(value, 7);
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -2720,6 +3840,60 @@ mod tests {
         });
 
         format!("http://{addr}/token")
+    }
+
+    fn spawn_oauth_host_server(status_code: u16, body: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let body = body.to_string();
+
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+
+            let mut chunk = [0_u8; 4096];
+            let _ = socket.read(&mut chunk);
+
+            let reason = match status_code {
+                400 => "Bad Request",
+                401 => "Unauthorized",
+                403 => "Forbidden",
+                500 => "Internal Server Error",
+                _ => "OK",
+            };
+            let response = format!(
+                "HTTP/1.1 {status_code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .expect("write response");
+            socket.flush().expect("flush response");
+        });
+
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn test_google_project_id_from_gcloud_config_parses_core_project() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let gcloud_dir = dir.path().join("gcloud");
+        let configs_dir = gcloud_dir.join("configurations");
+        std::fs::create_dir_all(&configs_dir).expect("mkdir configurations");
+        std::fs::write(
+            configs_dir.join("config_default"),
+            "[core]\nproject = my-proj\n",
+        )
+        .expect("write config_default");
+
+        let project = google_project_id_from_gcloud_config_with_env_lookup(|key| match key {
+            "CLOUDSDK_CONFIG" => Some(gcloud_dir.to_string_lossy().to_string()),
+            _ => None,
+        });
+
+        assert_eq!(project.as_deref(), Some("my-proj"));
     }
 
     #[test]
@@ -2943,6 +4117,62 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_api_key_prefers_stored_oauth_over_env() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        auth.set(
+            "anthropic",
+            AuthCredential::OAuth {
+                access_token: "stored-oauth-token".to_string(),
+                refresh_token: "refresh-token".to_string(),
+                expires: now + 60_000,
+                token_url: None,
+                client_id: None,
+            },
+        );
+
+        let resolved = auth.resolve_api_key_with_env_lookup("anthropic", None, |_| {
+            Some("env-api-key".to_string())
+        });
+        let token = resolved.expect("resolved anthropic oauth token");
+        assert_eq!(
+            unmark_anthropic_oauth_bearer_token(&token),
+            Some("stored-oauth-token")
+        );
+    }
+
+    #[test]
+    fn test_resolve_api_key_expired_oauth_falls_back_to_env() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+        let now = chrono::Utc::now().timestamp_millis();
+        auth.set(
+            "anthropic",
+            AuthCredential::OAuth {
+                access_token: "expired-oauth-token".to_string(),
+                refresh_token: "refresh-token".to_string(),
+                expires: now - 1_000,
+                token_url: None,
+                client_id: None,
+            },
+        );
+
+        let resolved = auth.resolve_api_key_with_env_lookup("anthropic", None, |_| {
+            Some("env-api-key".to_string())
+        });
+        assert_eq!(resolved.as_deref(), Some("env-api-key"));
+    }
+
+    #[test]
     fn test_resolve_api_key_returns_none_when_unconfigured() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let auth_path = dir.path().join("auth.json");
@@ -2951,7 +4181,8 @@ mod tests {
             entries: HashMap::new(),
         };
 
-        let resolved = auth.resolve_api_key_with_env_lookup("openai", None, |_| None);
+        let resolved =
+            auth.resolve_api_key_with_env_lookup("nonexistent-provider-for-test", None, |_| None);
         assert!(resolved.is_none());
     }
 
@@ -3020,6 +4251,17 @@ mod tests {
         let (code, state) = parse_oauth_code_input("abc");
         assert_eq!(code.as_deref(), Some("abc"));
         assert!(state.is_none());
+    }
+
+    #[test]
+    fn test_complete_anthropic_oauth_rejects_state_mismatch() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let err = complete_anthropic_oauth("abc#mismatch", "expected")
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("State mismatch"));
+        });
     }
 
     fn sample_oauth_config() -> crate::models::OAuthConfig {
@@ -3117,6 +4359,42 @@ mod tests {
     }
 
     #[test]
+    fn test_complete_extension_oauth_rejects_state_mismatch() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let config = sample_oauth_config();
+            let err = complete_extension_oauth(&config, "abc#mismatch", "expected")
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("State mismatch"));
+        });
+    }
+
+    #[test]
+    fn test_complete_copilot_browser_oauth_rejects_state_mismatch() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let config = CopilotOAuthConfig::default();
+            let err = complete_copilot_browser_oauth(&config, "abc#mismatch", "expected", None)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("State mismatch"));
+        });
+    }
+
+    #[test]
+    fn test_complete_gitlab_oauth_rejects_state_mismatch() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let config = GitLabOAuthConfig::default();
+            let err = complete_gitlab_oauth(&config, "abc#mismatch", "expected", None)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("State mismatch"));
+        });
+    }
+
+    #[test]
     fn test_refresh_expired_extension_oauth_tokens_skips_anthropic() {
         // Verify that the extension refresh method skips "anthropic" (handled separately).
         let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
@@ -3156,7 +4434,7 @@ mod tests {
                 matches!(
                     auth.entries.get("anthropic"),
                     Some(AuthCredential::OAuth { access_token, .. })
-                        if access_token == &initial_access
+                        if access_token  == &initial_access
                 ),
                 "expected OAuth credential"
             );
@@ -3202,7 +4480,7 @@ mod tests {
                 matches!(
                     auth.entries.get("my-ext"),
                     Some(AuthCredential::OAuth { access_token, .. })
-                        if access_token == &initial_access_token
+                        if access_token  == &initial_access_token
                 ),
                 "expected OAuth credential"
             );
@@ -3246,7 +4524,7 @@ mod tests {
                 matches!(
                     auth.entries.get("unknown-ext"),
                     Some(AuthCredential::OAuth { access_token, .. })
-                        if access_token == &initial_access_token
+                        if access_token  == &initial_access_token
                 ),
                 "expected OAuth credential"
             );
@@ -3329,7 +4607,7 @@ mod tests {
     fn test_refresh_extension_oauth_token_redacts_secret_in_error() {
         let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
         rt.expect("runtime").block_on(async {
-            let refresh_secret = "secret-refresh-token-123";
+            let refresh_secret  = "secret-refresh-token-123";
             let leaked_access = "leaked-access-token-456";
             let token_url = spawn_json_server(
                 401,
@@ -3581,14 +4859,14 @@ mod tests {
                     }),
                 );
             }
-            other => panic!("expected OAuthValid, got {other:?}"),
+            other => panic!(),
         }
 
         match auth.credential_status("expired-oauth") {
             CredentialStatus::OAuthExpired { expired_by_ms } => {
                 assert!(expired_by_ms > 0, "expired_by_ms should be positive");
             }
-            other => panic!("expected OAuthExpired, got {other:?}"),
+            other => panic!(),
         }
     }
 
@@ -3629,6 +4907,88 @@ mod tests {
                 "status": "Not authenticated",
             }),
         );
+    }
+
+    #[test]
+    fn test_has_stored_credential_uses_reverse_alias_lookup() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "gemini",
+            AuthCredential::ApiKey {
+                key: "legacy-gemini-key".to_string(),
+            },
+        );
+
+        assert!(auth.has_stored_credential("google"));
+        assert!(auth.has_stored_credential("gemini"));
+    }
+
+    #[test]
+    fn test_resolve_api_key_handles_case_insensitive_stored_provider_keys() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "Google",
+            AuthCredential::ApiKey {
+                key: "mixed-case-key".to_string(),
+            },
+        );
+
+        let resolved = auth.resolve_api_key_with_env_lookup("google", None, |_| None);
+        assert_eq!(resolved.as_deref(), Some("mixed-case-key"));
+    }
+
+    #[test]
+    fn test_credential_status_uses_reverse_alias_lookup() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "gemini",
+            AuthCredential::ApiKey {
+                key: "legacy-gemini-key".to_string(),
+            },
+        );
+
+        assert_eq!(auth.credential_status("google"), CredentialStatus::ApiKey);
+    }
+
+    #[test]
+    fn test_remove_provider_aliases_removes_canonical_and_alias_entries() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "google",
+            AuthCredential::ApiKey {
+                key: "google-key".to_string(),
+            },
+        );
+        auth.set(
+            "gemini",
+            AuthCredential::ApiKey {
+                key: "gemini-key".to_string(),
+            },
+        );
+
+        assert!(auth.remove_provider_aliases("google"));
+        assert!(!auth.has_stored_credential("google"));
+        assert!(!auth.has_stored_credential("gemini"));
     }
 
     #[test]
@@ -3716,7 +5076,7 @@ mod tests {
         assert!(auth.entries.contains_key("anthropic"));
         match auth.get("anthropic").expect("credential") {
             AuthCredential::ApiKey { key } => assert_eq!(key, "sk-test-abc"),
-            other => panic!("expected ApiKey, got: {other:?}"),
+            other => panic!(),
         }
     }
 
@@ -3875,6 +5235,56 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_api_key_anthropic_oauth_marks_for_bearer_lane() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "anthropic",
+            AuthCredential::OAuth {
+                access_token: "sk-ant-api-like-token".to_string(),
+                refresh_token: "refresh-token".to_string(),
+                expires: chrono::Utc::now().timestamp_millis() + 60_000,
+                token_url: None,
+                client_id: None,
+            },
+        );
+
+        let resolved = auth.resolve_api_key_with_env_lookup("anthropic", None, |_| None);
+        let token = resolved.expect("resolved anthropic oauth token");
+        assert_eq!(
+            unmark_anthropic_oauth_bearer_token(&token),
+            Some("sk-ant-api-like-token")
+        );
+    }
+
+    #[test]
+    fn test_resolve_api_key_non_anthropic_oauth_is_not_marked() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "openai-codex",
+            AuthCredential::OAuth {
+                access_token: "codex-oauth-token".to_string(),
+                refresh_token: "refresh-token".to_string(),
+                expires: chrono::Utc::now().timestamp_millis() + 60_000,
+                token_url: None,
+                client_id: None,
+            },
+        );
+
+        let resolved = auth.resolve_api_key_with_env_lookup("openai-codex", None, |_| None);
+        assert_eq!(resolved.as_deref(), Some("codex-oauth-token"));
+    }
+
+    #[test]
     fn test_resolve_api_key_google_uses_gemini_env_fallback() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let auth_path = dir.path().join("auth.json");
@@ -3915,6 +5325,25 @@ mod tests {
 
         let resolved = auth.resolve_api_key_with_env_lookup("gemini", None, |_| None);
         assert_eq!(resolved.as_deref(), Some("stored-google-key"));
+    }
+
+    #[test]
+    fn test_resolve_api_key_google_reads_legacy_gemini_alias_stored_key() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let mut auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "gemini",
+            AuthCredential::ApiKey {
+                key: "legacy-gemini-key".to_string(),
+            },
+        );
+
+        let resolved = auth.resolve_api_key_with_env_lookup("google", None, |_| None);
+        assert_eq!(resolved.as_deref(), Some("legacy-gemini-key"));
     }
 
     #[test]
@@ -4118,6 +5547,62 @@ mod tests {
         let metadata = fs::metadata(&auth_path).expect("metadata");
         let mode = metadata.permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "auth.json should be owner-only read/write");
+    }
+
+    #[test]
+    fn test_save_uses_lockfile_and_preserves_original_on_persist_failure() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+
+        let mut original = AuthStorage {
+            path: auth_path.clone(),
+            entries: HashMap::new(),
+        };
+        original.set(
+            "anthropic",
+            AuthCredential::ApiKey {
+                key: "old-key".to_string(),
+            },
+        );
+        original.save().expect("save original auth");
+
+        let lock_path = auth_lock_path(&auth_path);
+        assert!(
+            lock_path.exists(),
+            "expected sibling lockfile to be created"
+        );
+
+        let mut replacement_entries = HashMap::new();
+        replacement_entries.insert(
+            "anthropic".to_string(),
+            AuthCredential::ApiKey {
+                key: "new-key".to_string(),
+            },
+        );
+        let replacement_data = serde_json::to_string_pretty(&AuthFileRef {
+            entries: &replacement_entries,
+        })
+        .expect("serialize replacement");
+
+        let mut temp_path = None;
+        let err = AuthStorage::save_data_sync_with_hook(&auth_path, &replacement_data, |temp| {
+            temp_path = Some(temp.path().to_path_buf());
+            Err(std::io::Error::other("injected persist failure"))
+        })
+        .expect_err("persist hook should abort save");
+        assert!(
+            err.to_string().contains("injected persist failure"),
+            "unexpected error: {err}"
+        );
+
+        let temp_path = temp_path.expect("captured temp path");
+        assert!(
+            !temp_path.exists(),
+            "temporary auth file should be cleaned up on failure"
+        );
+
+        let reloaded = AuthStorage::load(auth_path).expect("reload auth");
+        assert_eq!(reloaded.api_key("anthropic").as_deref(), Some("old-key"));
     }
 
     // ── Missing key handling ──────────────────────────────────────────
@@ -4557,13 +6042,13 @@ mod tests {
 
     #[test]
     fn test_redact_known_secrets_multiple_secrets() {
-        let text = "token=aaa refresh=bbb echo=aaa";
+        let text = "token  =aaa refresh=bbb echo=aaa";
         let redacted = redact_known_secrets(text, &["aaa", "bbb"]);
         assert!(!redacted.contains("aaa"));
         assert!(!redacted.contains("bbb"));
         assert_eq!(
             redacted,
-            "token=[REDACTED] refresh=[REDACTED] echo=[REDACTED]"
+            "token  =[REDACTED] refresh=[REDACTED] echo=[REDACTED]"
         );
     }
 
@@ -4739,7 +6224,7 @@ mod tests {
                     assert_eq!(refresh_token, "ghr_test_refresh");
                     assert!(expires > chrono::Utc::now().timestamp_millis());
                 }
-                other => panic!("expected OAuth, got: {other:?}"),
+                other => panic!(),
             }
         });
     }
@@ -4759,7 +6244,7 @@ mod tests {
                 assert_eq!(access_token, "ghu_test");
                 assert!(refresh_token.is_empty(), "should default to empty");
             }
-            other => panic!("expected OAuth, got: {other:?}"),
+            other => panic!(),
         }
     }
 
@@ -4780,7 +6265,7 @@ mod tests {
                     "expected far-future expiry"
                 );
             }
-            other => panic!("expected OAuth, got: {other:?}"),
+            other => panic!(),
         }
     }
 
@@ -4859,6 +6344,181 @@ mod tests {
             };
             let err = start_copilot_device_flow(&config).await.unwrap_err();
             assert!(err.to_string().contains("client_id"));
+        });
+    }
+
+    #[test]
+    fn test_kimi_oauth_host_env_lookup_prefers_primary_host() {
+        let host = kimi_code_oauth_host_with_env_lookup(|key| match key {
+            "KIMI_CODE_OAUTH_HOST" => Some("https://primary.kimi.test".to_string()),
+            "KIMI_OAUTH_HOST" => Some("https://fallback.kimi.test".to_string()),
+            _ => None,
+        });
+        assert_eq!(host, "https://primary.kimi.test");
+    }
+
+    #[test]
+    fn test_kimi_share_dir_env_lookup_prefers_kimi_share_dir() {
+        let share_dir = kimi_share_dir_with_env_lookup(|key| match key {
+            "KIMI_SHARE_DIR" => Some("/tmp/custom-kimi-share".to_string()),
+            "HOME" => Some("/tmp/home".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            share_dir,
+            Some(PathBuf::from("/tmp/custom-kimi-share")),
+            "KIMI_SHARE_DIR should override HOME-based default"
+        );
+    }
+
+    #[test]
+    fn test_kimi_share_dir_env_lookup_falls_back_to_home() {
+        let share_dir = kimi_share_dir_with_env_lookup(|key| match key {
+            "KIMI_SHARE_DIR" => Some("   ".to_string()),
+            "HOME" => Some("/tmp/home".to_string()),
+            _ => None,
+        });
+        assert_eq!(share_dir, Some(PathBuf::from("/tmp/home/.kimi")));
+    }
+
+    #[test]
+    fn test_home_dir_env_lookup_falls_back_to_userprofile() {
+        let home = home_dir_with_env_lookup(|key| match key {
+            "HOME" => Some("   ".to_string()),
+            "USERPROFILE" => Some("C:\\Users\\tester".to_string()),
+            _ => None,
+        });
+        assert_eq!(home, Some(PathBuf::from("C:\\Users\\tester")));
+    }
+
+    #[test]
+    fn test_home_dir_env_lookup_falls_back_to_homedrive_homepath() {
+        let home = home_dir_with_env_lookup(|key| match key {
+            "HOMEDRIVE" => Some("C:".to_string()),
+            "HOMEPATH" => Some("\\Users\\tester".to_string()),
+            _ => None,
+        });
+        assert_eq!(home, Some(PathBuf::from("C:\\Users\\tester")));
+    }
+
+    #[test]
+    fn test_home_dir_env_lookup_homedrive_homepath_without_root_separator() {
+        let home = home_dir_with_env_lookup(|key| match key {
+            "HOMEDRIVE" => Some("C:".to_string()),
+            "HOMEPATH" => Some("Users\\tester".to_string()),
+            _ => None,
+        });
+        assert_eq!(home, Some(PathBuf::from("C:/Users\\tester")));
+    }
+
+    #[test]
+    fn test_read_external_kimi_code_access_token_from_share_dir_reads_unexpired_token() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let share_dir = dir.path();
+        let credentials_dir = share_dir.join("credentials");
+        std::fs::create_dir_all(&credentials_dir).expect("create credentials dir");
+        let path = credentials_dir.join("kimi-code.json");
+        let expires_at = chrono::Utc::now().timestamp() + 3600;
+        std::fs::write(
+            &path,
+            format!(r#"{{"access_token":" kimi-token ","expires_at":{expires_at}}}"#),
+        )
+        .expect("write token file");
+
+        let token = read_external_kimi_code_access_token_from_share_dir(share_dir);
+        assert_eq!(token.as_deref(), Some("kimi-token"));
+    }
+
+    #[test]
+    fn test_read_external_kimi_code_access_token_from_share_dir_ignores_expired_token() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let share_dir = dir.path();
+        let credentials_dir = share_dir.join("credentials");
+        std::fs::create_dir_all(&credentials_dir).expect("create credentials dir");
+        let path = credentials_dir.join("kimi-code.json");
+        let expires_at = chrono::Utc::now().timestamp() - 5;
+        std::fs::write(
+            &path,
+            format!(r#"{{"access_token":"kimi-token","expires_at":{expires_at}}}"#),
+        )
+        .expect("write token file");
+
+        let token = read_external_kimi_code_access_token_from_share_dir(share_dir);
+        assert!(token.is_none(), "expired Kimi token should be ignored");
+    }
+
+    #[test]
+    fn test_start_kimi_code_device_flow_parses_response() {
+        let host = spawn_oauth_host_server(
+            200,
+            r#"{
+                "device_code": "dc_test",
+                "user_code": "ABCD-1234",
+                "verification_uri": "https://auth.kimi.com/device",
+                "verification_uri_complete": "https://auth.kimi.com/device?user_code=ABCD-1234",
+                "expires_in": 900,
+                "interval": 5
+            }"#,
+        );
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let client = crate::http::client::Client::new();
+            let response = start_kimi_code_device_flow_with_client(&client, &host)
+                .await
+                .expect("start kimi device flow");
+            assert_eq!(response.device_code, "dc_test");
+            assert_eq!(response.user_code, "ABCD-1234");
+            assert_eq!(response.expires_in, 900);
+            assert_eq!(response.interval, 5);
+            assert_eq!(
+                response.verification_uri_complete.as_deref(),
+                Some("https://auth.kimi.com/device?user_code=ABCD-1234")
+            );
+        });
+    }
+
+    #[test]
+    fn test_poll_kimi_code_device_flow_success_returns_oauth_credential() {
+        let host = spawn_oauth_host_server(
+            200,
+            r#"{"access_token":"kimi-at","refresh_token":"kimi-rt","expires_in":3600}"#,
+        );
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let client = crate::http::client::Client::new();
+            let result =
+                poll_kimi_code_device_flow_with_client(&client, &host, "device-code").await;
+            match result {
+                DeviceFlowPollResult::Success(AuthCredential::OAuth {
+                    access_token,
+                    refresh_token,
+                    token_url,
+                    client_id,
+                    ..
+                }) => {
+                    let expected_token_url = format!("{host}{KIMI_CODE_TOKEN_PATH}");
+                    assert_eq!(access_token, "kimi-at");
+                    assert_eq!(refresh_token, "kimi-rt");
+                    assert_eq!(token_url.as_deref(), Some(expected_token_url.as_str()));
+                    assert_eq!(client_id.as_deref(), Some(KIMI_CODE_OAUTH_CLIENT_ID));
+                }
+                other => panic!(),
+            }
+        });
+    }
+
+    #[test]
+    fn test_poll_kimi_code_device_flow_pending_state() {
+        let host = spawn_oauth_host_server(
+            400,
+            r#"{"error":"authorization_pending","error_description":"wait"}"#,
+        );
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let client = crate::http::client::Client::new();
+            let result =
+                poll_kimi_code_device_flow_with_client(&client, &host, "device-code").await;
+            assert!(matches!(result, DeviceFlowPollResult::Pending));
         });
     }
 
@@ -4965,6 +6625,8 @@ mod tests {
 
     #[test]
     fn test_gitlab_oauth_no_redirect_uri() {
+        // When no redirect_uri is configured, a random-port localhost callback
+        // server should be auto-created so the browser redirect is captured.
         let config = GitLabOAuthConfig {
             client_id: "gl_no_redirect".to_string(),
             base_url: GITLAB_DEFAULT_BASE_URL.to_string(),
@@ -4976,9 +6638,23 @@ mod tests {
         let (_, query) = info.url.split_once('?').expect("missing query");
         let params: std::collections::HashMap<_, _> =
             parse_query_pairs(query).into_iter().collect();
+
+        // The auto-generated localhost redirect_uri should be present in the
+        // authorize URL and the callback_server should be pre-bound.
         assert!(
-            !params.contains_key("redirect_uri"),
-            "redirect_uri should be absent"
+            info.redirect_uri
+                .as_deref()
+                .is_some_and(|uri| uri.starts_with("http://localhost:")),
+            "auto-generated redirect_uri should be a localhost URL, got {:?}",
+            info.redirect_uri
+        );
+        assert!(
+            params.contains_key("redirect_uri"),
+            "redirect_uri should be included in the authorize URL"
+        );
+        assert!(
+            info.callback_server.is_some(),
+            "callback_server should be pre-bound"
         );
     }
 
@@ -5028,7 +6704,7 @@ mod tests {
                     assert_eq!(refresh_token, "glrt-test_refresh");
                     assert!(expires > chrono::Utc::now().timestamp_millis());
                 }
-                other => panic!("expected OAuth, got: {other:?}"),
+                other => panic!(),
             }
 
             // Also ensure the test server URL was consumed (not left hanging).
@@ -5144,7 +6820,7 @@ mod tests {
                 assert_eq!(session_token.as_deref(), Some("FwoGZX...session"));
                 assert_eq!(region.as_deref(), Some("us-west-2"));
             }
-            other => panic!("expected AwsCredentials, got: {other:?}"),
+            other => panic!(),
         }
     }
 
@@ -5162,7 +6838,7 @@ mod tests {
                 assert!(session_token.is_none());
                 assert!(region.is_none());
             }
-            other => panic!("expected AwsCredentials, got: {other:?}"),
+            other => panic!(),
         }
     }
 
@@ -5177,7 +6853,7 @@ mod tests {
             AuthCredential::BearerToken { token } => {
                 assert_eq!(token, "my-gateway-token-123");
             }
-            other => panic!("expected BearerToken, got: {other:?}"),
+            other => panic!(),
         }
     }
 
@@ -5206,7 +6882,7 @@ mod tests {
                 );
                 assert_eq!(service_url.as_deref(), Some("https://api.ai.sap.com"));
             }
-            other => panic!("expected ServiceKey, got: {other:?}"),
+            other => panic!(),
         }
     }
 
@@ -5226,7 +6902,7 @@ mod tests {
                 assert!(token_url.is_none());
                 assert!(service_url.is_none());
             }
-            other => panic!("expected ServiceKey, got: {other:?}"),
+            other => panic!(),
         }
     }
 
@@ -5371,7 +7047,7 @@ mod tests {
             Some(AwsResolvedCredentials::Sigv4 { region, .. }) => {
                 assert_eq!(region, "ca-central-1");
             }
-            other => panic!("expected Sigv4, got: {other:?}"),
+            other => panic!(),
         }
     }
 
@@ -5399,6 +7075,34 @@ mod tests {
                 secret_access_key: "secret_stored".to_string(),
                 session_token: None,
                 region: "us-west-2".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_aws_stored_credentials_accept_alias_and_case_insensitive_entry() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut auth = AuthStorage {
+            path: dir.path().join("auth.json"),
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "BedRock",
+            AuthCredential::AwsCredentials {
+                access_key_id: "AKIA_ALIAS".to_string(),
+                secret_access_key: "alias-secret".to_string(),
+                session_token: Some("alias-session".to_string()),
+                region: Some("eu-central-1".to_string()),
+            },
+        );
+        let result = resolve_aws_credentials_with_env(&auth, |_| -> Option<String> { None });
+        assert_eq!(
+            result,
+            Some(AwsResolvedCredentials::Sigv4 {
+                access_key_id: "AKIA_ALIAS".to_string(),
+                secret_access_key: "alias-secret".to_string(),
+                session_token: Some("alias-session".to_string()),
+                region: "eu-central-1".to_string(),
             })
         );
     }
@@ -5451,7 +7155,7 @@ mod tests {
             Some(AwsResolvedCredentials::Sigv4 { access_key_id, .. }) => {
                 assert_eq!(access_key_id, "AKIA_ENV");
             }
-            other => panic!("expected Sigv4 from env, got: {other:?}"),
+            other => panic!(),
         }
     }
 
@@ -5558,6 +7262,34 @@ mod tests {
                 client_secret: "stored-secret".to_string(),
                 token_url: "https://stored-token.sap.com".to_string(),
                 service_url: "https://stored-api.sap.com".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_sap_stored_service_key_accepts_alias_and_case_insensitive_entry() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut auth = AuthStorage {
+            path: dir.path().join("auth.json"),
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "SaP",
+            AuthCredential::ServiceKey {
+                client_id: Some("alias-id".to_string()),
+                client_secret: Some("alias-secret".to_string()),
+                token_url: Some("https://alias-token.sap.com".to_string()),
+                service_url: Some("https://alias-api.sap.com".to_string()),
+            },
+        );
+        let result = resolve_sap_credentials_with_env(&auth, |_| -> Option<String> { None });
+        assert_eq!(
+            result,
+            Some(SapResolvedCredentials {
+                client_id: "alias-id".to_string(),
+                client_secret: "alias-secret".to_string(),
+                token_url: "https://alias-token.sap.com".to_string(),
+                service_url: "https://alias-api.sap.com".to_string(),
             })
         );
     }
@@ -5770,7 +7502,7 @@ mod tests {
                 AuthCredential::OAuth { access_token, .. } => {
                     assert_eq!(access_token, "refreshed");
                 }
-                other => panic!("expected OAuth, got: {other:?}"),
+                other => panic!(),
             }
         });
     }
@@ -5808,7 +7540,7 @@ mod tests {
                 AuthCredential::OAuth { access_token, .. } => {
                     assert_eq!(access_token, "still-good");
                 }
-                other => panic!("expected OAuth, got: {other:?}"),
+                other => panic!(),
             }
         });
     }
@@ -5855,7 +7587,7 @@ mod tests {
                     assert_eq!(token_url.as_deref(), Some(server_url.as_str()));
                     assert_eq!(client_id.as_deref(), Some("Iv1.copilot-client"));
                 }
-                other => panic!("expected OAuth, got: {other:?}"),
+                other => panic!(),
             }
         });
     }
@@ -5891,7 +7623,7 @@ mod tests {
                 AuthCredential::OAuth { access_token, .. } => {
                     assert_eq!(access_token, "old-ext");
                 }
-                other => panic!("expected OAuth, got: {other:?}"),
+                other => panic!(),
             }
         });
     }
@@ -5930,7 +7662,7 @@ mod tests {
                 AuthCredential::OAuth { access_token, .. } => {
                     assert_eq!(access_token, "self-contained");
                 }
-                other => panic!("expected OAuth, got: {other:?}"),
+                other => panic!(),
             }
         });
     }
@@ -6052,7 +7784,7 @@ mod tests {
                 assert_eq!(token_url.as_deref(), Some("https://example.com/token"));
                 assert_eq!(client_id.as_deref(), Some("my-client"));
             }
-            other => panic!("expected OAuth, got: {other:?}"),
+            other => panic!(),
         }
     }
 
@@ -6085,7 +7817,41 @@ mod tests {
                 assert!(token_url.is_none());
                 assert!(client_id.is_none());
             }
-            other => panic!("expected OAuth, got: {other:?}"),
+            other => panic!(),
         }
+    }
+
+    #[test]
+    fn codex_openai_api_key_parser_ignores_oauth_access_token_only_payloads() {
+        let value = serde_json::json!({
+            "tokens": {
+                "access_token": "codex-oauth-token"
+            }
+        });
+        assert!(codex_openai_api_key_from_value(&value).is_none());
+    }
+
+    #[test]
+    fn codex_access_token_parser_reads_nested_tokens_payload() {
+        let value = serde_json::json!({
+            "tokens": {
+                "access_token": " codex-oauth-token "
+            }
+        });
+        assert_eq!(
+            codex_access_token_from_value(&value).as_deref(),
+            Some("codex-oauth-token")
+        );
+    }
+
+    #[test]
+    fn codex_openai_api_key_parser_reads_openai_api_key_field() {
+        let value = serde_json::json!({
+            "OPENAI_API_KEY": " sk-openai "
+        });
+        assert_eq!(
+            codex_openai_api_key_from_value(&value).as_deref(),
+            Some("sk-openai")
+        );
     }
 }

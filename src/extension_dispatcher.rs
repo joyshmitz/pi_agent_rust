@@ -40,6 +40,16 @@ use crate::hostcall_io_uring_lane::{
 use crate::scheduler::{Clock as SchedulerClock, HostcallOutcome, WallClock};
 use crate::tools::ToolRegistry;
 
+fn extension_wait_now() -> asupersync::types::Time {
+    Cx::current()
+        .and_then(|cx| cx.timer_driver())
+        .map_or_else(wall_now, |driver| driver.now())
+}
+
+fn extension_wait_sleep(duration: Duration) -> asupersync::time::Sleep {
+    sleep(extension_wait_now(), duration)
+}
+
 /// Coordinates hostcall dispatch between the JS extension runtime and Rust handlers.
 pub struct ExtensionDispatcher<C: SchedulerClock = WallClock> {
     /// Runtime bridge used by the dispatcher.
@@ -780,11 +790,14 @@ fn hostcall_io_hint(kind: &HostcallKind) -> HostcallIoHint {
             let name = name.trim();
             if name.eq_ignore_ascii_case("read")
                 || name.eq_ignore_ascii_case("write")
+                || name.eq_ignore_ascii_case("edit")
                 || name.eq_ignore_ascii_case("grep")
                 || name.eq_ignore_ascii_case("find")
                 || name.eq_ignore_ascii_case("ls")
             {
                 HostcallIoHint::IoHeavy
+            } else if name.eq_ignore_ascii_case("bash") {
+                HostcallIoHint::CpuBound
             } else {
                 HostcallIoHint::Unknown
             }
@@ -802,10 +815,10 @@ fn hostcall_io_hint(kind: &HostcallKind) -> HostcallIoHint {
                 HostcallIoHint::Unknown
             }
         }
-        HostcallKind::Exec { .. } => HostcallIoHint::Unknown,
-        HostcallKind::Ui { .. } | HostcallKind::Events { .. } | HostcallKind::Log => {
-            HostcallIoHint::CpuBound
-        }
+        HostcallKind::Exec { .. }
+        | HostcallKind::Ui { .. }
+        | HostcallKind::Events { .. }
+        | HostcallKind::Log => HostcallIoHint::CpuBound,
     }
 }
 
@@ -1867,6 +1880,21 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
 
     #[allow(clippy::future_not_send)]
     async fn dispatch_hostcall_fast(&self, request: &HostcallRequest) -> HostcallOutcome {
+        let cap = request.required_capability();
+        let (check, lookup_path) = self.policy_lookup(cap, request.extension_id.as_deref());
+        self.emit_policy_decision_telemetry(
+            cap,
+            request.extension_id.as_deref(),
+            lookup_path,
+            &check,
+        );
+        if check.decision != PolicyDecision::Allow {
+            return HostcallOutcome::Error {
+                code: "denied".to_string(),
+                message: format!("Capability '{}' denied by policy ({})", cap, check.reason),
+            };
+        }
+
         match &request.kind {
             HostcallKind::Tool { name } => {
                 self.dispatch_tool(&request.call_id, name, request.payload.clone())
@@ -1903,8 +1931,11 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 .await
             }
             HostcallKind::Log => {
-                // Log hostcalls are handled by the shared dispatcher path.
-                // Return success here for the legacy dispatcher fallback.
+                tracing::info!(
+                    target: "pi.extension.log",
+                    payload = ?request.payload,
+                    "Extension log"
+                );
                 HostcallOutcome::Success(serde_json::json!({ "logged": true }))
             }
         }
@@ -2407,6 +2438,11 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     .await
             }
             Some(ProtocolHostcallMethod::Log) => {
+                tracing::info!(
+                    target: "pi.extension.log",
+                    payload = ?payload.params,
+                    "Extension log"
+                );
                 HostcallOutcome::Success(serde_json::json!({ "logged": true }))
             }
             None => HostcallOutcome::Error {
@@ -2462,7 +2498,6 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         cmd: &str,
         payload: &serde_json::Value,
     ) -> HostcallOutcome {
-        use std::io::Read as _;
         use std::process::{Command, Stdio};
         use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
         use std::sync::mpsc::{self, SyncSender};
@@ -2483,7 +2518,12 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             let mut partial = Vec::new();
 
             loop {
-                let read = reader.read(&mut buf).map_err(|err| err.to_string())?;
+                let read = match reader.read(&mut buf) {
+                    Ok(0) => 0,
+                    Ok(n) => n,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(err) => return Err(err.to_string()),
+                };
                 if read == 0 {
                     // EOF. Flush partial if any (lossy).
                     if !partial.is_empty() {
@@ -2697,6 +2737,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                         .stdout(Stdio::piped())
                         .stderr(Stdio::piped())
                         .current_dir(&cwd);
+                    crate::tools::isolate_command_process_group(&mut command);
 
                     let mut child = command.spawn().map_err(|err| err.to_string())?;
                     let pid = child.id();
@@ -2718,17 +2759,17 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                             break status;
                         }
 
-                        if cancel_worker.load(AtomicOrdering::SeqCst) {
+                        if !killed && cancel_worker.load(AtomicOrdering::SeqCst) {
                             killed = true;
-                            crate::tools::kill_process_tree(Some(pid));
+                            crate::tools::kill_process_group_tree(Some(pid));
                             let _ = child.kill();
                             break child.wait().map_err(|err| err.to_string())?;
                         }
 
                         if let Some(timeout_ms) = timeout_ms {
-                            if start.elapsed() >= Duration::from_millis(timeout_ms) {
+                            if !killed && start.elapsed() >= Duration::from_millis(timeout_ms) {
                                 killed = true;
-                                crate::tools::kill_process_tree(Some(pid));
+                                crate::tools::kill_process_group_tree(Some(pid));
                                 let _ = child.kill();
                                 break child.wait().map_err(|err| err.to_string())?;
                             }
@@ -2818,7 +2859,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                         };
                     }
                     Err(mpsc::TryRecvError::Empty) => {
-                        sleep(wall_now(), Duration::from_millis(25)).await;
+                        extension_wait_sleep(Duration::from_millis(25)).await;
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
                         return HostcallOutcome::Error {
@@ -2836,6 +2877,40 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         let call_id_for_error = call_id.to_string();
 
         thread::spawn(move || {
+            #[derive(Clone, Copy)]
+            enum StreamKind {
+                Stdout,
+                Stderr,
+            }
+
+            struct StreamChunk {
+                kind: StreamKind,
+                bytes: Vec<u8>,
+            }
+
+            fn pump_stream(
+                mut reader: impl std::io::Read,
+                tx: &std::sync::mpsc::SyncSender<StreamChunk>,
+                kind: StreamKind,
+            ) {
+                let mut buf = [0u8; 8192];
+                loop {
+                    let read = match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(read) => read,
+                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    };
+                    let chunk = StreamChunk {
+                        kind,
+                        bytes: buf[..read].to_vec(),
+                    };
+                    if tx.send(chunk).is_err() {
+                        break;
+                    }
+                }
+            }
+
             let result: std::result::Result<serde_json::Value, String> = (|| {
                 let mut command = Command::new(&cmd);
                 command
@@ -2844,41 +2919,64 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .current_dir(&cwd);
+                crate::tools::isolate_command_process_group(&mut command);
 
                 let mut child = command.spawn().map_err(|err| err.to_string())?;
                 let pid = child.id();
 
-                let mut stdout = child.stdout.take().ok_or("Missing stdout pipe")?;
-                let mut stderr = child.stderr.take().ok_or("Missing stderr pipe")?;
+                let stdout = child.stdout.take().ok_or("Missing stdout pipe")?;
+                let stderr = child.stderr.take().ok_or("Missing stderr pipe")?;
 
-                let stdout_handle =
-                    thread::spawn(move || -> std::result::Result<Vec<u8>, String> {
-                        let mut buf = Vec::new();
-                        stdout
-                            .read_to_end(&mut buf)
-                            .map_err(|err| err.to_string())?;
-                        Ok(buf)
-                    });
-                let stderr_handle =
-                    thread::spawn(move || -> std::result::Result<Vec<u8>, String> {
-                        let mut buf = Vec::new();
-                        stderr
-                            .read_to_end(&mut buf)
-                            .map_err(|err| err.to_string())?;
-                        Ok(buf)
-                    });
+                let (tx, rx) = std::sync::mpsc::sync_channel::<StreamChunk>(128);
+                let tx_stdout = tx.clone();
+                let _stdout_handle =
+                    thread::spawn(move || pump_stream(stdout, &tx_stdout, StreamKind::Stdout));
+                let _stderr_handle =
+                    thread::spawn(move || pump_stream(stderr, &tx, StreamKind::Stderr));
 
                 let start = Instant::now();
                 let mut killed = false;
+                let max_bytes = crate::tools::DEFAULT_MAX_BYTES.saturating_mul(2);
+
+                let mut stdout_chunks = std::collections::VecDeque::new();
+                let mut stderr_chunks = std::collections::VecDeque::new();
+                let mut stdout_bytes_len = 0usize;
+                let mut stderr_bytes_len = 0usize;
+
+                let mut ingest_chunk = |kind: StreamKind, bytes: Vec<u8>| match kind {
+                    StreamKind::Stdout => {
+                        stdout_bytes_len += bytes.len();
+                        stdout_chunks.push_back(bytes);
+                        while stdout_bytes_len > max_bytes && stdout_chunks.len() > 1 {
+                            if let Some(front) = stdout_chunks.pop_front() {
+                                stdout_bytes_len -= front.len();
+                            }
+                        }
+                    }
+                    StreamKind::Stderr => {
+                        stderr_bytes_len += bytes.len();
+                        stderr_chunks.push_back(bytes);
+                        while stderr_bytes_len > max_bytes && stderr_chunks.len() > 1 {
+                            if let Some(front) = stderr_chunks.pop_front() {
+                                stderr_bytes_len -= front.len();
+                            }
+                        }
+                    }
+                };
+
                 let status = loop {
+                    while let Ok(chunk) = rx.try_recv() {
+                        ingest_chunk(chunk.kind, chunk.bytes);
+                    }
+
                     if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
                         break status;
                     }
 
                     if let Some(timeout_ms) = timeout_ms {
-                        if start.elapsed() >= Duration::from_millis(timeout_ms) {
+                        if !killed && start.elapsed() >= Duration::from_millis(timeout_ms) {
                             killed = true;
-                            crate::tools::kill_process_tree(Some(pid));
+                            crate::tools::kill_process_group_tree(Some(pid));
                             let _ = child.kill();
                             break child.wait().map_err(|err| err.to_string())?;
                         }
@@ -2887,14 +2985,24 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     thread::sleep(Duration::from_millis(10));
                 };
 
-                let stdout_bytes = stdout_handle
-                    .join()
-                    .map_err(|_| "stdout reader thread panicked".to_string())?
-                    .map_err(|err| format!("Read stdout: {err}"))?;
-                let stderr_bytes = stderr_handle
-                    .join()
-                    .map_err(|_| "stderr reader thread panicked".to_string())?
-                    .map_err(|err| format!("Read stderr: {err}"))?;
+                let drain_deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    match rx.try_recv() {
+                        Ok(chunk) => ingest_chunk(chunk.kind, chunk.bytes),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            if Instant::now() >= drain_deadline {
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+
+                drop(rx); // Close the channel so pump threads exit if blocked
+
+                let stdout_bytes: Vec<u8> = stdout_chunks.into_iter().flatten().collect();
+                let stderr_bytes: Vec<u8> = stderr_chunks.into_iter().flatten().collect();
 
                 let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
                 let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
@@ -3423,11 +3531,12 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             })
             .await?;
 
-        let start = Instant::now();
+        let start = extension_wait_now();
         let timeout = Duration::from_millis(timeout_ms.max(1));
 
         loop {
-            if start.elapsed() > timeout {
+            let now = extension_wait_now();
+            if std::time::Duration::from_nanos(now.duration_since(start)) > timeout {
                 return Err(crate::error::Error::extension(format!(
                     "events.emit timed out after {}ms",
                     timeout.as_millis()
@@ -3462,7 +3571,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             match state.status.as_str() {
                 "pending" => {
                     if !self.js_runtime().has_pending() {
-                        sleep(wall_now(), Duration::from_millis(1)).await;
+                        extension_wait_sleep(Duration::from_millis(1)).await;
                     }
                 }
                 "resolved" => return Ok(state.value.unwrap_or(Value::Null)),
@@ -3491,7 +3600,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 }
             }
 
-            sleep(wall_now(), Duration::from_millis(0)).await;
+            extension_wait_sleep(Duration::from_millis(0)).await;
         }
     }
 }
@@ -3541,6 +3650,32 @@ mod tests {
     use std::net::TcpListener;
     use std::path::Path;
     use std::sync::Mutex;
+
+    #[test]
+    fn extension_wait_sleep_uses_current_timer_driver_epoch() {
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+        use asupersync::types::{Budget, RegionId, TaskId, Time};
+        use std::sync::Arc;
+
+        let virtual_clock = Arc::new(VirtualClock::starting_at(Time::from_secs(42)));
+        let timer_driver = TimerDriverHandle::with_virtual_clock(virtual_clock);
+        let cx = Cx::new_with_drivers(
+            RegionId::new_for_test(7, 0),
+            TaskId::new_for_test(9, 0),
+            Budget::INFINITE,
+            None,
+            None,
+            None,
+            Some(timer_driver.clone()),
+            None,
+        );
+        let _current = Cx::set_current(Some(cx));
+
+        let now = extension_wait_now();
+        assert_eq!(now, timer_driver.now());
+        let sleeper = extension_wait_sleep(Duration::from_millis(5));
+        assert_eq!(sleeper.remaining(now), Duration::from_millis(5));
+    }
 
     #[test]
     fn ui_confirm_cancel_defaults_to_false() {
@@ -3706,7 +3841,10 @@ mod tests {
             &self,
             request: ExtensionUiRequest,
         ) -> Result<Option<ExtensionUiResponse>> {
-            self.captured.lock().unwrap().push(request.clone());
+            self.captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request.clone());
             Ok(Some(ExtensionUiResponse {
                 id: request.id,
                 value: Some(self.response_value.clone()),
@@ -3733,27 +3871,45 @@ mod tests {
     #[async_trait]
     impl ExtensionSession for TestSession {
         async fn get_state(&self) -> Value {
-            self.state.lock().unwrap().clone()
+            self.state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         }
 
         async fn get_messages(&self) -> Vec<SessionMessage> {
-            self.messages.lock().unwrap().clone()
+            self.messages
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         }
 
         async fn get_entries(&self) -> Vec<Value> {
-            self.entries.lock().unwrap().clone()
+            self.entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         }
 
         async fn get_branch(&self) -> Vec<Value> {
-            self.branch.lock().unwrap().clone()
+            self.branch
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
         }
 
         async fn set_name(&self, name: String) -> Result<()> {
             {
-                let mut guard = self.name.lock().unwrap();
+                let mut guard = self
+                    .name
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 *guard = Some(name.clone());
             }
-            let mut state = self.state.lock().unwrap();
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Value::Object(ref mut map) = *state {
                 map.insert("sessionName".to_string(), Value::String(name));
             }
@@ -3762,7 +3918,10 @@ mod tests {
         }
 
         async fn append_message(&self, message: SessionMessage) -> Result<()> {
-            self.messages.lock().unwrap().push(message);
+            self.messages
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(message);
             Ok(())
         }
 
@@ -3773,13 +3932,16 @@ mod tests {
         ) -> Result<()> {
             self.custom_entries
                 .lock()
-                .unwrap()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push((custom_type, data));
             Ok(())
         }
 
         async fn set_model(&self, provider: String, model_id: String) -> Result<()> {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Value::Object(ref mut map) = *state {
                 map.insert("provider".to_string(), Value::String(provider));
                 map.insert("modelId".to_string(), Value::String(model_id));
@@ -3789,7 +3951,10 @@ mod tests {
         }
 
         async fn get_model(&self) -> (Option<String>, Option<String>) {
-            let state = self.state.lock().unwrap();
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let provider = state
                 .get("provider")
                 .and_then(Value::as_str)
@@ -3803,7 +3968,10 @@ mod tests {
         }
 
         async fn set_thinking_level(&self, level: String) -> Result<()> {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Value::Object(ref mut map) = *state {
                 map.insert("thinkingLevel".to_string(), Value::String(level));
             }
@@ -3812,7 +3980,10 @@ mod tests {
         }
 
         async fn get_thinking_level(&self) -> Option<String> {
-            let state = self.state.lock().unwrap();
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let level = state
                 .get("thinkingLevel")
                 .and_then(Value::as_str)
@@ -3822,7 +3993,10 @@ mod tests {
         }
 
         async fn set_label(&self, target_id: String, label: Option<String>) -> Result<()> {
-            self.labels.lock().unwrap().push((target_id, label));
+            self.labels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((target_id, label));
             Ok(())
         }
     }
@@ -4122,7 +4296,10 @@ mod tests {
             assert_eq!(name_value, Value::String("demo".to_string()));
             assert_eq!(name_set, Value::Bool(true));
 
-            let name_value = name.lock().unwrap().clone();
+            let name_value = name
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             assert_eq!(name_value.as_deref(), Some("hello"));
         });
     }
@@ -4228,6 +4405,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn dispatcher_session_hostcall_append_message_and_entry() {
         futures::executor::block_on(async {
             let runtime = Rc::new(
@@ -4304,7 +4482,11 @@ mod tests {
             assert_eq!(entry_appended, Value::Bool(true));
 
             {
-                let messages = session.messages.lock().unwrap().clone();
+                let messages = session
+                    .messages
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
                 assert_eq!(messages.len(), 1);
                 match &messages[0] {
                     SessionMessage::Custom {
@@ -4326,7 +4508,11 @@ mod tests {
 
             {
                 let expected = Some(serde_json::json!({ "ok": true }));
-                let custom_entries = session.custom_entries.lock().unwrap().clone();
+                let custom_entries = session
+                    .custom_entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
                 assert_eq!(custom_entries.len(), 1);
                 assert_eq!(custom_entries[0].0, "meta");
                 assert_eq!(custom_entries[0].1, expected);
@@ -4962,7 +5148,10 @@ mod tests {
                 .await
                 .expect("verify result");
 
-            let seen = captured.lock().unwrap().clone();
+            let seen = captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             assert_eq!(seen.len(), 1);
             assert_eq!(seen[0].method, "confirm");
         });
@@ -5009,7 +5198,10 @@ mod tests {
 
             runtime.tick().await.expect("tick");
 
-            let seen = captured.lock().unwrap().clone();
+            let seen = captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             assert_eq!(seen.len(), 1);
             assert_eq!(seen[0].method, "setStatus");
             assert_eq!(
@@ -5068,7 +5260,10 @@ mod tests {
 
             runtime.tick().await.expect("tick");
 
-            let seen = captured.lock().unwrap().clone();
+            let seen = captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             assert_eq!(seen.len(), 1);
             assert_eq!(seen[0].method, "setWidget");
             assert_eq!(
@@ -5241,7 +5436,10 @@ mod tests {
                 .await
                 .expect("verify set_model result");
 
-            let final_state = state.lock().unwrap().clone();
+            let final_state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             assert_eq!(
                 final_state.get("provider").and_then(Value::as_str),
                 Some("anthropic")
@@ -5539,7 +5737,10 @@ mod tests {
                 .await
                 .expect("verify set_thinking_level");
 
-            let final_state = state.lock().unwrap().clone();
+            let final_state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             assert_eq!(
                 final_state.get("thinkingLevel").and_then(Value::as_str),
                 Some("high")
@@ -5925,7 +6126,10 @@ mod tests {
                 .await
                 .expect("verify model_id snake_case");
 
-            let final_state = state.lock().unwrap().clone();
+            let final_state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             assert_eq!(
                 final_state.get("modelId").and_then(Value::as_str),
                 Some("claude-opus-4-20250514")
@@ -6000,7 +6204,10 @@ mod tests {
                 .expect("verify alt keys");
 
             // Last write wins, so "low" should be the final value
-            let final_state = state.lock().unwrap().clone();
+            let final_state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             assert_eq!(
                 final_state.get("thinkingLevel").and_then(Value::as_str),
                 Some("low")
@@ -6113,7 +6320,9 @@ mod tests {
             }
 
             // Verify set_label was called with correct args
-            let captured = labels.lock().unwrap();
+            let captured = labels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert_eq!(captured.len(), 1);
             assert_eq!(captured[0].0, "msg-42");
             assert_eq!(captured[0].1.as_deref(), Some("important"));
@@ -6174,7 +6383,9 @@ mod tests {
             }
 
             // Verify set_label was called with None label (removal)
-            let captured = labels.lock().unwrap();
+            let captured = labels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert_eq!(captured.len(), 1);
             assert_eq!(captured[0].0, "msg-99");
             assert!(captured[0].1.is_none());
@@ -6284,7 +6495,9 @@ mod tests {
                 runtime.drain_microtasks().await.expect("microtasks");
             }
 
-            let captured = labels.lock().unwrap();
+            let captured = labels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert_eq!(captured.len(), 1);
             assert_eq!(captured[0].0, "msg-77");
             assert_eq!(captured[0].1.as_deref(), Some("reviewed"));
@@ -6345,7 +6558,9 @@ mod tests {
                 runtime.drain_microtasks().await.expect("microtasks");
             }
 
-            let captured = labels.lock().unwrap();
+            let captured = labels
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert_eq!(captured.len(), 1);
             assert_eq!(captured[0].0, "entry-5");
             assert_eq!(captured[0].1.as_deref(), Some("flagged"));
@@ -7077,7 +7292,10 @@ mod tests {
                 runtime.drain_microtasks().await.expect("microtasks");
             }
 
-            let reqs = captured.lock().unwrap().clone();
+            let reqs = captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             assert_eq!(reqs.len(), 1);
             assert_eq!(reqs[0].method, "spinner");
             assert_eq!(reqs[0].payload["text"], "Loading...");
@@ -7131,7 +7349,10 @@ mod tests {
                 runtime.drain_microtasks().await.expect("microtasks");
             }
 
-            let reqs = captured.lock().unwrap().clone();
+            let reqs = captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             assert_eq!(reqs.len(), 1);
             assert_eq!(reqs[0].method, "progress");
             assert_eq!(reqs[0].payload["current"], 50);
@@ -7186,7 +7407,10 @@ mod tests {
                 runtime.drain_microtasks().await.expect("microtasks");
             }
 
-            let reqs = captured.lock().unwrap().clone();
+            let reqs = captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             assert_eq!(reqs.len(), 1);
             assert_eq!(reqs[0].method, "notification");
             assert_eq!(reqs[0].payload["message"], "Task complete!");
@@ -7293,7 +7517,9 @@ mod tests {
             }
 
             let (len, methods) = {
-                let reqs = captured.lock().unwrap();
+                let reqs = captured
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let len = reqs.len();
                 let methods = reqs.iter().map(|r| r.method.clone()).collect::<Vec<_>>();
                 drop(reqs);
@@ -7705,7 +7931,9 @@ mod tests {
                 runtime.drain_microtasks().await.expect("microtasks");
             }
 
-            let captured = custom_entries.lock().unwrap();
+            let captured = custom_entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert_eq!(captured.len(), 1);
             assert_eq!(captured[0].0, "audit_log");
             assert!(captured[0].1.is_some());
@@ -8547,7 +8775,10 @@ mod tests {
                 runtime.drain_microtasks().await.expect("microtasks");
             }
 
-            let reqs = captured.lock().unwrap().clone();
+            let reqs = captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             assert_eq!(reqs.len(), 1);
             assert_eq!(reqs[0].method, "custom_op");
             assert_eq!(reqs[0].payload["key"], "value");
@@ -8607,7 +8838,10 @@ mod tests {
                 runtime.drain_microtasks().await.expect("microtasks");
             }
 
-            let reqs = captured.lock().unwrap().clone();
+            let reqs = captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             assert_eq!(reqs.len(), 1);
             let payload = &reqs[0].payload;
             assert!(payload["lines"].is_array());
@@ -8728,7 +8962,10 @@ mod tests {
                 runtime.drain_microtasks().await.expect("microtasks");
             }
 
-            let reqs = captured.lock().unwrap().clone();
+            let reqs = captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             assert_eq!(reqs.len(), 1);
             assert_eq!(reqs[0].method, "set_status");
             assert_eq!(reqs[0].payload["text"], "");
@@ -8782,7 +9019,10 @@ mod tests {
                 runtime.drain_microtasks().await.expect("microtasks");
             }
 
-            let reqs = captured.lock().unwrap().clone();
+            let reqs = captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             assert_eq!(reqs.len(), 1);
             assert_eq!(reqs[0].method, "dismiss");
         });
@@ -8839,7 +9079,10 @@ mod tests {
                 runtime.drain_microtasks().await.expect("microtasks");
             }
 
-            let reqs = captured.lock().unwrap().clone();
+            let reqs = captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             assert_eq!(reqs.len(), 3);
             let methods: Vec<&str> = reqs.iter().map(|r| r.method.as_str()).collect();
             assert!(methods.contains(&"set_status"));
@@ -8895,7 +9138,10 @@ mod tests {
                 runtime.drain_microtasks().await.expect("microtasks");
             }
 
-            let reqs = captured.lock().unwrap().clone();
+            let reqs = captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             assert_eq!(reqs.len(), 1);
             assert_eq!(reqs[0].method, "notification");
             assert_eq!(reqs[0].payload["severity"], "error");
@@ -8956,7 +9202,10 @@ mod tests {
                 runtime.drain_microtasks().await.expect("microtasks");
             }
 
-            let reqs = captured.lock().unwrap().clone();
+            let reqs = captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             assert_eq!(reqs.len(), 1);
             assert_eq!(reqs[0].method, "set_widget");
             let lines = reqs[0].payload["lines"].as_array().unwrap();
@@ -9013,7 +9262,10 @@ mod tests {
                 runtime.drain_microtasks().await.expect("microtasks");
             }
 
-            let reqs = captured.lock().unwrap().clone();
+            let reqs = captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             assert_eq!(reqs.len(), 1);
             assert_eq!(reqs[0].method, "progress");
             assert_eq!(reqs[0].payload["percent"], 75);
@@ -9454,7 +9706,7 @@ mod tests {
                     );
                 }
                 HostcallOutcome::Success(_) | HostcallOutcome::StreamChunk { .. } => {
-                    panic!("unknown op should not succeed");
+                    panic!();
                 }
             }
         });
@@ -9480,10 +9732,10 @@ mod tests {
                     );
                 }
                 HostcallOutcome::Success(_) => {
-                    panic!("set_model with missing provider should not succeed");
+                    panic!();
                 }
                 HostcallOutcome::StreamChunk { .. } => {
-                    panic!("set_model with missing provider should not stream");
+                    panic!();
                 }
             }
         });
@@ -9510,10 +9762,10 @@ mod tests {
                     assert_eq!(code, "invalid_request");
                 }
                 HostcallOutcome::Success(_) => {
-                    panic!("set_model with missing modelId should not succeed");
+                    panic!();
                 }
                 HostcallOutcome::StreamChunk { .. } => {
-                    panic!("set_model with missing modelId should not stream");
+                    panic!();
                 }
             }
         });
@@ -9536,10 +9788,10 @@ mod tests {
                     assert_eq!(code, "invalid_request");
                 }
                 HostcallOutcome::Success(_) => {
-                    panic!("set_thinking_level with no level should not succeed");
+                    panic!();
                 }
                 HostcallOutcome::StreamChunk { .. } => {
-                    panic!("set_thinking_level with no level should not stream");
+                    panic!();
                 }
             }
         });
@@ -9562,10 +9814,10 @@ mod tests {
                     assert_eq!(code, "invalid_request");
                 }
                 HostcallOutcome::Success(_) => {
-                    panic!("set_label with no targetId should not succeed");
+                    panic!();
                 }
                 HostcallOutcome::StreamChunk { .. } => {
-                    panic!("set_label with no targetId should not stream");
+                    panic!();
                 }
             }
         });
@@ -9595,10 +9847,10 @@ mod tests {
                     );
                 }
                 HostcallOutcome::Success(_) => {
-                    panic!("invalid message should not succeed");
+                    panic!();
                 }
                 HostcallOutcome::StreamChunk { .. } => {
-                    panic!("invalid message should not stream");
+                    panic!();
                 }
             }
         });
@@ -9715,10 +9967,10 @@ mod tests {
                         assert_eq!(code, "io", "session IO error for op '{op}' must be 'io'");
                     }
                     HostcallOutcome::Success(_) => {
-                        panic!("op '{op}' with failing session should not succeed");
+                        panic!();
                     }
                     HostcallOutcome::StreamChunk { .. } => {
-                        panic!("op '{op}' with failing session should not stream");
+                        panic!();
                     }
                 }
             }
@@ -9802,7 +10054,7 @@ mod tests {
                             "alias pair ({snake}, {camel}) should produce same output"
                         );
                     }
-                    _ => panic!("alias pair ({snake}, {camel}) should both succeed"),
+                    _ => panic!(),
                 }
             }
         });
@@ -9936,7 +10188,7 @@ mod tests {
                     );
                     assert!(result.error.is_none(), "success should not include error");
                 }
-                other => panic!("expected host_result body, got {other:?}"),
+                other => panic!(),
             }
         });
     }
@@ -10004,7 +10256,7 @@ mod tests {
                         Value::String("invalid_request".to_string())
                     );
                 }
-                other => panic!("expected host_result body, got {other:?}"),
+                other => panic!(),
             }
         });
     }
@@ -10063,7 +10315,7 @@ mod tests {
                         Value::Number(serde_json::Number::from(1))
                     );
                 }
-                other => panic!("expected host_result body, got {other:?}"),
+                other => panic!(),
             }
         });
     }
@@ -10092,12 +10344,10 @@ mod tests {
                     assert_eq!(value, serde_json::json!({ "events": [] }));
                 }
                 HostcallOutcome::Error { code, message } => {
-                    panic!(
-                        "events.list for unknown extension should not fail (code={code}): {message}"
-                    );
+                    panic!();
                 }
                 HostcallOutcome::StreamChunk { .. } => {
-                    panic!("events.list for unknown extension should not stream");
+                    panic!();
                 }
             }
         });
@@ -10503,7 +10753,7 @@ mod tests {
                         error.message
                     );
                 }
-                other => panic!("expected host_result body, got {other:?}"),
+                other => panic!(),
             }
         });
     }
@@ -11099,7 +11349,7 @@ mod tests {
                 assert_eq!(plain_error.message, traced_error.message);
                 assert_eq!(plain_error.retryable, traced_error.retryable);
             }
-            _ => panic!("plain and traced protocol results disagree on error presence"),
+            _ => panic!(),
         }
     }
 
@@ -11516,7 +11766,7 @@ mod tests {
                     assert!(!result.is_error, "expected success: {result:?}");
                     assert!(result.output.is_object());
                 }
-                other => panic!("expected host_result, got {other:?}"),
+                other => panic!(),
             }
         });
     }
@@ -11561,7 +11811,7 @@ mod tests {
                         error.message
                     );
                 }
-                other => panic!("expected host_result, got {other:?}"),
+                other => panic!(),
             }
         });
     }
@@ -11601,7 +11851,7 @@ mod tests {
                     let error = result.error.expect("error");
                     assert_eq!(error.code, HostCallErrorCode::InvalidRequest);
                 }
-                other => panic!("expected host_result, got {other:?}"),
+                other => panic!(),
             }
         });
     }
@@ -11656,7 +11906,7 @@ mod tests {
                 ExtensionBody::HostResult(result) => {
                     assert!(!result.is_error, "expected success: {result:?}");
                 }
-                other => panic!("expected host_result, got {other:?}"),
+                other => panic!(),
             }
         });
     }
@@ -11702,7 +11952,7 @@ mod tests {
                 ExtensionBody::HostResult(result) => {
                     assert!(!result.is_error, "expected success: {result:?}");
                 }
-                other => panic!("expected host_result, got {other:?}"),
+                other => panic!(),
             }
         });
     }
@@ -11747,7 +11997,7 @@ mod tests {
                         error.message
                     );
                 }
-                other => panic!("expected host_result, got {other:?}"),
+                other => panic!(),
             }
         });
     }
@@ -11792,7 +12042,7 @@ mod tests {
                         error.message
                     );
                 }
-                other => panic!("expected host_result, got {other:?}"),
+                other => panic!(),
             }
         });
     }
@@ -11830,7 +12080,7 @@ mod tests {
                 ExtensionBody::HostResult(result) => {
                     assert!(!result.is_error, "log dispatch should succeed: {result:?}");
                 }
-                other => panic!("expected host_result, got {other:?}"),
+                other => panic!(),
             }
         });
     }
@@ -12325,7 +12575,10 @@ mod tests {
             #[async_trait]
             impl ExtensionSession for DivergentReadSession {
                 async fn get_state(&self) -> Value {
-                    let mut guard = self.counter.lock().expect("counter lock");
+                    let mut guard = self
+                        .counter
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let value = *guard;
                     *guard = guard.saturating_add(1);
                     drop(guard);
@@ -12644,6 +12897,31 @@ mod tests {
     }
 
     #[test]
+    fn hostcall_io_hint_classifies_edit_bash_and_exec() {
+        assert_eq!(
+            hostcall_io_hint(&HostcallKind::Tool {
+                name: "edit".to_string()
+            }),
+            HostcallIoHint::IoHeavy,
+            "edit tool should be IoHeavy"
+        );
+        assert_eq!(
+            hostcall_io_hint(&HostcallKind::Tool {
+                name: "bash".to_string()
+            }),
+            HostcallIoHint::CpuBound,
+            "bash tool should be CpuBound"
+        );
+        assert_eq!(
+            hostcall_io_hint(&HostcallKind::Exec {
+                cmd: "ls".to_string()
+            }),
+            HostcallIoHint::CpuBound,
+            "exec hostcall should be CpuBound"
+        );
+    }
+
+    #[test]
     fn io_uring_bridge_reports_cancellation_when_request_not_pending() {
         futures::executor::block_on(async {
             let runtime = Rc::new(
@@ -12679,7 +12957,7 @@ mod tests {
                         "unexpected cancellation message: {message}"
                     );
                 }
-                other => panic!("expected cancellation error outcome, got {other:?}"),
+                other => panic!(),
             }
         });
     }

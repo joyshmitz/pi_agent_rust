@@ -14,6 +14,10 @@ import { DoomOverlayComponent } from "./doom-component.js";
 import { DoomEngine } from "./doom-engine.js";
 import { ensureWadFile } from "./wad-finder.js";
 
+async function yieldToUi(): Promise<void> {
+	await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 // Persistent engine instance - survives between invocations
 let activeEngine: DoomEngine | null = null;
 let activeWadPath: string | null = null;
@@ -28,9 +32,9 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// Auto-download WAD if not present
-			ctx.ui.notify("Loading DOOM...", "info");
-			const wad = args?.trim() ? args.trim() : await ensureWadFile();
+			const wad = args?.trim()
+				? args.trim()
+				: await ensureWadFile((message) => ctx.ui.notify(message, "info"));
 
 			if (!wad) {
 				ctx.ui.notify("Failed to download DOOM WAD file. Check your internet connection.", "error");
@@ -38,22 +42,26 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			try {
-				// Reuse existing engine if same WAD, otherwise create new
 				let isResume = false;
 				if (activeEngine && activeWadPath === wad) {
 					ctx.ui.notify("Resuming DOOM...", "info");
+					await yieldToUi();
 					isResume = true;
 				} else {
 					ctx.ui.notify(`Loading DOOM from ${wad}...`, "info");
-					activeEngine = new DoomEngine(wad);
+					await yieldToUi();
+					activeEngine = new DoomEngine(wad, (message) => ctx.ui.notify(message, "info"));
+					ctx.ui.notify("Initializing DOOM engine...", "info");
+					await yieldToUi();
 					await activeEngine.init();
+					ctx.ui.notify("DOOM engine initialized.", "info");
 					activeWadPath = wad;
 				}
 
+				ctx.ui.notify("Opening DOOM overlay...", "info");
 				await ctx.ui.custom(
-					(tui, _theme, _keybindings, done) => {
-						return new DoomOverlayComponent(tui, activeEngine!, () => done(undefined), isResume);
-					},
+					(tui, _theme, _keybindings, done) =>
+						new DoomOverlayComponent(tui, activeEngine!, () => done(undefined), isResume),
 					{
 						overlay: true,
 						overlayOptions: {

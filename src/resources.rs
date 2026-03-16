@@ -7,12 +7,50 @@
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::package_manager::{PackageManager, ResolveExtensionSourcesOptions};
+use crate::package_manager::{
+    PackageManager, PackageScope, ResolveExtensionSourcesOptions, ResolvedResource, ResourceOrigin,
+};
 use crate::theme::Theme;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send + 'static>) -> String {
+    payload.downcast::<String>().map_or_else(
+        |payload| {
+            payload.downcast::<&'static str>().map_or_else(
+                |_| "unknown panic payload".to_string(),
+                |message| (*message).to_string(),
+            )
+        },
+        |message| *message,
+    )
+}
+
+fn read_dir_sorted_paths(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    paths.sort();
+    paths
+}
+
+fn canonical_identity_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn resolved_path_kind(path: &Path) -> (bool, bool) {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            fs::metadata(path).map_or((false, false), |meta| (meta.is_dir(), meta.is_file()))
+        }
+        Ok(meta) => (meta.is_dir(), meta.is_file()),
+        Err(_) => (false, false),
+    }
+}
 
 // ============================================================================
 // Diagnostics
@@ -145,6 +183,16 @@ pub struct ResourceCliOptions {
     pub theme_paths: Vec<String>,
 }
 
+impl ResourceCliOptions {
+    #[must_use]
+    pub fn has_explicit_paths(&self) -> bool {
+        !self.skill_paths.is_empty()
+            || !self.prompt_paths.is_empty()
+            || !self.extension_paths.is_empty()
+            || !self.theme_paths.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PackageResources {
     pub extensions: Vec<PathBuf>,
@@ -199,97 +247,71 @@ impl ResourceLoader {
         ))
         .await?;
 
-        let resolved_skill_paths = resolved
-            .skills
-            .into_iter()
-            .filter(|r| r.enabled)
-            .map(|r| r.path)
-            .collect::<Vec<_>>();
-        let resolved_prompt_paths = resolved
-            .prompts
-            .into_iter()
-            .filter(|r| r.enabled)
-            .map(|r| r.path)
-            .collect::<Vec<_>>();
-        let resolved_theme_paths = resolved
-            .themes
-            .into_iter()
-            .filter(|r| r.enabled)
-            .map(|r| r.path)
-            .collect::<Vec<_>>();
-        let resolved_extension_paths = resolved
-            .extensions
-            .into_iter()
-            .filter(|r| r.enabled)
-            .map(|r| r.path)
-            .collect::<Vec<_>>();
+        let explicit_skill_paths = dedupe_paths(
+            cli.skill_paths
+                .iter()
+                .map(|path| resolve_path(path, cwd))
+                .collect(),
+        );
+        validate_explicit_resource_paths(&explicit_skill_paths, ExplicitResourceKind::Skill)?;
 
-        let cli_skill_paths = cli_extensions
-            .skills
-            .into_iter()
-            .filter(|r| r.enabled)
-            .map(|r| r.path)
-            .collect::<Vec<_>>();
-        let cli_prompt_paths = cli_extensions
-            .prompts
-            .into_iter()
-            .filter(|r| r.enabled)
-            .map(|r| r.path)
-            .collect::<Vec<_>>();
-        let cli_theme_paths = cli_extensions
-            .themes
-            .into_iter()
-            .filter(|r| r.enabled)
-            .map(|r| r.path)
-            .collect::<Vec<_>>();
-        let cli_extension_paths = cli_extensions
-            .extensions
-            .into_iter()
-            .filter(|r| r.enabled)
-            .map(|r| r.path)
-            .collect::<Vec<_>>();
+        let explicit_prompt_paths = dedupe_paths(
+            cli.prompt_paths
+                .iter()
+                .map(|path| resolve_path(path, cwd))
+                .collect(),
+        );
+        validate_explicit_resource_paths(&explicit_prompt_paths, ExplicitResourceKind::Prompt)?;
 
-        // Merge paths with pi-mono semantics:
-        // - `--no-skills` disables configured + auto skills, but still loads CLI `-e` and explicit `--skill`
-        // - `--no-prompt-templates` disables configured + auto prompts, but still loads CLI `-e` and explicit `--prompt-template`
-        let mut skill_paths = Vec::new();
-        if !cli.no_skills {
-            skill_paths.extend(resolved_skill_paths);
-        }
-        skill_paths.extend(cli_skill_paths);
-        skill_paths.extend(cli.skill_paths.iter().map(|p| resolve_path(p, cwd)));
-        let skill_paths = dedupe_paths(skill_paths);
+        let explicit_theme_paths = dedupe_paths(
+            cli.theme_paths
+                .iter()
+                .map(|path| resolve_path(path, cwd))
+                .collect(),
+        );
+        validate_explicit_resource_paths(&explicit_theme_paths, ExplicitResourceKind::Theme)?;
 
-        let mut prompt_paths = Vec::new();
-        if !cli.no_prompt_templates {
-            prompt_paths.extend(resolved_prompt_paths);
-        }
-        prompt_paths.extend(cli_prompt_paths);
-        prompt_paths.extend(cli.prompt_paths.iter().map(|p| resolve_path(p, cwd)));
-        let prompt_paths = dedupe_paths(prompt_paths);
+        // Merge paths with documented precedence semantics:
+        // - explicit CLI resources win over everything else
+        // - CLI `-e` resources outrank configured/project/global/package resources
+        // - project directories outrank global directories, which outrank installed packages
+        // - `--no-skills` / `--no-prompt-templates` / `--no-themes` only disable configured
+        //   resources; explicit CLI paths and CLI `-e` resources still participate
+        let skill_paths = merge_resource_paths(
+            &explicit_skill_paths,
+            cli_extensions.skills,
+            resolved.skills,
+            !cli.no_skills,
+        );
 
-        let mut theme_paths = Vec::new();
-        if !cli.no_themes {
-            theme_paths.extend(resolved_theme_paths);
-        }
-        theme_paths.extend(cli_theme_paths);
-        theme_paths.extend(cli.theme_paths.iter().map(|p| resolve_path(p, cwd)));
-        let theme_paths = dedupe_paths(theme_paths);
+        let prompt_paths = merge_resource_paths(
+            &explicit_prompt_paths,
+            cli_extensions.prompts,
+            resolved.prompts,
+            !cli.no_prompt_templates,
+        );
+
+        let theme_paths = merge_resource_paths(
+            &explicit_theme_paths,
+            cli_extensions.themes,
+            resolved.themes,
+            !cli.no_themes,
+        );
 
         // Extension entries:
         // - `--no-extensions` disables configured + auto discovery but still allows CLI `-e` sources.
-        let mut extension_entries = Vec::new();
-        if !cli.no_extensions {
-            extension_entries.extend(resolved_extension_paths);
-        }
-        extension_entries.extend(cli_extension_paths);
-        let extension_entries = dedupe_paths(extension_entries);
+        let extension_entries = merge_resource_paths(
+            &[],
+            cli_extensions.extensions,
+            resolved.extensions,
+            !cli.no_extensions,
+        );
 
         // Load skills, prompt templates, and themes in parallel — they are independent
         // filesystem walks that benefit from overlapped I/O on multi-core machines.
         let agent_dir = Config::global_dir();
         let cwd_buf = cwd.to_path_buf();
-        let (skills_result, prompt_templates, themes_result) = std::thread::scope(|s| {
+        let (skills_join, prompts_join, themes_join) = std::thread::scope(|s| {
             let cwd_s = &cwd_buf;
             let agent_s = &agent_dir;
             let skills_handle = s.spawn(move || {
@@ -317,15 +339,58 @@ impl ResourceLoader {
                 })
             });
             (
-                skills_handle.join().expect("skills loader thread"),
-                prompts_handle.join().expect("prompt loader thread"),
-                themes_handle.join().expect("theme loader thread"),
+                skills_handle.join(),
+                prompts_handle.join(),
+                themes_handle.join(),
             )
         });
+        let skills_result = skills_join.map_err(|payload| {
+            Error::config(format!(
+                "Skills loader thread panicked: {}",
+                panic_payload_message(payload)
+            ))
+        })?;
+        let prompt_templates = prompts_join.map_err(|payload| {
+            Error::config(format!(
+                "Prompt loader thread panicked: {}",
+                panic_payload_message(payload)
+            ))
+        })?;
+        let themes_result = themes_join.map_err(|payload| {
+            Error::config(format!(
+                "Theme loader thread panicked: {}",
+                panic_payload_message(payload)
+            ))
+        })?;
         let (prompts, prompt_diagnostics) = dedupe_prompts(prompt_templates);
         let (themes, theme_diagnostics) = dedupe_themes(themes_result.themes);
         let mut theme_diags = themes_result.diagnostics;
         theme_diags.extend(theme_diagnostics);
+        ensure_explicit_file_paths_loaded(
+            &explicit_skill_paths,
+            skills_result
+                .skills
+                .iter()
+                .map(|skill| skill.file_path.clone())
+                .collect(),
+            &skills_result.diagnostics,
+            ExplicitResourceKind::Skill,
+        )?;
+        ensure_explicit_file_paths_loaded(
+            &explicit_prompt_paths,
+            prompts
+                .iter()
+                .map(|prompt| prompt.file_path.clone())
+                .collect(),
+            &prompt_diagnostics,
+            ExplicitResourceKind::Prompt,
+        )?;
+        ensure_explicit_file_paths_loaded(
+            &explicit_theme_paths,
+            themes.iter().map(|theme| theme.file_path.clone()).collect(),
+            &theme_diags,
+            ExplicitResourceKind::Theme,
+        )?;
 
         Ok(Self {
             skills: skills_result.skills,
@@ -462,8 +527,8 @@ pub async fn discover_package_resources(manager: &PackageManager) -> Result<Pack
             continue;
         }
 
-        if let Some(pi) = read_pi_manifest(&root) {
-            append_resources_from_manifest(&mut resources, &root, &pi);
+        if let Some(pi) = read_pi_manifest(&root)? {
+            append_resources_from_manifest(&mut resources, &root, &pi)?;
         } else {
             append_resources_from_defaults(&mut resources, &root);
         }
@@ -472,29 +537,70 @@ pub async fn discover_package_resources(manager: &PackageManager) -> Result<Pack
     Ok(resources)
 }
 
-fn read_pi_manifest(root: &Path) -> Option<Value> {
+fn read_pi_manifest(root: &Path) -> Result<Option<Value>> {
     let manifest_path = root.join("package.json");
     if !manifest_path.exists() {
-        return None;
+        return Ok(None);
     }
-    let raw = fs::read_to_string(&manifest_path).ok()?;
-    let json: Value = serde_json::from_str(&raw).ok()?;
-    json.get("pi").cloned()
+    let raw = fs::read_to_string(&manifest_path).map_err(|err| {
+        Error::config(format!(
+            "Failed to read package manifest {}: {err}",
+            manifest_path.display()
+        ))
+    })?;
+    let json: Value = serde_json::from_str(&raw).map_err(|err| {
+        Error::config(format!(
+            "Failed to parse package manifest {}: {err}",
+            manifest_path.display()
+        ))
+    })?;
+    match json.get("pi") {
+        Some(pi) if pi.is_object() => Ok(Some(pi.clone())),
+        Some(_) => Err(Error::config(format!(
+            "Invalid package manifest {}: `pi` must be an object",
+            manifest_path.display()
+        ))),
+        None => Ok(None),
+    }
 }
 
-fn append_resources_from_manifest(resources: &mut PackageResources, root: &Path, pi: &Value) {
+fn append_resources_from_manifest(
+    resources: &mut PackageResources,
+    root: &Path,
+    pi: &Value,
+) -> Result<()> {
     let Some(obj) = pi.as_object() else {
-        return;
+        return Ok(());
     };
     append_resource_paths(
         resources,
         root,
         obj.get("extensions"),
         ResourceKind::Extensions,
-    );
-    append_resource_paths(resources, root, obj.get("skills"), ResourceKind::Skills);
-    append_resource_paths(resources, root, obj.get("prompts"), ResourceKind::Prompts);
-    append_resource_paths(resources, root, obj.get("themes"), ResourceKind::Themes);
+        "extensions",
+    )?;
+    append_resource_paths(
+        resources,
+        root,
+        obj.get("skills"),
+        ResourceKind::Skills,
+        "skills",
+    )?;
+    append_resource_paths(
+        resources,
+        root,
+        obj.get("prompts"),
+        ResourceKind::Prompts,
+        "prompts",
+    )?;
+    append_resource_paths(
+        resources,
+        root,
+        obj.get("themes"),
+        ResourceKind::Themes,
+        "themes",
+    )?;
+    Ok(())
 }
 
 fn append_resources_from_defaults(resources: &mut PackageResources, root: &Path) {
@@ -531,21 +637,19 @@ fn append_resource_paths(
     root: &Path,
     value: Option<&Value>,
     kind: ResourceKind,
-) {
+    field_name: &str,
+) -> Result<()> {
     let Some(value) = value else {
-        return;
+        return Ok(());
     };
-    let paths = extract_string_list(value);
+    let manifest_path = root.join("package.json");
+    let paths = extract_manifest_string_list(&manifest_path, field_name, value)?;
     if paths.is_empty() {
-        return;
+        return Ok(());
     }
 
     for path in paths {
-        let resolved = if Path::new(&path).is_absolute() {
-            PathBuf::from(path)
-        } else {
-            root.join(path)
-        };
+        let resolved = resolve_manifest_resource_path(root, &manifest_path, field_name, &path)?;
         match kind {
             ResourceKind::Extensions => resources.extensions.push(resolved),
             ResourceKind::Skills => resources.skills.push(resolved),
@@ -553,18 +657,98 @@ fn append_resource_paths(
             ResourceKind::Themes => resources.themes.push(resolved),
         }
     }
+    Ok(())
 }
 
-fn extract_string_list(value: &Value) -> Vec<String> {
+fn extract_manifest_string_list(
+    manifest_path: &Path,
+    field_name: &str,
+    value: &Value,
+) -> Result<Vec<String>> {
     match value {
-        Value::String(s) => vec![s.clone()],
+        Value::String(s) => Ok(vec![validate_manifest_resource_string(
+            manifest_path,
+            field_name,
+            s,
+        )?]),
         Value::Array(items) => items
             .iter()
-            .filter_map(Value::as_str)
-            .map(str::to_string)
+            .map(|item| {
+                item.as_str().ok_or_else(|| {
+                    Error::config(format!(
+                        "Invalid package manifest {}: `pi.{field_name}` must be a string or array of strings",
+                        manifest_path.display()
+                    ))
+                }).and_then(|path| validate_manifest_resource_string(manifest_path, field_name, path))
+            })
             .collect(),
-        _ => Vec::new(),
+        _ => Err(Error::config(format!(
+            "Invalid package manifest {}: `pi.{field_name}` must be a string or array of strings",
+            manifest_path.display()
+        ))),
     }
+}
+
+fn validate_manifest_resource_string(
+    manifest_path: &Path,
+    field_name: &str,
+    value: &str,
+) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(Error::config(format!(
+            "Invalid package manifest {}: `pi.{field_name}` entries must be non-empty paths",
+            manifest_path.display()
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn resolve_manifest_resource_path(
+    root: &Path,
+    manifest_path: &Path,
+    field_name: &str,
+    raw_path: &str,
+) -> Result<PathBuf> {
+    let relative = Path::new(raw_path);
+    if relative.is_absolute() {
+        return Err(Error::config(format!(
+            "Invalid package manifest {}: `pi.{field_name}` paths must stay within the package root",
+            manifest_path.display()
+        )));
+    }
+
+    let mut depth = 0usize;
+    for component in relative.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(_) => depth = depth.saturating_add(1),
+            Component::ParentDir => {
+                if depth == 0 {
+                    return Err(Error::config(format!(
+                        "Invalid package manifest {}: `pi.{field_name}` paths must stay within the package root",
+                        manifest_path.display()
+                    )));
+                }
+                depth -= 1;
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(Error::config(format!(
+                    "Invalid package manifest {}: `pi.{field_name}` paths must stay within the package root",
+                    manifest_path.display()
+                )));
+            }
+        }
+    }
+
+    let resolved = root.join(relative);
+    if resolved.exists() && !is_under_path(&resolved, root) {
+        return Err(Error::config(format!(
+            "Invalid package manifest {}: `pi.{field_name}` paths must stay within the package root",
+            manifest_path.display()
+        )));
+    }
+    Ok(resolved)
 }
 
 // ============================================================================
@@ -575,6 +759,7 @@ fn extract_string_list(value: &Value) -> Vec<String> {
 pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
     let mut skill_map: HashMap<String, Skill> = HashMap::new();
     let mut real_paths: HashSet<PathBuf> = HashSet::new();
+    let mut visited_dirs: HashSet<PathBuf> = HashSet::new();
     let mut diagnostics = Vec::new();
     let mut collisions = Vec::new();
 
@@ -588,8 +773,7 @@ pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
     ) {
         diagnostics.extend(result.diagnostics);
         for skill in result.skills {
-            let real_path =
-                fs::canonicalize(&skill.file_path).unwrap_or_else(|_| skill.file_path.clone());
+            let real_path = canonical_identity_path(&skill.file_path);
             if real_paths.contains(&real_path) {
                 continue;
             }
@@ -615,17 +799,23 @@ pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
 
     if options.include_defaults {
         merge_skills(
-            load_skills_from_dir(options.agent_dir.join("skills"), "user".to_string(), true),
+            load_skills_from_dir_with_visited(
+                options.cwd.join(Config::project_dir()).join("skills"),
+                "project".to_string(),
+                true,
+                &mut visited_dirs,
+            ),
             &mut skill_map,
             &mut real_paths,
             &mut diagnostics,
             &mut collisions,
         );
         merge_skills(
-            load_skills_from_dir(
-                options.cwd.join(Config::project_dir()).join("skills"),
-                "project".to_string(),
+            load_skills_from_dir_with_visited(
+                options.agent_dir.join("skills"),
+                "user".to_string(),
                 true,
+                &mut visited_dirs,
             ),
             &mut skill_map,
             &mut real_paths,
@@ -634,8 +824,7 @@ pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
         );
     }
 
-    for path in options.skill_paths {
-        let resolved = path.clone();
+    for resolved in options.skill_paths {
         if !resolved.exists() {
             diagnostics.push(ResourceDiagnostic {
                 kind: DiagnosticKind::Warning,
@@ -662,7 +851,7 @@ pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
         match fs::metadata(&resolved) {
             Ok(meta) if meta.is_dir() => {
                 merge_skills(
-                    load_skills_from_dir(resolved, source, true),
+                    load_skills_from_dir_with_visited(resolved, source, true, &mut visited_dirs),
                     &mut skill_map,
                     &mut real_paths,
                     &mut diagnostics,
@@ -719,9 +908,18 @@ fn load_skills_from_dir(
     source: String,
     include_root_files: bool,
 ) -> LoadSkillsResult {
+    let mut visited_dirs = HashSet::new();
+    load_skills_from_dir_with_visited(dir, source, include_root_files, &mut visited_dirs)
+}
+
+fn load_skills_from_dir_with_visited(
+    dir: PathBuf,
+    source: String,
+    include_root_files: bool,
+    visited_dirs: &mut HashSet<PathBuf>,
+) -> LoadSkillsResult {
     let mut skills = Vec::new();
     let mut diagnostics = Vec::new();
-    let mut visited_dirs = HashSet::new();
     let mut stack = vec![(dir, source, include_root_files)];
 
     while let Some((current_dir, current_source, current_include_root)) = stack.pop() {
@@ -735,32 +933,19 @@ fn load_skills_from_dir(
             continue;
         }
 
-        let Ok(entries) = fs::read_dir(&current_dir) else {
-            continue;
-        };
+        let mut child_dirs = Vec::new();
 
-        for entry in entries.flatten() {
-            let file_name = entry.file_name();
-            let file_name = file_name.to_string_lossy();
+        for full_path in read_dir_sorted_paths(&current_dir) {
+            let file_name = full_path.file_name().unwrap_or_default().to_string_lossy();
 
             if file_name.starts_with('.') || file_name == "node_modules" {
                 continue;
             }
 
-            let full_path = entry.path();
-            let file_type = entry.file_type();
-
-            let (is_dir, is_file) = match file_type {
-                Ok(ft) if ft.is_symlink() => match fs::metadata(&full_path) {
-                    Ok(meta) => (meta.is_dir(), meta.is_file()),
-                    Err(_) => continue,
-                },
-                Ok(ft) => (ft.is_dir(), ft.is_file()),
-                Err(_) => continue,
-            };
+            let (is_dir, is_file) = resolved_path_kind(&full_path);
 
             if is_dir {
-                stack.push((full_path, current_source.clone(), false));
+                child_dirs.push(full_path);
                 continue;
             }
 
@@ -779,6 +964,10 @@ fn load_skills_from_dir(
                 skills.push(skill);
             }
             diagnostics.extend(result.diagnostics);
+        }
+
+        for child_dir in child_dirs.into_iter().rev() {
+            stack.push((child_dir, current_source.clone(), false));
         }
     }
 
@@ -1000,12 +1189,12 @@ pub fn load_prompt_templates(options: LoadPromptTemplatesOptions) -> Vec<PromptT
     let project_dir = options.cwd.join(Config::project_dir()).join("prompts");
 
     if options.include_defaults {
-        templates.extend(load_templates_from_dir(&user_dir, "user", "(user)"));
         templates.extend(load_templates_from_dir(
             &project_dir,
             "project",
             "(project)",
         ));
+        templates.extend(load_templates_from_dir(&user_dir, "user", "(user)"));
     }
 
     for path in options.prompt_paths {
@@ -1046,18 +1235,9 @@ fn load_templates_from_dir(dir: &Path, source: &str, label: &str) -> Vec<PromptT
     if !dir.exists() {
         return templates;
     }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return templates;
-    };
 
-    for entry in entries.flatten() {
-        let full_path = entry.path();
-        let file_type = entry.file_type();
-        let is_file = match file_type {
-            Ok(ft) if ft.is_symlink() => fs::metadata(&full_path).is_ok_and(|m| m.is_file()),
-            Ok(ft) => ft.is_file(),
-            Err(_) => false,
-        };
+    for full_path in read_dir_sorted_paths(dir) {
+        let (_, is_file) = resolved_path_kind(&full_path);
 
         if is_file && full_path.extension().is_some_and(|ext| ext == "md") {
             if let Some(template) = load_template_from_file(&full_path, source, label) {
@@ -1125,15 +1305,15 @@ pub fn load_themes(options: LoadThemesOptions) -> LoadThemesResult {
 
     if options.include_defaults {
         themes.extend(load_themes_from_dir(
-            &user_dir,
-            "user",
-            "(user)",
-            &mut diagnostics,
-        ));
-        themes.extend(load_themes_from_dir(
             &project_dir,
             "project",
             "(project)",
+            &mut diagnostics,
+        ));
+        themes.extend(load_themes_from_dir(
+            &user_dir,
+            "user",
+            "(user)",
             &mut diagnostics,
         ));
     }
@@ -1189,18 +1369,9 @@ fn load_themes_from_dir(
     if !dir.exists() {
         return themes;
     }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return themes;
-    };
 
-    for entry in entries.flatten() {
-        let full_path = entry.path();
-        let file_type = entry.file_type();
-        let is_file = match file_type {
-            Ok(ft) if ft.is_symlink() => fs::metadata(&full_path).is_ok_and(|m| m.is_file()),
-            Ok(ft) => ft.is_file(),
-            Err(_) => false,
-        };
+    for full_path in read_dir_sorted_paths(dir) {
+        let (_, is_file) = resolved_path_kind(&full_path);
 
         if is_file && is_theme_file(&full_path) {
             if let Some(theme) = load_theme_from_file(&full_path, source, label, diagnostics) {
@@ -1303,7 +1474,11 @@ pub fn dedupe_prompts(
     let mut diagnostics = Vec::new();
 
     for prompt in prompts {
+        let real_path = canonical_identity_path(&prompt.file_path);
         if let Some(existing) = seen.get(&prompt.name) {
+            if canonical_identity_path(&existing.file_path) == real_path {
+                continue;
+            }
             diagnostics.push(ResourceDiagnostic {
                 kind: DiagnosticKind::Collision,
                 message: format!("name \"/{}\" collision", prompt.name),
@@ -1331,7 +1506,11 @@ pub fn dedupe_themes(themes: Vec<ThemeResource>) -> (Vec<ThemeResource>, Vec<Res
 
     for theme in themes {
         let key = theme.name.to_ascii_lowercase();
+        let real_path = canonical_identity_path(&theme.file_path);
         if let Some(existing) = seen.get(&key) {
+            if canonical_identity_path(&existing.file_path) == real_path {
+                continue;
+            }
             diagnostics.push(ResourceDiagnostic {
                 kind: DiagnosticKind::Collision,
                 message: format!("theme \"{}\" collision", theme.name),
@@ -1361,11 +1540,13 @@ pub fn parse_command_args(args: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
     let mut in_quote: Option<char> = None;
+    let mut just_closed_quote = false;
 
     for ch in args.chars() {
         if let Some(quote) = in_quote {
             if ch == quote {
                 in_quote = None;
+                just_closed_quote = true;
             } else {
                 current.push(ch);
             }
@@ -1374,21 +1555,35 @@ pub fn parse_command_args(args: &str) -> Vec<String> {
 
         if ch == '"' || ch == '\'' {
             in_quote = Some(ch);
-        } else if ch == ' ' || ch == '\t' {
-            if !current.is_empty() {
+        } else if ch.is_whitespace() {
+            if !current.is_empty() || just_closed_quote {
                 out.push(current.clone());
                 current.clear();
             }
+            just_closed_quote = false;
         } else {
             current.push(ch);
+            just_closed_quote = false;
         }
     }
 
-    if !current.is_empty() {
+    if !current.is_empty() || just_closed_quote {
         out.push(current);
     }
 
     out
+}
+
+fn split_command_name_and_args(text: &str, prefix_len: usize) -> (&str, &str) {
+    let body = &text[prefix_len..];
+    let Some((idx, _)) = body.char_indices().find(|(_, ch)| ch.is_whitespace()) else {
+        return (body, "");
+    };
+
+    let args_start = prefix_len + idx;
+    let name = &text[prefix_len..args_start];
+    let args = text[args_start..].trim_start_matches(char::is_whitespace);
+    (name, args)
 }
 
 /// Cached regex for positional `$1`, `$2`, … substitution.
@@ -1410,7 +1605,11 @@ pub fn substitute_args(content: &str, args: &[String]) -> String {
     // Positional $1, $2, ...
     result = replace_regex(&result, positional_arg_regex(), |caps| {
         let idx = caps[1].parse::<usize>().unwrap_or(0);
-        args.get(idx.saturating_sub(1)).cloned().unwrap_or_default()
+        if idx == 0 {
+            String::new()
+        } else {
+            args.get(idx.saturating_sub(1)).cloned().unwrap_or_default()
+        }
     });
 
     // ${@:start} or ${@:start:length}
@@ -1441,9 +1640,7 @@ pub fn expand_prompt_template(text: &str, templates: &[PromptTemplate]) -> Strin
     if !text.starts_with('/') {
         return text.to_string();
     }
-    let space_index = text.find(' ');
-    let name = space_index.map_or(&text[1..], |idx| &text[1..idx]);
-    let args = space_index.map_or("", |idx| &text[idx + 1..]);
+    let (name, args) = split_command_name_and_args(text, 1);
 
     if let Some(template) = templates.iter().find(|t| t.name == name) {
         let args = parse_command_args(args);
@@ -1458,9 +1655,7 @@ fn expand_skill_command(text: &str, skills: &[Skill]) -> String {
         return text.to_string();
     }
 
-    let space_index = text.find(' ');
-    let name = space_index.map_or(&text[7..], |idx| &text[7..idx]);
-    let args = space_index.map_or("", |idx| text[idx + 1..].trim());
+    let (name, args) = split_command_name_and_args(text, 7);
 
     let Some(skill) = skills.iter().find(|s| s.name == name) else {
         return text.to_string();
@@ -1613,12 +1808,193 @@ fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for path in paths {
-        let key = path.to_string_lossy().to_string();
+        let key = canonical_identity_path(&path).to_string_lossy().to_string();
         if seen.insert(key) {
             out.push(path);
         }
     }
     out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ResourcePathPrecedence {
+    CliExtension,
+    ProjectDirectory,
+    GlobalDirectory,
+    ProjectPackage,
+    GlobalPackage,
+}
+
+fn precedence_sorted_enabled_paths(resources: Vec<ResolvedResource>) -> Vec<PathBuf> {
+    let mut enabled = resources
+        .into_iter()
+        .filter(|resource| resource.enabled)
+        .collect::<Vec<_>>();
+    // Preserve source order within a precedence tier so CLI-specified
+    // extension/resource ordering remains behaviorally significant.
+    enabled.sort_by_key(resource_path_precedence);
+    enabled.into_iter().map(|resource| resource.path).collect()
+}
+
+fn merge_resource_paths(
+    explicit_paths: &[PathBuf],
+    cli_resources: Vec<ResolvedResource>,
+    resolved_resources: Vec<ResolvedResource>,
+    include_resolved: bool,
+) -> Vec<PathBuf> {
+    let mut merged = explicit_paths.to_vec();
+    merged.extend(precedence_sorted_enabled_paths(cli_resources));
+    if include_resolved {
+        merged.extend(precedence_sorted_enabled_paths(resolved_resources));
+    }
+    dedupe_paths(merged)
+}
+
+const fn resource_path_precedence(resource: &ResolvedResource) -> ResourcePathPrecedence {
+    match (resource.metadata.scope, resource.metadata.origin) {
+        (PackageScope::Temporary, _) => ResourcePathPrecedence::CliExtension,
+        (PackageScope::Project, ResourceOrigin::TopLevel) => {
+            ResourcePathPrecedence::ProjectDirectory
+        }
+        (PackageScope::User, ResourceOrigin::TopLevel) => ResourcePathPrecedence::GlobalDirectory,
+        (PackageScope::Project, ResourceOrigin::Package) => ResourcePathPrecedence::ProjectPackage,
+        (PackageScope::User, ResourceOrigin::Package) => ResourcePathPrecedence::GlobalPackage,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ExplicitResourceKind {
+    Skill,
+    Prompt,
+    Theme,
+}
+
+impl ExplicitResourceKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Skill => "skill",
+            Self::Prompt => "prompt template",
+            Self::Theme => "theme",
+        }
+    }
+
+    fn file_supported(self, path: &Path) -> bool {
+        match self {
+            Self::Skill | Self::Prompt => path.extension().is_some_and(|ext| ext == "md"),
+            Self::Theme => is_theme_file(path),
+        }
+    }
+
+    const fn unsupported_file_message(self) -> &'static str {
+        match self {
+            Self::Skill | Self::Prompt => "is not a markdown file",
+            Self::Theme => "is not a supported theme file (.json, .ini, or .theme)",
+        }
+    }
+}
+
+fn validate_explicit_resource_paths(
+    paths: &[PathBuf],
+    resource_kind: ExplicitResourceKind,
+) -> Result<()> {
+    for path in paths {
+        if !path.exists() {
+            return Err(Error::config(format!(
+                "Explicit {} path '{}' does not exist",
+                resource_kind.label(),
+                path.display()
+            )));
+        }
+
+        let metadata = fs::metadata(path).map_err(|err| {
+            Error::config(format!(
+                "Failed to inspect explicit {} path '{}': {err}",
+                resource_kind.label(),
+                path.display()
+            ))
+        })?;
+
+        if metadata.is_dir() {
+            continue;
+        }
+
+        if metadata.is_file() {
+            if resource_kind.file_supported(path) {
+                continue;
+            }
+
+            return Err(Error::config(format!(
+                "Explicit {} path '{}' {}",
+                resource_kind.label(),
+                path.display(),
+                resource_kind.unsupported_file_message()
+            )));
+        }
+
+        return Err(Error::config(format!(
+            "Explicit {} path '{}' is neither a file nor a directory",
+            resource_kind.label(),
+            path.display()
+        )));
+    }
+
+    Ok(())
+}
+
+fn ensure_explicit_file_paths_loaded(
+    explicit_paths: &[PathBuf],
+    loaded_paths: Vec<PathBuf>,
+    diagnostics: &[ResourceDiagnostic],
+    resource_kind: ExplicitResourceKind,
+) -> Result<()> {
+    let loaded_paths = loaded_paths
+        .into_iter()
+        .map(|path| canonical_identity_path(&path))
+        .collect::<HashSet<_>>();
+
+    for path in explicit_paths {
+        let metadata = fs::metadata(path).map_err(|err| {
+            Error::config(format!(
+                "Failed to inspect explicit {} path '{}': {err}",
+                resource_kind.label(),
+                path.display()
+            ))
+        })?;
+        if !metadata.is_file() {
+            continue;
+        }
+
+        let key = canonical_identity_path(path);
+        if loaded_paths.contains(&key) {
+            continue;
+        }
+
+        let detail = diagnostics
+            .iter()
+            .find_map(|diagnostic| {
+                if canonical_identity_path(&diagnostic.path) == key {
+                    return Some(diagnostic.message.clone());
+                }
+                diagnostic.collision.as_ref().and_then(|collision| {
+                    if canonical_identity_path(&collision.winner_path) == key
+                        || canonical_identity_path(&collision.loser_path) == key
+                    {
+                        Some(diagnostic.message.clone())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or_else(|| "file could not be loaded".to_string());
+
+        return Err(Error::config(format!(
+            "Explicit {} path '{}' could not be loaded: {detail}",
+            resource_kind.label(),
+            path.display()
+        )));
+    }
+
+    Ok(())
 }
 
 fn replace_regex<F>(input: &str, regex: &regex::Regex, mut replacer: F) -> String
@@ -1656,6 +2032,10 @@ mod tests {
             vec!["foo", "bar baz", "qux"]
         );
         assert_eq!(parse_command_args("foo 'bar baz'"), vec!["foo", "bar baz"]);
+        assert_eq!(
+            parse_command_args("foo\tbar\n\"baz qux\"\r\n''"),
+            vec!["foo", "bar", "baz qux", ""]
+        );
     }
 
     #[test]
@@ -1677,8 +2057,45 @@ mod tests {
             source: "user".to_string(),
             file_path: PathBuf::from("/tmp/review.md"),
         };
-        let out = expand_prompt_template("/review foo", &[template]);
+        let out = expand_prompt_template("/review foo", std::slice::from_ref(&template));
         assert_eq!(out, "Review foo");
+        let tab_out = expand_prompt_template("/review\tfoo", std::slice::from_ref(&template));
+        assert_eq!(tab_out, "Review foo");
+        let newline_out = expand_prompt_template("/review\nfoo", std::slice::from_ref(&template));
+        assert_eq!(newline_out, "Review foo");
+    }
+
+    #[test]
+    fn test_expand_skill_command_accepts_non_space_whitespace_separator() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skill_dir = dir.path().join("review");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        let skill_file = skill_dir.join("SKILL.md");
+        fs::write(
+            &skill_file,
+            "---\nname: review\ndescription: Review code\n---\nSkill body.\n",
+        )
+        .expect("write skill");
+
+        let skill = Skill {
+            name: "review".to_string(),
+            description: "Review code".to_string(),
+            file_path: skill_file,
+            base_dir: skill_dir,
+            source: "user".to_string(),
+            disable_model_invocation: false,
+        };
+
+        let tab_out = expand_skill_command(
+            "/skill:review\tfocus this file",
+            std::slice::from_ref(&skill),
+        );
+        assert!(tab_out.contains("Skill body."));
+        assert!(tab_out.ends_with("focus this file"));
+
+        let newline_out = expand_skill_command("/skill:review\nfocus this file", &[skill]);
+        assert!(newline_out.contains("Skill body."));
+        assert!(newline_out.ends_with("focus this file"));
     }
 
     #[test]
@@ -1708,11 +2125,32 @@ mod tests {
     }
 
     #[test]
+    fn test_resource_cli_options_detect_explicit_paths() {
+        let empty = ResourceCliOptions {
+            no_skills: false,
+            no_prompt_templates: false,
+            no_extensions: false,
+            no_themes: false,
+            skill_paths: Vec::new(),
+            prompt_paths: Vec::new(),
+            extension_paths: Vec::new(),
+            theme_paths: Vec::new(),
+        };
+        assert!(!empty.has_explicit_paths());
+
+        let with_extension = ResourceCliOptions {
+            extension_paths: vec!["./ext.native.json".to_string()],
+            ..empty
+        };
+        assert!(with_extension.has_explicit_paths());
+    }
+
+    #[test]
     fn test_cli_extensions_load_when_no_extensions_flag_set() {
         run_async(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
-            let extension_path = temp_dir.path().join("ext.js");
-            fs::write(&extension_path, "export default function() {}").expect("write extension");
+            let extension_path = temp_dir.path().join("ext.native.json");
+            fs::write(&extension_path, "{}").expect("write extension");
 
             let manager = PackageManager::new(temp_dir.path().to_path_buf());
             let config = Config::default();
@@ -1735,11 +2173,242 @@ mod tests {
     }
 
     #[test]
+    fn test_resource_loader_rejects_missing_cli_extension_path() {
+        run_async(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let missing_path = temp_dir.path().join("missing.native.json");
+
+            let manager = PackageManager::new(temp_dir.path().to_path_buf());
+            let config = Config::default();
+            let cli = ResourceCliOptions {
+                no_skills: true,
+                no_prompt_templates: true,
+                no_extensions: false,
+                no_themes: true,
+                skill_paths: Vec::new(),
+                prompt_paths: Vec::new(),
+                extension_paths: vec![missing_path.to_string_lossy().to_string()],
+                theme_paths: Vec::new(),
+            };
+
+            let err = ResourceLoader::load(&manager, temp_dir.path(), &config, &cli)
+                .await
+                .expect_err("missing explicit CLI extension path should fail");
+            assert!(
+                err.to_string().contains("does not exist"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_resource_loader_rejects_missing_cli_skill_path() {
+        run_async(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let missing_path = temp_dir.path().join("missing-skill.md");
+
+            let manager = PackageManager::new(temp_dir.path().to_path_buf());
+            let config = Config::default();
+            let cli = ResourceCliOptions {
+                no_skills: false,
+                no_prompt_templates: true,
+                no_extensions: true,
+                no_themes: true,
+                skill_paths: vec![missing_path.to_string_lossy().to_string()],
+                prompt_paths: Vec::new(),
+                extension_paths: Vec::new(),
+                theme_paths: Vec::new(),
+            };
+
+            let err = ResourceLoader::load(&manager, temp_dir.path(), &config, &cli)
+                .await
+                .expect_err("missing explicit CLI skill path should fail");
+            assert!(
+                err.to_string().contains("does not exist"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_resource_loader_rejects_missing_cli_prompt_path() {
+        run_async(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let missing_path = temp_dir.path().join("missing-prompt.md");
+
+            let manager = PackageManager::new(temp_dir.path().to_path_buf());
+            let config = Config::default();
+            let cli = ResourceCliOptions {
+                no_skills: true,
+                no_prompt_templates: false,
+                no_extensions: true,
+                no_themes: true,
+                skill_paths: Vec::new(),
+                prompt_paths: vec![missing_path.to_string_lossy().to_string()],
+                extension_paths: Vec::new(),
+                theme_paths: Vec::new(),
+            };
+
+            let err = ResourceLoader::load(&manager, temp_dir.path(), &config, &cli)
+                .await
+                .expect_err("missing explicit CLI prompt path should fail");
+            assert!(
+                err.to_string().contains("does not exist"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resource_loader_accepts_explicit_cli_prompt_alias_path() {
+        run_async(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let prompt_dir = temp_dir.path().join("prompts");
+            fs::create_dir_all(&prompt_dir).expect("create prompt dir");
+            let prompt_path = prompt_dir.join("review.md");
+            fs::write(
+                &prompt_path,
+                "---\ndescription: Review prompt\n---\nReview body\n",
+            )
+            .expect("write prompt");
+            let alias_path = temp_dir.path().join("review-alias.md");
+            std::os::unix::fs::symlink(&prompt_path, &alias_path).expect("create prompt alias");
+
+            let manager = PackageManager::new(temp_dir.path().to_path_buf());
+            let config = Config::default();
+            let cli = ResourceCliOptions {
+                no_skills: true,
+                no_prompt_templates: false,
+                no_extensions: true,
+                no_themes: true,
+                skill_paths: Vec::new(),
+                prompt_paths: vec![
+                    prompt_path.to_string_lossy().to_string(),
+                    alias_path.to_string_lossy().to_string(),
+                ],
+                extension_paths: Vec::new(),
+                theme_paths: Vec::new(),
+            };
+
+            let loader = ResourceLoader::load(&manager, temp_dir.path(), &config, &cli)
+                .await
+                .expect("load explicit prompt alias");
+            assert_eq!(loader.prompts().len(), 1);
+            assert_eq!(loader.prompts()[0].file_path, prompt_path);
+            assert!(loader.prompt_diagnostics().is_empty());
+        });
+    }
+
+    #[test]
+    fn test_resource_loader_rejects_invalid_cli_skill_file() {
+        run_async(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let skill_dir = temp_dir.path().join("bad-skill");
+            fs::create_dir_all(&skill_dir).expect("create skill dir");
+            let skill_path = skill_dir.join("SKILL.md");
+            fs::write(&skill_path, "# Missing frontmatter\n").expect("write skill");
+
+            let manager = PackageManager::new(temp_dir.path().to_path_buf());
+            let config = Config::default();
+            let cli = ResourceCliOptions {
+                no_skills: false,
+                no_prompt_templates: true,
+                no_extensions: true,
+                no_themes: true,
+                skill_paths: vec![skill_path.to_string_lossy().to_string()],
+                prompt_paths: Vec::new(),
+                extension_paths: Vec::new(),
+                theme_paths: Vec::new(),
+            };
+
+            let err = ResourceLoader::load(&manager, temp_dir.path(), &config, &cli)
+                .await
+                .expect_err("invalid explicit CLI skill file should fail");
+            assert!(
+                err.to_string().contains("description is required"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_resource_loader_rejects_invalid_cli_theme_file() {
+        run_async(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let theme_path = temp_dir.path().join("broken.json");
+            fs::write(&theme_path, "{not-json").expect("write theme");
+
+            let manager = PackageManager::new(temp_dir.path().to_path_buf());
+            let config = Config::default();
+            let cli = ResourceCliOptions {
+                no_skills: true,
+                no_prompt_templates: true,
+                no_extensions: true,
+                no_themes: false,
+                skill_paths: Vec::new(),
+                prompt_paths: Vec::new(),
+                extension_paths: Vec::new(),
+                theme_paths: vec![theme_path.to_string_lossy().to_string()],
+            };
+
+            let err = ResourceLoader::load(&manager, temp_dir.path(), &config, &cli)
+                .await
+                .expect_err("invalid explicit CLI theme file should fail");
+            assert!(
+                err.to_string().contains("could not be loaded"),
+                "unexpected error: {err}"
+            );
+            assert!(
+                err.to_string().contains("Failed to load theme"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resource_loader_accepts_explicit_cli_theme_alias_path() {
+        run_async(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let theme_dir = temp_dir.path().join("themes");
+            fs::create_dir_all(&theme_dir).expect("create theme dir");
+            let theme_path = theme_dir.join("dark.ini");
+            fs::write(&theme_path, "[styles]\nbrand.accent = bold #38bdf8\n").expect("write theme");
+            let alias_path = temp_dir.path().join("dark-alias.ini");
+            std::os::unix::fs::symlink(&theme_path, &alias_path).expect("create theme alias");
+
+            let manager = PackageManager::new(temp_dir.path().to_path_buf());
+            let config = Config::default();
+            let cli = ResourceCliOptions {
+                no_skills: true,
+                no_prompt_templates: true,
+                no_extensions: true,
+                no_themes: false,
+                skill_paths: Vec::new(),
+                prompt_paths: Vec::new(),
+                extension_paths: Vec::new(),
+                theme_paths: vec![
+                    theme_path.to_string_lossy().to_string(),
+                    alias_path.to_string_lossy().to_string(),
+                ],
+            };
+
+            let loader = ResourceLoader::load(&manager, temp_dir.path(), &config, &cli)
+                .await
+                .expect("load explicit theme alias");
+            assert_eq!(loader.themes().len(), 1);
+            assert_eq!(loader.themes()[0].file_path, theme_path);
+            assert!(loader.theme_diagnostics().is_empty());
+        });
+    }
+
+    #[test]
     fn test_extension_paths_deduped_between_settings_and_cli() {
         run_async(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
-            let extension_path = temp_dir.path().join("ext.js");
-            fs::write(&extension_path, "export default function() {}").expect("write extension");
+            let extension_path = temp_dir.path().join("ext.native.json");
+            fs::write(&extension_path, "{}").expect("write extension");
 
             let settings_dir = temp_dir.path().join(".pi");
             fs::create_dir_all(&settings_dir).expect("create settings dir");
@@ -1806,16 +2475,29 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_string_list_variants() {
+    fn test_extract_manifest_string_list_variants() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manifest_path = temp.path().join("package.json");
         assert_eq!(
-            extract_string_list(&Value::String("one".to_string())),
+            extract_manifest_string_list(
+                &manifest_path,
+                "extensions",
+                &Value::String("one".to_string())
+            )
+            .expect("single string should parse"),
             vec!["one".to_string()]
         );
         assert_eq!(
-            extract_string_list(&json!(["one", 2, "three", true, null])),
+            extract_manifest_string_list(&manifest_path, "extensions", &json!(["one", "three"]))
+                .expect("string arrays should parse"),
             vec!["one".to_string(), "three".to_string()]
         );
-        assert!(extract_string_list(&json!({"a": 1})).is_empty());
+        let err = extract_manifest_string_list(&manifest_path, "extensions", &json!({"a": 1}))
+            .expect_err("objects should be rejected");
+        assert!(
+            err.to_string()
+                .contains("`pi.extensions` must be a string or array of strings")
+        );
     }
 
     #[test]
@@ -1956,6 +2638,200 @@ still frontmatter",
                 PathBuf::from("/a"),
                 PathBuf::from("/b"),
                 PathBuf::from("/c"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_read_dir_sorted_paths_returns_lexicographic_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("z.md"), "z").expect("write z");
+        fs::write(temp.path().join("a.md"), "a").expect("write a");
+
+        let names: Vec<String> = read_dir_sorted_paths(temp.path())
+            .into_iter()
+            .map(|path| {
+                path.file_name()
+                    .expect("file name")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(names, vec!["a.md", "z.md"]);
+    }
+
+    #[test]
+    fn test_precedence_sorted_enabled_paths_orders_by_documented_resource_priority() {
+        let resources = vec![
+            ResolvedResource {
+                path: PathBuf::from("/global/package/review.md"),
+                enabled: true,
+                metadata: crate::package_manager::PathMetadata {
+                    source: "pkg:user".to_string(),
+                    scope: PackageScope::User,
+                    origin: ResourceOrigin::Package,
+                    base_dir: None,
+                },
+            },
+            ResolvedResource {
+                path: PathBuf::from("/project/.pi/prompts/review.md"),
+                enabled: true,
+                metadata: crate::package_manager::PathMetadata {
+                    source: "local:project".to_string(),
+                    scope: PackageScope::Project,
+                    origin: ResourceOrigin::TopLevel,
+                    base_dir: None,
+                },
+            },
+            ResolvedResource {
+                path: PathBuf::from("/global/.pi/prompts/review.md"),
+                enabled: true,
+                metadata: crate::package_manager::PathMetadata {
+                    source: "local:user".to_string(),
+                    scope: PackageScope::User,
+                    origin: ResourceOrigin::TopLevel,
+                    base_dir: None,
+                },
+            },
+            ResolvedResource {
+                path: PathBuf::from("/project/package/review.md"),
+                enabled: true,
+                metadata: crate::package_manager::PathMetadata {
+                    source: "pkg:project".to_string(),
+                    scope: PackageScope::Project,
+                    origin: ResourceOrigin::Package,
+                    base_dir: None,
+                },
+            },
+            ResolvedResource {
+                path: PathBuf::from("/tmp/cli-ext/review.md"),
+                enabled: true,
+                metadata: crate::package_manager::PathMetadata {
+                    source: "cli-extension".to_string(),
+                    scope: PackageScope::Temporary,
+                    origin: ResourceOrigin::Package,
+                    base_dir: None,
+                },
+            },
+            ResolvedResource {
+                path: PathBuf::from("/disabled/ignored.md"),
+                enabled: false,
+                metadata: crate::package_manager::PathMetadata {
+                    source: "ignored".to_string(),
+                    scope: PackageScope::Project,
+                    origin: ResourceOrigin::TopLevel,
+                    base_dir: None,
+                },
+            },
+        ];
+
+        let sorted = precedence_sorted_enabled_paths(resources);
+        assert_eq!(
+            sorted,
+            vec![
+                PathBuf::from("/tmp/cli-ext/review.md"),
+                PathBuf::from("/project/.pi/prompts/review.md"),
+                PathBuf::from("/global/.pi/prompts/review.md"),
+                PathBuf::from("/project/package/review.md"),
+                PathBuf::from("/global/package/review.md"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_precedence_sorted_enabled_paths_preserves_source_order_within_same_precedence() {
+        let resources = vec![
+            ResolvedResource {
+                path: PathBuf::from("/tmp/cli-ext/zeta/review.md"),
+                enabled: true,
+                metadata: crate::package_manager::PathMetadata {
+                    source: "cli-extension:zeta".to_string(),
+                    scope: PackageScope::Temporary,
+                    origin: ResourceOrigin::Package,
+                    base_dir: None,
+                },
+            },
+            ResolvedResource {
+                path: PathBuf::from("/tmp/cli-ext/alpha/review.md"),
+                enabled: true,
+                metadata: crate::package_manager::PathMetadata {
+                    source: "cli-extension:alpha".to_string(),
+                    scope: PackageScope::Temporary,
+                    origin: ResourceOrigin::Package,
+                    base_dir: None,
+                },
+            },
+            ResolvedResource {
+                path: PathBuf::from("/project/.pi/prompts/review.md"),
+                enabled: true,
+                metadata: crate::package_manager::PathMetadata {
+                    source: "local:project".to_string(),
+                    scope: PackageScope::Project,
+                    origin: ResourceOrigin::TopLevel,
+                    base_dir: None,
+                },
+            },
+        ];
+
+        let sorted = precedence_sorted_enabled_paths(resources);
+        assert_eq!(
+            sorted,
+            vec![
+                PathBuf::from("/tmp/cli-ext/zeta/review.md"),
+                PathBuf::from("/tmp/cli-ext/alpha/review.md"),
+                PathBuf::from("/project/.pi/prompts/review.md"),
+            ],
+            "same-tier resources should keep their original source order"
+        );
+    }
+
+    #[test]
+    fn test_merge_resource_paths_keeps_explicit_cli_paths_first() {
+        let explicit_path = PathBuf::from("/cli/direct/review.md");
+        let merged = merge_resource_paths(
+            std::slice::from_ref(&explicit_path),
+            vec![ResolvedResource {
+                path: PathBuf::from("/tmp/cli-ext/review.md"),
+                enabled: true,
+                metadata: crate::package_manager::PathMetadata {
+                    source: "cli-extension".to_string(),
+                    scope: PackageScope::Temporary,
+                    origin: ResourceOrigin::Package,
+                    base_dir: None,
+                },
+            }],
+            vec![
+                ResolvedResource {
+                    path: PathBuf::from("/project/.pi/prompts/review.md"),
+                    enabled: true,
+                    metadata: crate::package_manager::PathMetadata {
+                        source: "local:project".to_string(),
+                        scope: PackageScope::Project,
+                        origin: ResourceOrigin::TopLevel,
+                        base_dir: None,
+                    },
+                },
+                ResolvedResource {
+                    path: PathBuf::from("/global/.pi/prompts/review.md"),
+                    enabled: true,
+                    metadata: crate::package_manager::PathMetadata {
+                        source: "local:user".to_string(),
+                        scope: PackageScope::User,
+                        origin: ResourceOrigin::TopLevel,
+                        base_dir: None,
+                    },
+                },
+            ],
+            true,
+        );
+
+        assert_eq!(
+            merged,
+            vec![
+                explicit_path,
+                PathBuf::from("/tmp/cli-ext/review.md"),
+                PathBuf::from("/project/.pi/prompts/review.md"),
+                PathBuf::from("/global/.pi/prompts/review.md"),
             ]
         );
     }
@@ -2120,6 +2996,16 @@ still frontmatter",
         assert_eq!(parse_command_args("foo \"bar"), vec!["foo", "bar"]);
     }
 
+    #[test]
+    fn test_parse_command_args_preserves_empty_quoted_args() {
+        assert_eq!(parse_command_args("\"\""), vec![""]);
+        assert_eq!(parse_command_args("''"), vec![""]);
+        assert_eq!(
+            parse_command_args("foo \"\" bar ''"),
+            vec!["foo", "", "bar", ""]
+        );
+    }
+
     // ── substitute_args edge cases ─────────────────────────────────────
 
     #[test]
@@ -2131,20 +3017,27 @@ still frontmatter",
     #[test]
     fn test_substitute_args_zero_positional() {
         let args = vec!["one".to_string(), "two".to_string()];
-        // $0 → index 0-1 = index -1 which saturates → args[0]? No, it tries idx.saturating_sub(1) = 0
-        // Actually $0 parsed as idx=0, then 0.saturating_sub(1) = 0, so args[0] = "one"
-        // Wait, 0usize.saturating_sub(1) = 0, but that's still index 0 which is "one"
-        // Hmm, actually 0_usize.saturating_sub(1) = 0, so args.get(0) = Some("one")
-        // But logically $0 shouldn't match anything... let me just test the behavior
         let result = substitute_args("$0", &args);
-        // $0 → idx=0, 0.saturating_sub(1)=0, args[0]="one"
-        assert_eq!(result, "one");
+        assert_eq!(result, "");
     }
 
     #[test]
     fn test_substitute_args_empty_args() {
         let result = substitute_args("$1 $@ $ARGUMENTS", &[]);
         assert_eq!(result, "  ");
+    }
+
+    #[test]
+    fn panic_payload_message_handles_known_payload_types() {
+        let string_payload: Box<dyn std::any::Any + Send + 'static> =
+            Box::new("loader panic".to_string());
+        assert_eq!(
+            panic_payload_message(string_payload),
+            "loader panic".to_string()
+        );
+
+        let str_payload: Box<dyn std::any::Any + Send + 'static> = Box::new("panic str");
+        assert_eq!(panic_payload_message(str_payload), "panic str".to_string());
     }
 
     // ── expand_prompt_template edge cases ──────────────────────────────
@@ -2159,6 +3052,48 @@ still frontmatter",
     fn test_expand_prompt_template_unknown_command_returns_as_is() {
         let result = expand_prompt_template("/nonexistent foo", &[]);
         assert_eq!(result, "/nonexistent foo");
+    }
+
+    #[test]
+    fn test_expand_prompt_template_preserves_empty_positional_arguments() {
+        let template = PromptTemplate {
+            name: "review".to_string(),
+            description: "review prompt".to_string(),
+            content: "first=[$1] second=[$2] rest=[${@:2}]".to_string(),
+            source: "test".to_string(),
+            file_path: PathBuf::from("/review.md"),
+        };
+
+        let result = expand_prompt_template("/review \"\" foo", &[template]);
+        assert_eq!(result, "first=[] second=[foo] rest=[foo]");
+    }
+
+    #[test]
+    fn test_expand_prompt_template_preserves_trailing_empty_positional_arguments() {
+        let template = PromptTemplate {
+            name: "review".to_string(),
+            description: "review prompt".to_string(),
+            content: "first=[$1] second=[$2] third=[$3]".to_string(),
+            source: "test".to_string(),
+            file_path: PathBuf::from("/review.md"),
+        };
+
+        let result = expand_prompt_template("/review foo \"\"", &[template]);
+        assert_eq!(result, "first=[foo] second=[] third=[]");
+    }
+
+    #[test]
+    fn test_expand_prompt_template_preserves_repeated_empty_quoted_arguments() {
+        let template = PromptTemplate {
+            name: "review".to_string(),
+            description: "review prompt".to_string(),
+            content: "first=[$1] second=[$2] third=[$3] fourth=[$4]".to_string(),
+            source: "test".to_string(),
+            file_path: PathBuf::from("/review.md"),
+        };
+
+        let result = expand_prompt_template("/review foo \"\" \"\" bar", &[template]);
+        assert_eq!(result, "first=[foo] second=[] third=[] fourth=[bar]");
     }
 
     // ── parse_frontmatter edge cases ───────────────────────────────────
@@ -2223,6 +3158,85 @@ still frontmatter",
         assert_eq!(result, "a[1]b[2]c[3]");
     }
 
+    // ── package manifest parsing ──────────────────────────────────────
+
+    #[test]
+    fn test_read_pi_manifest_returns_none_when_package_json_is_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let pi = read_pi_manifest(tmp.path()).expect("missing package.json should not error");
+        assert!(pi.is_none());
+    }
+
+    #[test]
+    fn test_read_pi_manifest_errors_on_malformed_package_json() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tmp.path().join("package.json");
+        fs::write(&manifest_path, "{ not valid json").expect("write malformed package.json");
+
+        let err = read_pi_manifest(tmp.path()).expect_err("malformed package.json must error");
+        let message = err.to_string();
+        assert!(message.contains("Failed to parse package manifest"));
+        assert!(message.contains(&manifest_path.display().to_string()));
+    }
+
+    #[test]
+    fn test_read_pi_manifest_errors_when_pi_field_is_not_object() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tmp.path().join("package.json");
+        fs::write(&manifest_path, r#"{"name":"pkg","pi":"not-an-object"}"#)
+            .expect("write invalid pi manifest");
+
+        let err = read_pi_manifest(tmp.path()).expect_err("non-object `pi` field must error");
+        let message = err.to_string();
+        assert!(message.contains("Invalid package manifest"));
+        assert!(message.contains("`pi` must be an object"));
+        assert!(message.contains(&manifest_path.display().to_string()));
+    }
+
+    #[test]
+    fn test_read_pi_manifest_allows_default_fallback_when_pi_key_is_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manifest_path = tmp.path().join("package.json");
+        fs::write(&manifest_path, r#"{"name":"pkg","version":"1.0.0"}"#)
+            .expect("write package.json");
+
+        let pi = read_pi_manifest(tmp.path()).expect("missing `pi` key should not error");
+        assert!(pi.is_none());
+    }
+
+    #[test]
+    fn test_append_resources_from_manifest_errors_on_invalid_resource_entry_type() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pi = json!({
+            "extensions": ["ok", 7]
+        });
+
+        let mut resources = PackageResources::default();
+        let err = append_resources_from_manifest(&mut resources, tmp.path(), &pi)
+            .expect_err("non-string manifest entries must error");
+        assert!(
+            err.to_string()
+                .contains("`pi.extensions` must be a string or array of strings")
+        );
+    }
+
+    #[test]
+    fn test_append_resources_from_manifest_errors_on_outside_root_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pi = json!({
+            "skills": "../outside/skills"
+        });
+
+        let mut resources = PackageResources::default();
+        let err = append_resources_from_manifest(&mut resources, tmp.path(), &pi)
+            .expect_err("outside-root manifest paths must error");
+        assert!(
+            err.to_string()
+                .contains("`pi.skills` paths must stay within the package root")
+        );
+    }
+
     // ── load_skill_from_file with valid skill ──────────────────────────
 
     #[test]
@@ -2275,6 +3289,139 @@ still frontmatter",
         let result = load_skills_from_dir(skills_root, "test".to_string(), true);
         assert_eq!(result.skills.len(), 1);
         assert_eq!(result.skills[0].name, "my-skill");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_load_skills_ignores_alias_symlink_to_same_skill_tree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skills_root = tmp.path().join("skills");
+        let real_root = skills_root.join("real");
+        let skill_dir = real_root.join("my-skill");
+        fs::create_dir_all(&skill_dir).expect("mkdir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: Symlink alias guard test\n---\nBody",
+        )
+        .expect("write skill");
+
+        std::os::unix::fs::symlink(&real_root, skills_root.join("alias"))
+            .expect("create alias symlink");
+
+        let result = load_skills(LoadSkillsOptions {
+            cwd: tmp.path().to_path_buf(),
+            agent_dir: tmp.path().join("agent"),
+            skill_paths: vec![skills_root],
+            include_defaults: false,
+        });
+
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skills[0].name, "my-skill");
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_load_skills_dedupes_diagnostics_across_alias_roots() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real_root = tmp.path().join("skills-real");
+        let alias_root = tmp.path().join("skills-alias");
+        let skill_dir = real_root.join("my-skill");
+        fs::create_dir_all(&skill_dir).expect("mkdir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: Alias diagnostic guard test\ninvalid-field: nope\n---\nBody",
+        )
+        .expect("write skill");
+
+        std::os::unix::fs::symlink(&real_root, &alias_root).expect("create alias root");
+
+        let result = load_skills(LoadSkillsOptions {
+            cwd: tmp.path().to_path_buf(),
+            agent_dir: tmp.path().join("agent"),
+            skill_paths: vec![real_root, alias_root],
+            include_defaults: false,
+        });
+
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skills[0].name, "my-skill");
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].path, skill_dir.join("SKILL.md"));
+        assert!(
+            result.diagnostics[0]
+                .message
+                .contains("unknown frontmatter field")
+        );
+    }
+
+    #[test]
+    fn test_load_skills_prefers_lexicographically_first_duplicate_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("skills");
+        let z_skill = root.join("z").join("dup-skill");
+        let a_skill = root.join("a").join("dup-skill");
+        fs::create_dir_all(&z_skill).expect("create z skill dir");
+        fs::create_dir_all(&a_skill).expect("create a skill dir");
+        fs::write(
+            z_skill.join("SKILL.md"),
+            "---\nname: dup-skill\ndescription: z duplicate\n---\nZ body",
+        )
+        .expect("write z skill");
+        fs::write(
+            a_skill.join("SKILL.md"),
+            "---\nname: dup-skill\ndescription: a duplicate\n---\nA body",
+        )
+        .expect("write a skill");
+
+        let result = load_skills(LoadSkillsOptions {
+            cwd: temp.path().to_path_buf(),
+            agent_dir: temp.path().join("agent"),
+            skill_paths: vec![root],
+            include_defaults: false,
+        });
+
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skills[0].file_path, a_skill.join("SKILL.md"));
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(
+            result.diagnostics[0]
+                .collision
+                .as_ref()
+                .expect("collision")
+                .winner_path,
+            a_skill.join("SKILL.md")
+        );
+    }
+
+    #[test]
+    fn test_load_themes_prefers_lexicographically_first_duplicate_stem() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let themes_dir = temp.path().join("themes");
+        let dark_theme = themes_dir.join("dark.theme");
+        let dark_ini = themes_dir.join("dark.ini");
+        fs::create_dir_all(&themes_dir).expect("create themes dir");
+        fs::write(&dark_theme, "#445566").expect("write theme");
+        fs::write(&dark_ini, "#112233").expect("write ini");
+
+        let loaded = load_themes(LoadThemesOptions {
+            cwd: temp.path().to_path_buf(),
+            agent_dir: temp.path().join("agent"),
+            theme_paths: vec![themes_dir],
+            include_defaults: false,
+        });
+        let (themes, diagnostics) = dedupe_themes(loaded.themes);
+
+        assert_eq!(themes.len(), 1);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(themes[0].file_path, dark_ini);
+        assert_eq!(
+            diagnostics[0]
+                .collision
+                .as_ref()
+                .expect("collision")
+                .winner_path,
+            dark_ini
+        );
     }
 
     // ── Property tests ──────────────────────────────────────────────────

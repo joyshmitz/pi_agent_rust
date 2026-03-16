@@ -1,13 +1,13 @@
 {
   "schema": "pi.ext.risk_review.v1",
-  "generated_at": "2026-02-12T17:00:56.689504325+00:00",
+  "generated_at": "2026-03-12T02:18:59.858720668+00:00",
   "summary": {
     "total_artifacts": 208,
     "license_clear": 179,
     "license_copyleft": 0,
     "license_unknown": 29,
-    "security_clean": 107,
-    "security_info_only": 95,
+    "security_clean": 105,
+    "security_info_only": 97,
     "security_warnings": 6,
     "security_critical": 0,
     "has_npm_deps": 32,
@@ -567,7 +567,10 @@
       "license": "MIT",
       "license_source": "provenance_manifest",
       "redistributable": "yes",
-      "security_severity": "clean",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files"
+      ],
       "has_npm_deps": false,
       "risk_level": "minimal"
     },
@@ -601,7 +604,10 @@
       "license": "MIT",
       "license_source": "provenance_manifest",
       "redistributable": "yes",
-      "security_severity": "clean",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files"
+      ],
       "has_npm_deps": false,
       "risk_level": "minimal"
     },
@@ -1236,7 +1242,6 @@
       "redistributable": "yes",
       "security_severity": "info",
       "security_findings": [
-        "[Info] child_process: Uses child_process module (common in extensions)",
         "[Info] .env: References .env files",
         "[Info] Buffer.from(: Binary buffer operations"
       ],

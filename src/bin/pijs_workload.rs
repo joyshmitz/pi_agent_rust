@@ -19,8 +19,6 @@ use std::time::{Duration, Instant};
 
 const BENCH_BEGIN_FN: &str = "__bench_begin_roundtrip";
 const BENCH_ASSERT_FN: &str = "__bench_assert_roundtrip";
-const NATIVE_RUNTIME_DESCRIPTOR_PATH: &str =
-    "/tmp/pi_agent_rust_native_bench_descriptor.native.json";
 const NATIVE_RUNTIME_TOOL_NAME: &str = "bench_tool";
 
 const BENCH_TOOL_SETUP: &str = r#"
@@ -301,9 +299,14 @@ fn run() -> Result<()> {
 }
 
 fn setup_native_runtime_bench_handle() -> Result<ExtensionRuntimeHandle> {
-    fs::write(NATIVE_RUNTIME_DESCRIPTOR_PATH, NATIVE_RUNTIME_DESCRIPTOR).map_err(|err| {
+    let descriptor_path = std::env::temp_dir().join(format!(
+        "pi_agent_rust_native_bench_descriptor_{}.native.json",
+        std::process::id()
+    ));
+    fs::write(&descriptor_path, NATIVE_RUNTIME_DESCRIPTOR).map_err(|err| {
         Error::extension(format!(
-            "native workload: failed to write descriptor {NATIVE_RUNTIME_DESCRIPTOR_PATH}: {err}"
+            "native workload: failed to write descriptor {}: {err}",
+            descriptor_path.display()
         ))
     })?;
 
@@ -311,7 +314,7 @@ fn setup_native_runtime_bench_handle() -> Result<ExtensionRuntimeHandle> {
     let manager = ExtensionManager::new();
     manager.set_runtime(ExtensionRuntimeHandle::NativeRust(runtime.clone()));
 
-    let spec = NativeRustExtensionLoadSpec::from_entry_path(NATIVE_RUNTIME_DESCRIPTOR_PATH)?;
+    let spec = NativeRustExtensionLoadSpec::from_entry_path(&*descriptor_path.to_string_lossy())?;
     block_on(manager.load_native_extensions(vec![spec]))?;
     Ok(ExtensionRuntimeHandle::NativeRust(runtime))
 }

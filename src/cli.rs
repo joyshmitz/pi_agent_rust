@@ -2,6 +2,7 @@
 
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionCliFlag {
@@ -37,6 +38,7 @@ const ROOT_SUBCOMMANDS: &[&str] = &[
     "list",
     "config",
     "doctor",
+    "migrate",
 ];
 
 fn known_long_option(name: &str) -> Option<LongOptionSpec> {
@@ -55,7 +57,8 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "no-skills"
         | "no-prompt-templates"
         | "no-themes"
-        | "list-providers" => (false, false),
+        | "list-providers"
+        | "hide-cwd-in-prompt" => (false, false),
         "provider"
         | "model"
         | "api-key"
@@ -95,6 +98,15 @@ fn is_known_short_flag(token: &str) -> bool {
     }
     body.chars()
         .all(|ch| matches!(ch, 'v' | 'c' | 'r' | 'p' | 'e'))
+}
+
+fn short_flag_expects_value(token: &str) -> bool {
+    if !is_known_short_flag(token) {
+        return false;
+    }
+
+    let body = &token[1..];
+    body.find('e').is_some_and(|index| index == body.len() - 1)
 }
 
 fn is_negative_numeric_token(token: &str) -> bool {
@@ -190,6 +202,7 @@ fn preprocess_extension_flags(raw_args: &[String]) -> (Vec<String>, Vec<Extensio
         }
         if is_known_short_flag(token) {
             filtered.push(token.clone());
+            expecting_value = short_flag_expects_value(token);
             index += 1;
             continue;
         }
@@ -351,8 +364,11 @@ pub struct Cli {
     #[arg(long)]
     pub no_tools: bool,
 
-    /// Specific tools to enable (comma-separated: read,bash,edit,write,grep,find,ls)
-    #[arg(long, default_value = "read,bash,edit,write")]
+    /// Specific tools to enable (comma-separated: read,bash,edit,write,grep,find,ls,hashline_edit)
+    #[arg(
+        long,
+        default_value = "read,bash,edit,write,grep,find,ls,hashline_edit"
+    )]
     pub tools: String,
 
     // === Extensions ===
@@ -411,6 +427,11 @@ pub struct Cli {
     #[arg(long)]
     pub no_themes: bool,
 
+    // === System prompt modifiers ===
+    /// Hide the current working directory from the system prompt.
+    #[arg(long, env = "PI_HIDE_CWD_IN_PROMPT")]
+    pub hide_cwd_in_prompt: bool,
+
     // === Export & Listing ===
     /// Export session file to HTML
     #[arg(long)]
@@ -438,8 +459,8 @@ pub struct Cli {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands, parse_with_extension_flags};
-    use clap::Parser;
+    use super::{Cli, Commands, ROOT_SUBCOMMANDS, parse_with_extension_flags};
+    use clap::{CommandFactory, Parser};
 
     // ── 1. Basic flag parsing ────────────────────────────────────────
 
@@ -662,7 +683,7 @@ mod tests {
                 assert_eq!(source, "npm:@org/pkg");
                 assert!(!local);
             }
-            other => panic!("expected Install, got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -674,7 +695,7 @@ mod tests {
                 assert_eq!(source, "git:https://example.com");
                 assert!(local);
             }
-            other => panic!("expected Install --local, got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -683,7 +704,7 @@ mod tests {
         let cli = Cli::parse_from(["pi", "install", "-l", "./local-ext"]);
         match cli.command {
             Some(Commands::Install { local, .. }) => assert!(local),
-            other => panic!("expected Install -l, got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -695,7 +716,7 @@ mod tests {
                 assert_eq!(source, "npm:pkg");
                 assert!(!local);
             }
-            other => panic!("expected Remove, got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -704,7 +725,7 @@ mod tests {
         let cli = Cli::parse_from(["pi", "remove", "--local", "npm:pkg"]);
         match cli.command {
             Some(Commands::Remove { local, .. }) => assert!(local),
-            other => panic!("expected Remove --local, got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -715,7 +736,7 @@ mod tests {
             Some(Commands::Update { source }) => {
                 assert_eq!(source.as_deref(), Some("npm:pkg"));
             }
-            other => panic!("expected Update with source, got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -724,7 +745,7 @@ mod tests {
         let cli = Cli::parse_from(["pi", "update"]);
         match cli.command {
             Some(Commands::Update { source }) => assert!(source.is_none()),
-            other => panic!("expected Update (all), got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -743,7 +764,7 @@ mod tests {
                 assert!(!paths);
                 assert!(!json);
             }
-            other => panic!("expected Config, got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -756,7 +777,7 @@ mod tests {
                 assert!(!paths);
                 assert!(!json);
             }
-            other => panic!("expected Config --show, got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -769,7 +790,7 @@ mod tests {
                 assert!(paths);
                 assert!(!json);
             }
-            other => panic!("expected Config --paths, got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -782,7 +803,7 @@ mod tests {
                 assert!(!paths);
                 assert!(json);
             }
-            other => panic!("expected Config --json, got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -799,7 +820,7 @@ mod tests {
             Some(Commands::Info { name }) => {
                 assert_eq!(name, "auto-commit-on-exit");
             }
-            other => panic!("expected Info, got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -829,7 +850,7 @@ mod tests {
         let cli = Cli::parse_from(["pi", "--list-models", "claude*"]);
         match cli.list_models {
             Some(Some(ref pat)) => assert_eq!(pat, "claude*"),
-            other => panic!("expected Some(Some(\"claude*\")), got {other:?}"),
+            other => panic!("unexpected command: {:?}", other),
         }
     }
 
@@ -852,7 +873,19 @@ mod tests {
     #[test]
     fn default_tools() {
         let cli = Cli::parse_from(["pi"]);
-        assert_eq!(cli.enabled_tools(), vec!["read", "bash", "edit", "write"]);
+        assert_eq!(
+            cli.enabled_tools(),
+            vec![
+                "read",
+                "bash",
+                "edit",
+                "write",
+                "grep",
+                "find",
+                "ls",
+                "hashline_edit",
+            ]
+        );
     }
 
     #[test]
@@ -871,6 +904,12 @@ mod tests {
     fn tools_with_spaces_trimmed() {
         let cli = Cli::parse_from(["pi", "--tools", "read, bash, edit"]);
         assert_eq!(cli.enabled_tools(), vec!["read", "bash", "edit"]);
+    }
+
+    #[test]
+    fn tools_ignore_empty_entries_and_duplicates() {
+        let cli = Cli::parse_from(["pi", "--tools", "read,, bash,read, ,grep,bash"]);
+        assert_eq!(cli.enabled_tools(), vec!["read", "bash", "grep"]);
     }
 
     // ── 7. Invalid inputs ────────────────────────────────────────────
@@ -999,6 +1038,43 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn extension_flags_survive_short_cluster_ending_in_e() {
+        let parsed = parse_with_extension_flags(vec![
+            "pi".to_string(),
+            "-pe".to_string(),
+            "ext.js".to_string(),
+            "--plan".to_string(),
+            "ship-it".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("parse short cluster with extension");
+
+        assert!(parsed.cli.print);
+        assert_eq!(parsed.cli.extension, vec!["ext.js".to_string()]);
+        assert_eq!(parsed.cli.message_args(), vec!["hello"]);
+        assert_eq!(parsed.extension_flags.len(), 1);
+        assert_eq!(parsed.extension_flags[0].name, "plan");
+        assert_eq!(parsed.extension_flags[0].value.as_deref(), Some("ship-it"));
+    }
+
+    #[test]
+    fn root_subcommands_constant_matches_clap_parser() {
+        let mut actual = Cli::command()
+            .get_subcommands()
+            .map(|command| command.get_name().to_string())
+            .collect::<Vec<_>>();
+        actual.sort();
+
+        let mut expected = ROOT_SUBCOMMANDS
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect::<Vec<_>>();
+        expected.sort();
+
+        assert_eq!(expected, actual);
+    }
+
     // ── 8. Multiple append flags ─────────────────────────────────────
 
     #[test]
@@ -1095,7 +1171,7 @@ mod tests {
         assert!(cli.list_models.is_none());
         assert!(cli.command.is_none());
         assert!(cli.args.is_empty());
-        assert_eq!(cli.tools, "read,bash,edit,write");
+        assert_eq!(cli.tools, "read,bash,edit,write,grep,find,ls,hashline_edit");
     }
 
     // ── 11. Combined flags ───────────────────────────────────────────
@@ -1310,7 +1386,7 @@ mod tests {
     mod proptest_cli {
         use crate::cli::{
             ExtensionCliFlag, ROOT_SUBCOMMANDS, is_known_short_flag, is_negative_numeric_token,
-            known_long_option, preprocess_extension_flags,
+            known_long_option, preprocess_extension_flags, short_flag_expects_value,
         };
         use proptest::prelude::*;
 
@@ -1332,7 +1408,7 @@ mod tests {
             fn is_known_short_flag_rejects_unknown_chars(
                 c in prop::sample::select(vec!['a', 'b', 'd', 'f', 'g', 'h', 'x', 'z']),
             ) {
-                let token = format!("-{c}");
+                let token  = format!("-{c}");
                 assert!(
                     !is_known_short_flag(&token),
                     "'-{c}' should not be a known short flag"
@@ -1353,7 +1429,7 @@ mod tests {
             fn is_known_short_flag_rejects_double_dash(
                 body in "[vcr]{1,5}",
             ) {
-                let token = format!("--{body}");
+                let token  = format!("--{body}");
                 assert!(
                     !is_known_short_flag(&token),
                     "'--{body}' should not be a short flag"
@@ -1361,10 +1437,32 @@ mod tests {
             }
 
             #[test]
+            fn short_flag_expects_value_when_cluster_ends_with_e(
+                prefix in prop::sample::select(vec!["", "p", "c", "vp"]),
+            ) {
+                let token = format!("-{prefix}e");
+                assert!(
+                    short_flag_expects_value(&token),
+                    "'{token}' should expect a following value"
+                );
+            }
+
+            #[test]
+            fn short_flag_does_not_expect_value_when_e_has_inline_value(
+                suffix in prop::sample::select(vec!["v", "c", "r", "p", "vc"]),
+            ) {
+                let token = format!("-e{suffix}");
+                assert!(
+                    !short_flag_expects_value(&token),
+                    "'{token}' should treat '{suffix}' as the inline -e value"
+                );
+            }
+
+            #[test]
             fn is_negative_numeric_token_accepts_negative_integers(
                 n in 1..10_000i64,
             ) {
-                let token = format!("-{n}");
+                let token  = format!("-{n}");
                 assert!(
                     is_negative_numeric_token(&token),
                     "'{token}' should be a negative numeric token"
@@ -1376,7 +1474,7 @@ mod tests {
                 whole in 0..100u32,
                 frac in 1..100u32,
             ) {
-                let token = format!("-{whole}.{frac}");
+                let token  = format!("-{whole}.{frac}");
                 assert!(
                     is_negative_numeric_token(&token),
                     "'{token}' should be a negative numeric token"
@@ -1387,7 +1485,7 @@ mod tests {
             fn is_negative_numeric_token_rejects_positive_numbers(
                 n in 0..10_000u64,
             ) {
-                let token = n.to_string();
+                let token  = n.to_string();
                 assert!(
                     !is_negative_numeric_token(&token),
                     "'{token}' (positive) should not be a negative numeric token"
@@ -1398,7 +1496,7 @@ mod tests {
             fn is_negative_numeric_token_rejects_non_numeric(
                 s in "[a-z]{1,5}",
             ) {
-                let token = format!("-{s}");
+                let token  = format!("-{s}");
                 assert!(
                     !is_negative_numeric_token(&token),
                     "'-{s}' should not be a negative numeric token"
@@ -1478,6 +1576,7 @@ mod tests {
             fn preprocess_subcommand_barrier(
                 subcommand in prop::sample::select(vec![
                     "install", "remove", "update", "search", "info", "list", "config", "doctor",
+                    "migrate",
                 ]),
             ) {
                 let args: Vec<String> = vec![
@@ -1614,7 +1713,7 @@ impl Cli {
         self.args
             .iter()
             .filter(|a| a.starts_with('@'))
-            .map(|a| a.trim_start_matches('@'))
+            .map(|a| a.strip_prefix('@').unwrap_or(a))
             .collect()
     }
 
@@ -1632,7 +1731,13 @@ impl Cli {
         if self.no_tools {
             vec![]
         } else {
-            self.tools.split(',').map(str::trim).collect()
+            let mut seen = HashSet::new();
+            self.tools
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .filter(|name| seen.insert(*name))
+                .collect()
         }
     }
 }

@@ -82,7 +82,13 @@ impl PiApp {
 
                         if pending.entries_to_summarize.is_empty() {
                             // Nothing to summarize; switch immediately.
-                            self.start_tree_navigation(pending, TreeSummaryChoice::NoSummary, None);
+                            if !self.start_tree_navigation(
+                                pending,
+                                TreeSummaryChoice::NoSummary,
+                                None,
+                            ) {
+                                self.tree_ui = Some(TreeUiState::Selector(selector));
+                            }
                             return None;
                         }
 
@@ -118,8 +124,10 @@ impl PiApp {
                         let choice = TreeSummaryChoice::all()[prompt.selected];
                         match choice {
                             TreeSummaryChoice::NoSummary | TreeSummaryChoice::Summarize => {
-                                let pending = prompt.pending;
-                                self.start_tree_navigation(pending, choice, None);
+                                let pending = prompt.pending.clone();
+                                if !self.start_tree_navigation(pending, choice, None) {
+                                    self.tree_ui = Some(TreeUiState::SummaryPrompt(prompt));
+                                }
                                 return None;
                             }
                             TreeSummaryChoice::SummarizeWithCustomPrompt => {
@@ -149,17 +157,19 @@ impl PiApp {
                         custom.instructions.pop();
                     }
                     KeyType::Enter => {
-                        let pending = custom.pending;
+                        let pending = custom.pending.clone();
                         let instructions = if custom.instructions.trim().is_empty() {
                             None
                         } else {
-                            Some(custom.instructions)
+                            Some(custom.instructions.clone())
                         };
-                        self.start_tree_navigation(
+                        if !self.start_tree_navigation(
                             pending,
                             TreeSummaryChoice::SummarizeWithCustomPrompt,
                             instructions,
-                        );
+                        ) {
+                            self.tree_ui = Some(TreeUiState::CustomPrompt(custom));
+                        }
                         return None;
                     }
                     KeyType::Runes => {
@@ -183,12 +193,16 @@ impl PiApp {
         match key.key_type {
             KeyType::Up => picker.select_prev(),
             KeyType::Down => picker.select_next(),
+            KeyType::PgUp => picker.select_page_up(),
+            KeyType::PgDown => picker.select_page_down(),
             KeyType::Runes if key.runes == ['k'] => picker.select_prev(),
             KeyType::Runes if key.runes == ['j'] => picker.select_next(),
             KeyType::Enter => {
                 if let Some(branch) = picker.selected_branch().cloned() {
-                    self.branch_picker = None;
-                    return self.switch_to_branch_leaf(&branch.leaf_id);
+                    if self.switch_to_branch_leaf(&branch.leaf_id) {
+                        self.branch_picker = None;
+                    }
+                    return None;
                 }
                 self.branch_picker = None;
             }
@@ -206,13 +220,14 @@ impl PiApp {
     }
 
     /// Switch the active branch to a different leaf. Reloads the conversation.
-    fn switch_to_branch_leaf(&mut self, leaf_id: &str) -> Option<Cmd> {
-        let (session_id, old_leaf_id) = self
-            .session
-            .try_lock()
-            .ok()
-            .map(|g| (g.header.id.clone(), g.leaf_id.clone()))
-            .unwrap_or_default();
+    fn switch_to_branch_leaf(&mut self, leaf_id: &str) -> bool {
+        let Ok(session_guard) = self.session.try_lock() else {
+            self.status_message = Some("Session busy; try again".to_string());
+            return false;
+        };
+        let session_id = session_guard.header.id.clone();
+        let old_leaf_id = session_guard.leaf_id.clone();
+        drop(session_guard);
 
         let pending = PendingTreeNavigation {
             session_id,
@@ -224,8 +239,7 @@ impl PiApp {
             summary_from_id: String::new(),
             api_key_present: false,
         };
-        self.start_tree_navigation(pending, TreeSummaryChoice::NoSummary, None);
-        None
+        self.start_tree_navigation(pending, TreeSummaryChoice::NoSummary, None)
     }
 
     /// Open the branch picker if the session has sibling branches.
@@ -235,15 +249,18 @@ impl PiApp {
             return;
         }
 
-        let branches = self
-            .session
-            .try_lock()
-            .ok()
-            .and_then(|guard| guard.sibling_branches().map(|(_, b)| b));
+        let Ok(session_guard) = self.session.try_lock() else {
+            self.status_message = Some("Session busy; try again".to_string());
+            return;
+        };
+        let branches = session_guard.sibling_branches().map(|(_, b)| b);
+        drop(session_guard);
 
         match branches {
             Some(branches) if branches.len() > 1 => {
-                self.branch_picker = Some(BranchPickerOverlay::new(branches));
+                let mut picker = BranchPickerOverlay::new(branches);
+                picker.max_visible = super::overlay_max_visible(self.term_height);
+                self.branch_picker = Some(picker);
             }
             _ => {
                 self.status_message =
@@ -259,8 +276,11 @@ impl PiApp {
             return;
         }
 
-        let target = self.session.try_lock().ok().and_then(|guard| {
-            let (_, branches) = guard.sibling_branches()?;
+        let Ok(session_guard) = self.session.try_lock() else {
+            self.status_message = Some("Session busy; try again".to_string());
+            return;
+        };
+        let target = session_guard.sibling_branches().and_then(|(_, branches)| {
             if branches.len() <= 1 {
                 return None;
             }
@@ -272,6 +292,7 @@ impl PiApp {
             };
             Some(branches[next_idx].leaf_id.clone())
         });
+        drop(session_guard);
 
         if let Some(leaf_id) = target {
             self.switch_to_branch_leaf(&leaf_id);
@@ -286,7 +307,7 @@ impl PiApp {
         pending: PendingTreeNavigation,
         choice: TreeSummaryChoice,
         custom_instructions: Option<String>,
-    ) {
+    ) -> bool {
         let summary_requested = matches!(
             choice,
             TreeSummaryChoice::Summarize | TreeSummaryChoice::SummarizeWithCustomPrompt
@@ -297,13 +318,13 @@ impl PiApp {
         if !summary_requested && self.extensions.is_none() {
             let Ok(mut session_guard) = self.session.try_lock() else {
                 self.status_message = Some("Session busy; try again".to_string());
-                return;
+                return false;
             };
 
             if let Some(target_id) = &pending.new_leaf_id {
                 if !session_guard.navigate_to(target_id) {
                     self.status_message = Some(format!("Branch target not found: {target_id}"));
-                    return;
+                    return false;
                 }
             } else {
                 session_guard.reset_leaf();
@@ -339,7 +360,7 @@ impl PiApp {
             }
             self.input.focus();
 
-            return;
+            return true;
         }
 
         let event_tx = self.event_tx.clone();
@@ -352,7 +373,7 @@ impl PiApp {
         let Ok(agent_guard) = self.agent.try_lock() else {
             self.status_message = Some("Agent busy; try again".to_string());
             self.agent_state = AgentState::Idle;
-            return;
+            return false;
         };
         let provider = agent_guard.provider();
         let key_opt = agent_guard.stream_options().api_key.clone();
@@ -387,9 +408,12 @@ impl PiApp {
                     .await
                     .unwrap_or(false);
                 if cancelled {
-                    let _ = event_tx.try_send(PiMsg::System(
-                        "Session switch cancelled by extension".to_string(),
-                    ));
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                        PiMsg::System("Session switch cancelled by extension".to_string()),
+                    )
+                    .await;
                     return;
                 }
             }
@@ -410,8 +434,12 @@ impl PiApp {
                 {
                     Ok(summary) => summary,
                     Err(err) => {
-                        let _ = event_tx
-                            .try_send(PiMsg::AgentError(format!("Branch summary failed: {err}")));
+                        let _ = crate::interactive::enqueue_pi_event(
+                            &event_tx,
+                            &cx,
+                            PiMsg::AgentError(format!("Branch summary failed: {err}")),
+                        )
+                        .await;
                         return;
                     }
                 }
@@ -423,17 +451,24 @@ impl PiApp {
                 let mut guard = match session.lock(&cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
-                        let _ = event_tx
-                            .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
+                        let _ = crate::interactive::enqueue_pi_event(
+                            &event_tx,
+                            &cx,
+                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
+                        )
+                        .await;
                         return;
                     }
                 };
 
                 if let Some(target_id) = &pending.new_leaf_id {
                     if !guard.navigate_to(target_id) {
-                        let _ = event_tx.try_send(PiMsg::AgentError(format!(
-                            "Branch target not found: {target_id}"
-                        )));
+                        let _ = crate::interactive::enqueue_pi_event(
+                            &event_tx,
+                            &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                            PiMsg::AgentError(format!("Branch target not found: {target_id}")),
+                        )
+                        .await;
                         return;
                     }
                 } else {
@@ -457,8 +492,12 @@ impl PiApp {
                 let mut agent_guard = match agent.lock(&cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
-                        let _ = event_tx
-                            .try_send(PiMsg::AgentError(format!("Failed to lock agent: {err}")));
+                        let _ = crate::interactive::enqueue_pi_event(
+                            &event_tx,
+                            &cx,
+                            PiMsg::AgentError(format!("Failed to lock agent: {err}")),
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -469,8 +508,12 @@ impl PiApp {
                 let guard = match session.lock(&cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
-                        let _ = event_tx
-                            .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
+                        let _ = crate::interactive::enqueue_pi_event(
+                            &event_tx,
+                            &cx,
+                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -485,14 +528,24 @@ impl PiApp {
                 Some(format!("Switched to {to_id_for_event}"))
             };
 
-            let _ = event_tx.try_send(PiMsg::ConversationReset {
-                messages,
-                usage,
-                status,
-            });
+            let _ = crate::interactive::enqueue_pi_event(
+                &event_tx,
+                &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                PiMsg::ConversationReset {
+                    messages,
+                    usage,
+                    status,
+                },
+            )
+            .await;
 
             if let Some(text) = pending.editor_text {
-                let _ = event_tx.try_send(PiMsg::SetEditorText(text));
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                    PiMsg::SetEditorText(text),
+                )
+                .await;
             }
 
             if let Some(manager) = extensions {
@@ -508,5 +561,6 @@ impl PiApp {
                     .await;
             }
         });
+        true
     }
 }

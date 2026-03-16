@@ -1,6 +1,138 @@
 use super::share::{parse_gist_url_and_id, parse_share_is_public, share_gist_description};
 use super::*;
+use crate::agent::AgentConfig;
+use crate::extensions::{ExtensionManager, PROTOCOL_VERSION, RegisterPayload};
+use crate::model::StreamEvent;
+use crate::provider::{Context, Provider, StreamOptions};
+use crate::resources::{ResourceCliOptions, ResourceLoader};
+use crate::session::Session;
+use crate::tools::ToolRegistry;
+use asupersync::channel::mpsc;
+use asupersync::runtime::RuntimeBuilder;
+use futures::stream;
 use serde_json::json;
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::OnceLock;
+
+struct DummyProvider;
+
+#[async_trait::async_trait]
+impl Provider for DummyProvider {
+    fn name(&self) -> &'static str {
+        "dummy"
+    }
+
+    fn api(&self) -> &'static str {
+        "dummy"
+    }
+
+    fn model_id(&self) -> &'static str {
+        "dummy-model"
+    }
+
+    async fn stream(
+        &self,
+        _context: &Context<'_>,
+        _options: &StreamOptions,
+    ) -> crate::error::Result<
+        Pin<Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+    > {
+        Ok(Box::pin(stream::empty()))
+    }
+}
+
+fn test_runtime_handle() -> asupersync::runtime::RuntimeHandle {
+    static RT: OnceLock<asupersync::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        RuntimeBuilder::current_thread()
+            .build()
+            .expect("build asupersync runtime")
+    })
+    .handle()
+}
+
+fn build_test_app_with_config(config: Config) -> PiApp {
+    build_test_app_with_config_and_extensions(config, None)
+}
+
+fn build_test_app_with_config_and_extensions(
+    config: Config,
+    extensions: Option<crate::extensions::ExtensionManager>,
+) -> PiApp {
+    let provider: Arc<dyn Provider> = Arc::new(DummyProvider);
+    let agent = Agent::new(
+        provider,
+        ToolRegistry::new(&[], Path::new("."), Some(&config)),
+        AgentConfig::default(),
+    );
+    let resources = ResourceLoader::empty(config.enable_skill_commands());
+    let resource_cli = ResourceCliOptions {
+        no_skills: false,
+        no_prompt_templates: false,
+        no_extensions: false,
+        no_themes: false,
+        skill_paths: Vec::new(),
+        prompt_paths: Vec::new(),
+        extension_paths: Vec::new(),
+        theme_paths: Vec::new(),
+    };
+    let model_entry = test_model_entry("dummy", "dummy-model");
+    let model_scope = vec![model_entry.clone()];
+    let available_models = vec![model_entry.clone()];
+    let (event_tx, _event_rx) = mpsc::channel(64);
+
+    PiApp::new(
+        agent,
+        Arc::new(asupersync::sync::Mutex::new(Session::in_memory())),
+        config,
+        resources,
+        resource_cli,
+        Path::new(".").to_path_buf(),
+        model_entry,
+        model_scope,
+        available_models,
+        Vec::new(),
+        event_tx,
+        test_runtime_handle(),
+        false,
+        extensions,
+        Some(KeyBindings::new()),
+        Vec::new(),
+        Usage::default(),
+    )
+}
+
+fn test_extension_manager_with_registered_extension() -> ExtensionManager {
+    let manager = ExtensionManager::new();
+    manager.register(RegisterPayload {
+        name: "test-extension".to_string(),
+        version: "1.0.0".to_string(),
+        api_version: PROTOCOL_VERSION.to_string(),
+        capabilities: Vec::new(),
+        capability_manifest: None,
+        tools: Vec::new(),
+        slash_commands: vec![json!({
+            "name": "test-command",
+            "description": "test command",
+        })],
+        shortcuts: Vec::new(),
+        flags: Vec::new(),
+        event_hooks: Vec::new(),
+    });
+    manager
+}
+
+fn custom_test_message(content: &str) -> ModelMessage {
+    ModelMessage::Custom(CustomMessage {
+        content: content.to_string(),
+        custom_type: "test".to_string(),
+        display: false,
+        details: None,
+        timestamp: 0,
+    })
+}
 
 #[test]
 fn format_count_suffixes() {
@@ -63,6 +195,351 @@ fn tool_progress_update_from_no_details() {
     p.update_from_details(None);
     assert!(p.elapsed_ms >= 5);
     assert_eq!(p.line_count, 0);
+}
+
+#[test]
+fn initial_window_size_cmd_emits_window_size_message() {
+    let msg = PiApp::initial_window_size_cmd()
+        .execute()
+        .expect("window size message");
+    let size = msg
+        .downcast::<WindowSizeMsg>()
+        .expect("window size message type");
+
+    assert!(size.width > 0);
+    assert!(size.height > 0);
+}
+
+#[test]
+fn startup_init_cmd_sequences_window_size_before_pending() {
+    let msg = PiApp::startup_init_cmd(None, Some(Cmd::new(|| Message::new(PiMsg::RunPending))))
+        .expect("startup init command")
+        .execute()
+        .expect("startup init message");
+    let sequence = msg
+        .downcast::<bubbletea::message::SequenceMsg>()
+        .expect("startup sequence message");
+
+    let mut cmds = sequence.0.into_iter();
+    let first = cmds
+        .next()
+        .expect("window size cmd")
+        .execute()
+        .expect("window size message");
+    assert!(
+        first.downcast_ref::<WindowSizeMsg>().is_some(),
+        "first startup command should refresh window size"
+    );
+
+    let second = cmds
+        .next()
+        .expect("pending cmd")
+        .execute()
+        .expect("pending message");
+    assert!(
+        second
+            .downcast_ref::<PiMsg>()
+            .is_some_and(|msg| matches!(msg, PiMsg::RunPending)),
+        "second startup command should run pending work"
+    );
+}
+
+#[test]
+fn oauth_device_flow_started_sets_pending_device_flow_state_and_prompt() {
+    let mut app = build_test_app_with_config(Config::default());
+    app.status_message = Some("Starting Kimi Code login...".to_string());
+    app.input_mode = InputMode::MultiLine;
+
+    let _ = bubbletea::Model::update(
+        &mut app,
+        bubbletea::Message::new(PiMsg::OAuthDeviceFlowStarted {
+            provider: "kimi-for-coding".to_string(),
+            device_code: "device-code-123".to_string(),
+            user_code: "user-code-456".to_string(),
+            verification_uri: "https://kimi.example/device".to_string(),
+            expires_in: 900,
+        }),
+    );
+
+    let pending = app.pending_oauth.as_ref().expect("pending device flow");
+    assert_eq!(pending.provider, "kimi-for-coding");
+    assert_eq!(pending.kind, PendingLoginKind::DeviceFlow);
+    assert_eq!(pending.verifier, "");
+    assert!(pending.oauth_config.is_none());
+    assert_eq!(pending.device_code.as_deref(), Some("device-code-123"));
+    assert!(pending.redirect_uri.is_none());
+
+    assert_eq!(app.input_mode, InputMode::SingleLine);
+    assert!(app.status_message.is_none());
+
+    let last_message = app.messages.last().expect("oauth instructions message");
+    assert_eq!(last_message.role, MessageRole::System);
+    assert!(last_message.thinking.is_none());
+    assert!(!last_message.collapsed);
+    assert!(
+        last_message
+            .content
+            .contains("Open this URL:\nhttps://kimi.example/device")
+    );
+    assert!(
+        last_message
+            .content
+            .contains("If prompted, enter this code: user-code-456")
+    );
+    assert!(
+        last_message
+            .content
+            .contains("Code expires in 900 seconds.")
+    );
+    assert!(
+        last_message
+            .content
+            .contains("press Enter in Pi to complete login")
+    );
+}
+
+#[test]
+fn enqueue_ui_shutdown_waits_for_capacity_in_full_channel() {
+    asupersync::test_utils::run_test(|| async {
+        let (event_tx, event_rx) = mpsc::channel(1);
+        event_tx
+            .try_send(PiMsg::System("busy".to_string()))
+            .expect("fill bounded event channel");
+
+        let send_cx = Cx::for_request();
+        let recv_cx = Cx::for_request();
+        let send_shutdown = enqueue_ui_shutdown(&event_tx, &send_cx);
+        let recv_messages = async {
+            let first = event_rx.recv(&recv_cx).await.expect("first queued message");
+            let second = event_rx.recv(&recv_cx).await.expect("shutdown message");
+            (first, second)
+        };
+
+        let ((), (first, second)) = futures::join!(send_shutdown, recv_messages);
+
+        assert!(matches!(first, PiMsg::System(text) if text == "busy"));
+        assert!(matches!(second, PiMsg::UiShutdown));
+    });
+}
+
+#[test]
+fn enqueue_pi_event_preserves_extension_ui_requests_under_backpressure() {
+    asupersync::test_utils::run_test(|| async {
+        let (event_tx, event_rx) = mpsc::channel(1);
+        event_tx
+            .try_send(PiMsg::System("busy".to_string()))
+            .expect("fill bounded event channel");
+
+        let request = ExtensionUiRequest::new(
+            "req-confirm",
+            "confirm",
+            json!({ "title": "Need approval" }),
+        );
+        let send_cx = Cx::for_request();
+        let recv_cx = Cx::for_request();
+        let send_request = enqueue_pi_event(
+            &event_tx,
+            &send_cx,
+            PiMsg::ExtensionUiRequest(request.clone()),
+        );
+        let recv_messages = async {
+            let first = event_rx.recv(&recv_cx).await.expect("first queued message");
+            let second = event_rx.recv(&recv_cx).await.expect("extension ui request");
+            (first, second)
+        };
+
+        let (enqueued, (first, second)) = futures::join!(send_request, recv_messages);
+
+        assert!(
+            enqueued,
+            "extension UI request should enqueue once capacity opens"
+        );
+        assert!(matches!(first, PiMsg::System(text) if text == "busy"));
+        match second {
+            PiMsg::ExtensionUiRequest(actual) => {
+                assert_eq!(actual.id, request.id);
+                assert_eq!(actual.method, request.method);
+                assert_eq!(actual.payload, request.payload);
+            }
+            other => panic!("expected extension UI request, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn enqueue_pi_event_preserves_conversation_reset_under_backpressure() {
+    asupersync::test_utils::run_test(|| async {
+        let (event_tx, event_rx) = mpsc::channel(1);
+        event_tx
+            .try_send(PiMsg::System("busy".to_string()))
+            .expect("fill bounded event channel");
+
+        let send_cx = Cx::for_request();
+        let recv_cx = Cx::for_request();
+        let send_reset = enqueue_pi_event(
+            &event_tx,
+            &send_cx,
+            PiMsg::ConversationReset {
+                messages: Vec::new(),
+                usage: Usage::default(),
+                status: Some("Session resumed".to_string()),
+            },
+        );
+        let recv_messages = async {
+            let first = event_rx.recv(&recv_cx).await.expect("first queued message");
+            let second = event_rx
+                .recv(&recv_cx)
+                .await
+                .expect("conversation reset message");
+            (first, second)
+        };
+
+        let (enqueued, (first, second)) = futures::join!(send_reset, recv_messages);
+
+        assert!(
+            enqueued,
+            "conversation reset should enqueue once capacity opens"
+        );
+        assert!(matches!(first, PiMsg::System(text) if text == "busy"));
+        match second {
+            PiMsg::ConversationReset {
+                messages,
+                usage,
+                status,
+            } => {
+                assert!(messages.is_empty());
+                assert_eq!(usage.input, 0);
+                assert_eq!(usage.output, 0);
+                assert_eq!(usage.cache_read, 0);
+                assert_eq!(usage.cache_write, 0);
+                assert_eq!(usage.total_tokens, 0);
+                assert!(usage.cost.input.abs() <= f64::EPSILON);
+                assert!(usage.cost.output.abs() <= f64::EPSILON);
+                assert!(usage.cost.cache_read.abs() <= f64::EPSILON);
+                assert!(usage.cost.cache_write.abs() <= f64::EPSILON);
+                assert!(usage.cost.total.abs() <= f64::EPSILON);
+                assert_eq!(status.as_deref(), Some("Session resumed"));
+            }
+            other => panic!("expected conversation reset, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn enqueue_pi_event_current_uses_ambient_context_under_backpressure() {
+    asupersync::test_utils::run_test(|| async {
+        let (event_tx, event_rx) = mpsc::channel(1);
+        event_tx
+            .try_send(PiMsg::System("busy".to_string()))
+            .expect("fill bounded event channel");
+
+        let current_cx = Cx::for_testing();
+        let _guard = Cx::set_current(Some(current_cx));
+        let recv_cx = Cx::for_request();
+        let send_system = enqueue_pi_event_current(&event_tx, PiMsg::System("queued".to_string()));
+        let recv_messages = async {
+            let first = event_rx.recv(&recv_cx).await.expect("first queued message");
+            let second = event_rx
+                .recv(&recv_cx)
+                .await
+                .expect("second queued message");
+            (first, second)
+        };
+
+        let (enqueued, (first, second)) = futures::join!(send_system, recv_messages);
+
+        assert!(enqueued, "ambient context send should survive backpressure");
+        assert!(matches!(first, PiMsg::System(text) if text == "busy"));
+        assert!(matches!(second, PiMsg::System(text) if text == "queued"));
+    });
+}
+
+#[test]
+fn enqueue_pi_event_current_respects_ambient_context_cancellation() {
+    asupersync::test_utils::run_test(|| async {
+        use asupersync::channel::mpsc::RecvError;
+        use asupersync::types::CancelKind;
+
+        let (event_tx, event_rx) = mpsc::channel(1);
+        event_tx
+            .try_send(PiMsg::System("busy".to_string()))
+            .expect("fill bounded event channel");
+
+        let current_cx = Cx::for_testing();
+        current_cx.cancel_with(CancelKind::User, Some("cancel stale UI send"));
+        let _guard = Cx::set_current(Some(current_cx));
+
+        let enqueued =
+            enqueue_pi_event_current(&event_tx, PiMsg::System("stale".to_string())).await;
+        assert!(
+            !enqueued,
+            "cancelled ambient context must reject stale UI sends"
+        );
+
+        let recv_cx = Cx::for_request();
+        let first = event_rx.recv(&recv_cx).await.expect("first queued message");
+        assert!(matches!(first, PiMsg::System(text) if text == "busy"));
+        assert!(
+            matches!(event_rx.try_recv(), Err(RecvError::Empty)),
+            "cancelled send should not enqueue a follow-on message"
+        );
+    });
+}
+
+#[test]
+fn tmux_wheel_guard_extracts_saved_binding_command() {
+    let line = r##"bind-key -T root WheelUpPane            if-shell -F "#{||:#{pane_in_mode},#{mouse_any_flag}}" { send-keys -M } { copy-mode -e }"##;
+    assert_eq!(
+        TmuxWheelGuard::binding_command(line, "WheelUpPane").as_deref(),
+        Some(
+            r##"if-shell -F "#{||:#{pane_in_mode},#{mouse_any_flag}}" { send-keys -M } { copy-mode -e }"##
+        )
+    );
+}
+
+#[test]
+fn tmux_wheel_guard_extracts_repeatable_binding_command() {
+    let line = r"bind-key -r -T root WheelUpPane send-keys -M";
+    assert_eq!(
+        TmuxWheelGuard::binding_command(line, "WheelUpPane").as_deref(),
+        Some("send-keys -M")
+    );
+}
+
+#[test]
+fn tmux_wheel_guard_extracts_command_after_quoted_option_value() {
+    let line = r#"bind-key -N "wheel note" -T root WheelUpPane display-message "foo bar""#;
+    assert_eq!(
+        TmuxWheelGuard::binding_command(line, "WheelUpPane").as_deref(),
+        Some(r#"display-message "foo bar""#)
+    );
+}
+
+#[test]
+fn tmux_wheel_guard_builds_pane_scoped_binding_args() {
+    let fallback =
+        r##"if-shell -F "#{||:#{pane_in_mode},#{mouse_any_flag}}" { send-keys -M } { copy-mode -e }"##
+            .to_string();
+    let args = TmuxWheelGuard::pane_scoped_binding_args("%3", "WheelUpPane", fallback.clone());
+
+    assert_eq!(args[0], "bind-key");
+    assert_eq!(args[1], "-T");
+    assert_eq!(args[2], "root");
+    assert_eq!(args[3], "WheelUpPane");
+    assert_eq!(args[4], "if-shell");
+    assert_eq!(args[5], "-F");
+    assert_eq!(args[6], "#{==:#{pane_id},%3}");
+    assert_eq!(args[7], "send-keys -M");
+    assert_eq!(args[8], fallback);
+}
+
+#[test]
+fn tmux_wheel_guard_binding_command_preserves_quoted_segments() {
+    let line = r#"bind-key -T root WheelUpPane display-message "foo bar""#;
+    assert_eq!(
+        TmuxWheelGuard::binding_command(line, "WheelUpPane").as_deref(),
+        Some(r#"display-message "foo bar""#)
+    );
 }
 
 #[test]
@@ -391,6 +868,88 @@ fn parse_queue_mode_default() {
         parse_queue_mode_or_default(Some("anything")),
         QueueMode::OneAtATime
     ));
+}
+
+#[test]
+fn apply_queue_modes_updates_injected_queue_delivery_policy() {
+    let app = build_test_app_with_config(Config {
+        steering_mode: Some("one-at-a-time".to_string()),
+        follow_up_mode: Some("one-at-a-time".to_string()),
+        ..Config::default()
+    });
+    app.apply_queue_modes(QueueMode::All, QueueMode::All);
+
+    let queued_follow_ups = {
+        let mut queue = app.injected_queue.lock().expect("lock injected queue");
+        queue.push_follow_up(custom_test_message("first"));
+        queue.push_follow_up(custom_test_message("second"));
+        queue.pop_follow_up().len()
+    };
+
+    assert_eq!(
+        queued_follow_ups, 2,
+        "updated queue modes should apply to extension-injected messages too"
+    );
+}
+
+#[test]
+fn default_permissive_status_mentions_restart_when_extensions_are_active() {
+    let app = build_test_app_with_config_and_extensions(
+        Config::default(),
+        Some(test_extension_manager_with_registered_extension()),
+    );
+
+    let status = app.default_permissive_update_status(false);
+    assert!(status.contains("restart active extensions/session to apply"));
+}
+
+#[test]
+fn settings_summary_notes_restart_requirement_for_future_policy_changes() {
+    let app = build_test_app_with_config_and_extensions(
+        Config::default(),
+        Some(test_extension_manager_with_registered_extension()),
+    );
+
+    let summary = app.format_settings_summary();
+    assert!(summary.contains(
+        "extensionPolicy.defaultPermissive: on (future changes apply after extension restart)"
+    ));
+}
+
+#[test]
+fn default_permissive_status_omits_restart_when_manager_has_no_loaded_extensions() {
+    let app =
+        build_test_app_with_config_and_extensions(Config::default(), Some(ExtensionManager::new()));
+
+    let status = app.default_permissive_update_status(false);
+    assert!(!status.contains("restart active extensions/session to apply"));
+}
+
+#[test]
+fn settings_summary_omits_restart_requirement_when_manager_has_no_loaded_extensions() {
+    let app =
+        build_test_app_with_config_and_extensions(Config::default(), Some(ExtensionManager::new()));
+
+    let summary = app.format_settings_summary();
+    assert!(summary.contains("extensionPolicy.defaultPermissive: on"));
+    assert!(!summary.contains("future changes apply after extension restart"));
+}
+
+#[test]
+fn settings_overlay_default_permissive_notes_restart_only_for_loaded_extensions() {
+    let app = build_test_app_with_config_and_extensions(
+        Config::default(),
+        Some(test_extension_manager_with_registered_extension()),
+    );
+    let rendered = app.render_settings_ui(&SettingsUiState::new());
+    assert!(rendered.contains("extensionPolicy.defaultPermissive: on (restart required)"));
+
+    let app_without_loaded_extensions =
+        build_test_app_with_config_and_extensions(Config::default(), Some(ExtensionManager::new()));
+    let rendered_without_loaded_extensions =
+        app_without_loaded_extensions.render_settings_ui(&SettingsUiState::new());
+    assert!(rendered_without_loaded_extensions.contains("extensionPolicy.defaultPermissive: on"));
+    assert!(!rendered_without_loaded_extensions.contains("restart required"));
 }
 
 // --- push_line tests ---
@@ -1630,4 +2189,31 @@ fn git_branch_empty_head() {
     std::fs::create_dir(&git_dir).unwrap();
     std::fs::write(git_dir.join("HEAD"), "").unwrap();
     assert_eq!(super::read_git_branch(dir.path()), None);
+}
+
+#[test]
+fn git_branch_found_from_nested_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let git_dir = dir.path().join(".git");
+    let nested = dir.path().join("src/ui");
+    std::fs::create_dir(&git_dir).unwrap();
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    assert_eq!(super::read_git_branch(&nested), Some("main".to_string()));
+}
+
+#[test]
+fn git_branch_worktree_gitdir_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let nested = dir.path().join("worktree/src");
+    let worktree_root = dir.path().join("worktree");
+    let gitdir = dir.path().join("actual-git-dir");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::create_dir_all(&gitdir).unwrap();
+    std::fs::write(worktree_root.join(".git"), "gitdir: ../actual-git-dir\n").unwrap();
+    std::fs::write(gitdir.join("HEAD"), "ref: refs/heads/feature/worktree\n").unwrap();
+    assert_eq!(
+        super::read_git_branch(&nested),
+        Some("feature/worktree".to_string())
+    );
 }

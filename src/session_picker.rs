@@ -16,6 +16,7 @@ use serde::Deserialize;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::session::{Session, SessionHeader, encode_cwd};
+use crate::session_index::session_file_stats;
 use crate::session_index::{SessionIndex, SessionMeta};
 use crate::theme::{Theme, TuiStyles};
 
@@ -354,60 +355,138 @@ pub async fn pick_session(override_dir: Option<&Path>) -> Option<Session> {
 pub fn list_sessions_for_project(cwd: &Path, override_dir: Option<&Path>) -> Vec<SessionMeta> {
     let base_dir = override_dir.map_or_else(Config::sessions_dir, PathBuf::from);
     let project_session_dir = base_dir.join(encode_cwd(cwd));
-    if !project_session_dir.exists() {
-        return Vec::new();
-    }
-
     let cwd_key = cwd.display().to_string();
     let index = SessionIndex::for_sessions_root(&base_dir);
     let mut sessions = index.list_sessions(Some(&cwd_key)).unwrap_or_default();
+    let project_session_dir_missing = indexed_session_path_is_missing(&project_session_dir);
 
-    if sessions.is_empty() && index.reindex_all().is_ok() {
+    if !project_session_dir_missing && sessions.is_empty() && index.reindex_all().is_ok() {
         sessions = index.list_sessions(Some(&cwd_key)).unwrap_or_default();
     }
 
-    sessions.retain(|meta| Path::new(&meta.path).exists());
-
-    let scanned = scan_sessions_on_disk(&project_session_dir);
-    if !scanned.is_empty() {
-        let mut by_path: HashMap<String, SessionMeta> = sessions
-            .into_iter()
-            .map(|meta| (meta.path.clone(), meta))
-            .collect();
-
-        for meta in scanned {
-            let should_replace = by_path
-                .get(&meta.path)
-                .is_some_and(|existing| meta.last_modified_ms > existing.last_modified_ms);
-            if should_replace || !by_path.contains_key(&meta.path) {
-                by_path.insert(meta.path.clone(), meta);
-            }
+    let mut missing_paths = Vec::new();
+    let mut by_path = HashMap::new();
+    for meta in sessions {
+        let path = PathBuf::from(&meta.path);
+        if indexed_session_path_is_missing(&path) {
+            missing_paths.push(path);
+        } else {
+            by_path.insert(meta.path.clone(), meta);
         }
-
-        sessions = by_path.into_values().collect();
     }
 
+    for path in &missing_paths {
+        let _ = index.delete_session_path(path);
+    }
+
+    if project_session_dir_missing {
+        return Vec::new();
+    }
+
+    let scanned = scan_sessions_on_disk(&project_session_dir, &by_path);
+    for path in &scanned.failed_paths {
+        let _ = index.delete_session_path(path);
+        by_path.remove(&path.display().to_string());
+    }
+
+    for meta in scanned.metas {
+        let _ = index.upsert_session_meta(meta.clone());
+        by_path.insert(meta.path.clone(), meta);
+    }
+
+    sessions = by_path.into_values().collect();
     sessions.sort_by_key(|m| Reverse(m.last_modified_ms));
     sessions.truncate(50);
     sessions
 }
 
-fn scan_sessions_on_disk(project_session_dir: &Path) -> Vec<SessionMeta> {
+fn indexed_session_path_is_missing(path: &Path) -> bool {
+    match path.try_exists() {
+        Ok(exists) => !exists,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "Failed to determine whether indexed session path exists; deferring prune"
+            );
+            false
+        }
+    }
+}
+
+struct ScanSessionsResult {
+    metas: Vec<SessionMeta>,
+    failed_paths: Vec<PathBuf>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SESSION_SCAN_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_session_scan_parse_count() {
+    SESSION_SCAN_PARSE_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn take_session_scan_parse_count() -> usize {
+    SESSION_SCAN_PARSE_COUNT.with(|count| {
+        let value = count.get();
+        count.set(0);
+        value
+    })
+}
+
+fn build_scanned_meta(path: &Path) -> crate::error::Result<SessionMeta> {
+    #[cfg(test)]
+    SESSION_SCAN_PARSE_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+
+    build_meta_from_file(path)
+}
+
+fn cached_meta_matches_disk(meta: &SessionMeta, path: &Path) -> bool {
+    let Ok((last_modified_ms, size_bytes)) = session_file_stats(path) else {
+        return false;
+    };
+    meta.last_modified_ms == last_modified_ms && meta.size_bytes == size_bytes
+}
+
+fn scan_sessions_on_disk(
+    project_session_dir: &Path,
+    cached_by_path: &HashMap<String, SessionMeta>,
+) -> ScanSessionsResult {
     let mut out = Vec::new();
+    let mut failed_paths = Vec::new();
     let Ok(entries) = fs::read_dir(project_session_dir) else {
-        return out;
+        return ScanSessionsResult {
+            metas: out,
+            failed_paths,
+        };
     };
 
     for entry in entries.flatten() {
         let path = entry.path();
         if is_session_file_path(&path) {
-            if let Ok(meta) = build_meta_from_file(&path) {
-                out.push(meta);
+            let path_key = path.display().to_string();
+            if cached_by_path
+                .get(&path_key)
+                .is_some_and(|meta| cached_meta_matches_disk(meta, &path))
+            {
+                continue;
+            }
+
+            match build_scanned_meta(&path) {
+                Ok(meta) => out.push(meta),
+                Err(_) => failed_paths.push(path),
             }
         }
     }
 
-    out
+    ScanSessionsResult {
+        metas: out,
+        failed_paths,
+    }
 }
 
 fn build_meta_from_file(path: &Path) -> crate::error::Result<SessionMeta> {
@@ -442,6 +521,9 @@ fn build_meta_from_jsonl(path: &Path) -> crate::error::Result<SessionMeta> {
 
     let header: SessionHeader = serde_json::from_str(&header_line)
         .map_err(|e| crate::error::Error::session(format!("Parse session header: {e}")))?;
+    header.validate().map_err(|reason| {
+        crate::error::Error::session(format!("Invalid session header: {reason}"))
+    })?;
 
     let mut message_count = 0u64;
     let mut name = None;
@@ -484,19 +566,13 @@ fn build_meta_from_jsonl(path: &Path) -> crate::error::Result<SessionMeta> {
 
 #[cfg(feature = "sqlite-sessions")]
 fn build_meta_from_sqlite(path: &Path) -> crate::error::Result<SessionMeta> {
-    let meta = futures::executor::block_on(async {
-        crate::session_sqlite::load_session_meta(path).await
-    })?;
+    let meta = futures::executor::block_on(crate::session_sqlite::load_session_meta(path))?;
     let header = meta.header;
+    header.validate().map_err(|reason| {
+        crate::error::Error::session(format!("Invalid session header: {reason}"))
+    })?;
 
-    let sqlite_meta = fs::metadata(path)?;
-    let size_bytes = sqlite_meta.len();
-    let modified = sqlite_meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-    let millis = modified
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let last_modified_ms = i64::try_from(millis).unwrap_or(i64::MAX);
+    let (last_modified_ms, size_bytes) = session_file_stats(path)?;
 
     Ok(SessionMeta {
         path: path.display().to_string(),
@@ -525,20 +601,85 @@ pub(crate) fn delete_session_file(path: &Path) -> Result<()> {
 
 fn delete_session_file_with_trash_cmd(path: &Path, trash_cmd: &str) -> Result<()> {
     if try_trash_with_cmd(path, trash_cmd) {
+        remove_sqlite_sidecars_best_effort(path, trash_cmd);
+        remove_sidecar_dir_best_effort(&crate::session_store_v2::v2_sidecar_path(path), trash_cmd);
         return Ok(());
     }
+
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(Error::session(format!(
-            "Failed to delete session {}: {err}",
-            path.display()
-        ))),
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(Error::session(format!(
+                "Failed to delete session {}: {err}",
+                path.display()
+            )));
+        }
+    }
+
+    remove_sqlite_sidecars_best_effort(path, trash_cmd);
+    remove_sidecar_dir_best_effort(&crate::session_store_v2::v2_sidecar_path(path), trash_cmd);
+    Ok(())
+}
+
+fn sqlite_auxiliary_paths(path: &Path) -> [PathBuf; 2] {
+    ["-wal", "-shm"].map(|suffix| {
+        let mut candidate = path.as_os_str().to_os_string();
+        candidate.push(suffix);
+        PathBuf::from(candidate)
+    })
+}
+
+#[cfg(feature = "sqlite-sessions")]
+fn remove_sqlite_sidecars_best_effort(path: &Path, trash_cmd: &str) {
+    if path.extension().and_then(|ext| ext.to_str()) == Some("sqlite") {
+        for auxiliary_path in sqlite_auxiliary_paths(path) {
+            if !auxiliary_path.exists() {
+                continue;
+            }
+            if try_trash_with_cmd(&auxiliary_path, trash_cmd) {
+                continue;
+            }
+            if let Err(err) = fs::remove_file(&auxiliary_path) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        path = %auxiliary_path.display(),
+                        error = %err,
+                        "Failed to remove SQLite sidecar"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "sqlite-sessions"))]
+const fn remove_sqlite_sidecars_best_effort(_path: &Path, _trash_cmd: &str) {}
+
+fn remove_sidecar_dir_best_effort(sidecar_path: &Path, trash_cmd: &str) {
+    if !sidecar_path.exists() {
+        return;
+    }
+
+    if try_trash_with_cmd(sidecar_path, trash_cmd) {
+        return;
+    }
+
+    if let Err(err) = fs::remove_dir_all(sidecar_path) {
+        tracing::warn!(
+            path = %sidecar_path.display(),
+            error = %err,
+            "Failed to remove session sidecar"
+        );
     }
 }
 
 fn try_trash_with_cmd(path: &Path, trash_cmd: &str) -> bool {
-    match std::process::Command::new(trash_cmd).arg(path).status() {
+    match std::process::Command::new(trash_cmd)
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .status()
+    {
         Ok(status) if status.success() => true,
         Ok(status) => {
             tracing::warn!(
@@ -564,6 +705,17 @@ fn try_trash_with_cmd(path: &Path, trash_cmd: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "sqlite-sessions")]
+    use crate::model::UserContent;
+    #[cfg(feature = "sqlite-sessions")]
+    use crate::session::{SessionMessage, SessionStoreKind};
+    #[cfg(feature = "sqlite-sessions")]
+    use asupersync::runtime::RuntimeBuilder;
+    use sqlmodel_core::Value;
+    use sqlmodel_sqlite::{OpenFlags, SqliteConfig, SqliteConnection};
+    #[cfg(feature = "sqlite-sessions")]
+    use std::future::Future;
+
     fn make_meta(path: &Path) -> SessionMeta {
         SessionMeta {
             path: path.display().to_string(),
@@ -584,6 +736,14 @@ mod tests {
             alt: false,
             paste: false,
         })
+    }
+
+    #[cfg(feature = "sqlite-sessions")]
+    fn run_async<T>(future: impl Future<Output = T>) -> T {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(future)
     }
 
     #[test]
@@ -936,12 +1096,10 @@ mod tests {
     fn build_meta_from_jsonl_parses_session_file() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let session_path = tmp.path().join("test.jsonl");
-        let header = serde_json::json!({
-            "type": "header",
-            "id": "abc123",
-            "cwd": "/work",
-            "timestamp": "2025-06-01T12:00:00.000Z"
-        });
+        let mut header = SessionHeader::new();
+        header.id = "abc123".to_string();
+        header.cwd = "/work".to_string();
+        header.timestamp = "2025-06-01T12:00:00.000Z".to_string();
         let msg1 = serde_json::json!({
             "type": "message",
             "timestamp": "2025-06-01T12:00:01.000Z",
@@ -975,6 +1133,32 @@ mod tests {
     }
 
     #[test]
+    fn build_meta_from_jsonl_rejects_semantically_invalid_header() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_path = tmp.path().join("invalid.jsonl");
+        let header = serde_json::json!({
+            "type": "header",
+            "id": "abc123",
+            "cwd": "/work",
+            "timestamp": "2025-06-01T12:00:00.000Z"
+        });
+        fs::write(
+            &session_path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&header).expect("serialize header")
+            ),
+        )
+        .expect("write");
+
+        let err = build_meta_from_jsonl(&session_path).expect_err("invalid header should fail");
+        assert!(
+            matches!(err, crate::error::Error::Session(ref msg) if msg.contains("Invalid session header")),
+            "expected invalid session header error, got {err:?}"
+        );
+    }
+
+    #[test]
     fn build_meta_from_jsonl_empty_file_returns_error() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let session_path = tmp.path().join("empty.jsonl");
@@ -998,26 +1182,319 @@ mod tests {
     fn scan_sessions_on_disk_finds_valid_session_files() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let session_path = tmp.path().join("session.jsonl");
-        let header = serde_json::json!({
-            "type": "header",
-            "id": "scan-test",
-            "cwd": "/work",
-            "timestamp": "2025-06-01T12:00:00.000Z"
-        });
+        let mut header = SessionHeader::new();
+        header.id = "scan-test".to_string();
+        header.cwd = "/work".to_string();
+        header.timestamp = "2025-06-01T12:00:00.000Z".to_string();
         fs::write(&session_path, serde_json::to_string(&header).unwrap()).expect("write");
 
         // Also create a non-session file that should be ignored
         fs::write(tmp.path().join("notes.txt"), "not a session").expect("write");
 
-        let found = scan_sessions_on_disk(tmp.path());
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].id, "scan-test");
+        let found = scan_sessions_on_disk(tmp.path(), &HashMap::new());
+        assert_eq!(found.metas.len(), 1);
+        assert_eq!(found.metas[0].id, "scan-test");
+        assert!(found.failed_paths.is_empty());
     }
 
     #[test]
     fn scan_sessions_on_disk_nonexistent_dir_returns_empty() {
-        let found = scan_sessions_on_disk(Path::new("/nonexistent/dir"));
-        assert!(found.is_empty());
+        let found = scan_sessions_on_disk(Path::new("/nonexistent/dir"), &HashMap::new());
+        assert!(found.metas.is_empty());
+        assert!(found.failed_paths.is_empty());
+    }
+
+    #[test]
+    fn scan_sessions_on_disk_skips_unchanged_cached_rows() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_path = tmp.path().join("session.jsonl");
+        let mut header = SessionHeader::new();
+        header.id = "cached-scan".to_string();
+        header.cwd = "/work".to_string();
+        header.timestamp = "2025-06-01T12:00:00.000Z".to_string();
+        fs::write(&session_path, serde_json::to_string(&header).unwrap()).expect("write");
+
+        let cached = build_meta_from_jsonl(&session_path).expect("cached meta");
+        let mut cached_by_path = HashMap::new();
+        cached_by_path.insert(cached.path.clone(), cached);
+
+        reset_session_scan_parse_count();
+        let found = scan_sessions_on_disk(tmp.path(), &cached_by_path);
+
+        assert!(found.metas.is_empty());
+        assert!(found.failed_paths.is_empty());
+        assert_eq!(take_session_scan_parse_count(), 0);
+    }
+
+    #[test]
+    fn list_sessions_for_project_prefers_scanned_meta_when_cached_row_is_stale() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base_dir = tmp.path().join("sessions");
+        let cwd = tmp.path().join("repo");
+        let project_dir = base_dir.join(encode_cwd(&cwd));
+        fs::create_dir_all(&project_dir).expect("create project sessions");
+
+        let session_path = project_dir.join("stale-index.jsonl");
+        let mut header = SessionHeader::new();
+        header.id = "stale-index".to_string();
+        header.cwd = cwd.display().to_string();
+        header.timestamp = "2025-06-01T12:00:00.000Z".to_string();
+
+        let content = format!(
+            "{}\n{{\"type\":\"message\"}}\n{{\"type\":\"message\"}}\n{{\"type\":\"session_info\",\"name\":\"Fresh name\"}}\n",
+            serde_json::to_string(&header).expect("serialize header"),
+        );
+        fs::write(&session_path, content).expect("write session");
+
+        let expected = build_meta_from_jsonl(&session_path).expect("load fresh meta");
+        let index = SessionIndex::for_sessions_root(&base_dir);
+        index.reindex_all().expect("seed session index");
+
+        let db_path = base_dir.join("session-index.sqlite");
+        let config = SqliteConfig::file(db_path.to_string_lossy())
+            .flags(OpenFlags::create_read_write())
+            .busy_timeout(5000);
+        let conn = SqliteConnection::open(&config).expect("open session index sqlite");
+        conn.execute_sync(
+            "UPDATE sessions
+             SET message_count=?1, size_bytes=?2, name=?3
+             WHERE path=?4",
+            &[
+                Value::BigInt(0),
+                Value::BigInt(
+                    i64::try_from(expected.size_bytes.saturating_sub(1)).expect("size fits in i64"),
+                ),
+                Value::Text("Stale name".to_string()),
+                Value::Text(session_path.display().to_string()),
+            ],
+        )
+        .expect("corrupt cached row");
+
+        let sessions = list_sessions_for_project(&cwd, Some(&base_dir));
+        assert_eq!(sessions.len(), 1);
+
+        let session = &sessions[0];
+        assert_eq!(session.path, session_path.display().to_string());
+        assert_eq!(session.message_count, expected.message_count);
+        assert_eq!(session.size_bytes, expected.size_bytes);
+        assert_eq!(session.name, expected.name);
+        assert_eq!(session.last_modified_ms, expected.last_modified_ms);
+    }
+
+    #[test]
+    fn list_sessions_for_project_refreshes_index_after_changed_disk_session() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base_dir = tmp.path().join("sessions");
+        let cwd = tmp.path().join("repo");
+        let project_dir = base_dir.join(encode_cwd(&cwd));
+        fs::create_dir_all(&project_dir).expect("create project sessions");
+
+        let session_path = project_dir.join("steady-state.jsonl");
+        let mut header = SessionHeader::new();
+        header.id = "steady-state".to_string();
+        header.cwd = cwd.display().to_string();
+        header.timestamp = "2025-06-01T12:00:00.000Z".to_string();
+
+        let initial = format!(
+            "{}\n{{\"type\":\"message\"}}\n{{\"type\":\"session_info\",\"name\":\"Initial\"}}\n",
+            serde_json::to_string(&header).expect("serialize header"),
+        );
+        fs::write(&session_path, initial).expect("write initial session");
+
+        let index = SessionIndex::for_sessions_root(&base_dir);
+        index.reindex_all().expect("seed session index");
+
+        let refreshed = format!(
+            "{}\n{{\"type\":\"message\"}}\n{{\"type\":\"message\"}}\n{{\"type\":\"session_info\",\"name\":\"Refreshed\"}}\n",
+            serde_json::to_string(&header).expect("serialize header"),
+        );
+        fs::write(&session_path, refreshed).expect("write refreshed session");
+
+        reset_session_scan_parse_count();
+        let sessions = list_sessions_for_project(&cwd, Some(&base_dir));
+        assert_eq!(take_session_scan_parse_count(), 1);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].message_count, 2);
+        assert_eq!(sessions[0].name.as_deref(), Some("Refreshed"));
+
+        let indexed = index
+            .list_sessions(Some(&cwd.display().to_string()))
+            .expect("list indexed sessions");
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].message_count, 2);
+        assert_eq!(indexed[0].name.as_deref(), Some("Refreshed"));
+
+        reset_session_scan_parse_count();
+        let steady_state = list_sessions_for_project(&cwd, Some(&base_dir));
+        assert_eq!(take_session_scan_parse_count(), 0);
+        assert_eq!(steady_state.len(), 1);
+        assert_eq!(steady_state[0].message_count, 2);
+        assert_eq!(steady_state[0].name.as_deref(), Some("Refreshed"));
+    }
+
+    #[test]
+    fn list_sessions_for_project_evicts_cached_row_when_disk_session_is_invalid() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base_dir = tmp.path().join("sessions");
+        let cwd = tmp.path().join("repo");
+        let project_dir = base_dir.join(encode_cwd(&cwd));
+        fs::create_dir_all(&project_dir).expect("create project sessions");
+
+        let session_path = project_dir.join("stale-invalid.jsonl");
+        let mut header = SessionHeader::new();
+        header.id = "stale-invalid".to_string();
+        header.cwd = cwd.display().to_string();
+        header.timestamp = "2025-06-01T12:00:00.000Z".to_string();
+        fs::write(
+            &session_path,
+            format!(
+                "{}\n{{\"type\":\"message\"}}\n",
+                serde_json::to_string(&header).expect("serialize header"),
+            ),
+        )
+        .expect("write session");
+
+        let index = SessionIndex::for_sessions_root(&base_dir);
+        index.reindex_all().expect("seed session index");
+
+        let invalid_header = serde_json::json!({
+            "type": "header",
+            "id": "stale-invalid",
+            "cwd": cwd.display().to_string(),
+            "timestamp": "2025-06-01T12:00:00.000Z"
+        });
+        fs::write(
+            &session_path,
+            format!(
+                "{}\n{{\"type\":\"message\"}}\n",
+                serde_json::to_string(&invalid_header).expect("serialize invalid header"),
+            ),
+        )
+        .expect("corrupt session");
+
+        let sessions = list_sessions_for_project(&cwd, Some(&base_dir));
+        assert!(sessions.is_empty());
+
+        let indexed = index
+            .list_sessions(Some(&cwd.display().to_string()))
+            .expect("list sessions");
+        assert!(indexed.is_empty());
+    }
+
+    #[test]
+    fn list_sessions_for_project_prunes_index_when_project_dir_is_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base_dir = tmp.path().join("sessions");
+        let cwd = tmp.path().join("repo");
+        let project_dir = base_dir.join(encode_cwd(&cwd));
+        fs::create_dir_all(&project_dir).expect("create project sessions");
+
+        let session_path = project_dir.join("missing-project-dir.jsonl");
+        let mut header = SessionHeader::new();
+        header.id = "missing-project-dir".to_string();
+        header.cwd = cwd.display().to_string();
+        header.timestamp = "2025-06-01T12:00:00.000Z".to_string();
+        fs::write(
+            &session_path,
+            format!(
+                "{}\n{{\"type\":\"message\"}}\n",
+                serde_json::to_string(&header).expect("serialize header"),
+            ),
+        )
+        .expect("write session");
+
+        let index = SessionIndex::for_sessions_root(&base_dir);
+        index.reindex_all().expect("seed session index");
+
+        let moved_project_dir = tmp.path().join("moved-project-dir");
+        fs::rename(&project_dir, &moved_project_dir).expect("move project dir away");
+
+        let sessions = list_sessions_for_project(&cwd, Some(&base_dir));
+        assert!(sessions.is_empty());
+
+        let indexed = index
+            .list_sessions(Some(&cwd.display().to_string()))
+            .expect("list indexed sessions");
+        assert!(indexed.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_sessions_for_project_keeps_permission_denied_row_indexed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base_dir = tmp.path().join("sessions");
+        let cwd = tmp.path().join("repo");
+        let project_dir = base_dir.join(encode_cwd(&cwd));
+        fs::create_dir_all(&project_dir).expect("create project sessions");
+
+        let session_path = project_dir.join("guarded.jsonl");
+        let mut header = SessionHeader::new();
+        header.id = "guarded-session".to_string();
+        header.cwd = cwd.display().to_string();
+        header.timestamp = "2025-06-01T12:00:00.000Z".to_string();
+        fs::write(
+            &session_path,
+            format!(
+                "{}\n{{\"type\":\"message\"}}\n",
+                serde_json::to_string(&header).expect("serialize header"),
+            ),
+        )
+        .expect("write session");
+
+        let index = SessionIndex::for_sessions_root(&base_dir);
+        index.reindex_all().expect("seed session index");
+
+        let original_mode = fs::metadata(&project_dir)
+            .expect("project dir metadata")
+            .permissions()
+            .mode();
+        fs::set_permissions(&project_dir, fs::Permissions::from_mode(0o000))
+            .expect("chmod project dir");
+
+        assert!(
+            session_path.try_exists().is_err(),
+            "expected permission-denied path probe for inaccessible project session directory"
+        );
+
+        let sessions = list_sessions_for_project(&cwd, Some(&base_dir));
+
+        fs::set_permissions(&project_dir, fs::Permissions::from_mode(original_mode))
+            .expect("restore project dir permissions");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].path, session_path.display().to_string());
+
+        let indexed = index
+            .list_sessions(Some(&cwd.display().to_string()))
+            .expect("list indexed sessions");
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].path, session_path.display().to_string());
+    }
+
+    #[cfg(feature = "sqlite-sessions")]
+    #[test]
+    fn build_meta_from_sqlite_uses_session_file_stats() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut session = Session::create_with_dir_and_store(
+            Some(tmp.path().to_path_buf()),
+            SessionStoreKind::Sqlite,
+        );
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text("sqlite".to_string()),
+            timestamp: Some(0),
+        });
+        run_async(async { session.save().await }).expect("save sqlite session");
+
+        let session_path = session.path.clone().expect("sqlite session path");
+        let meta = build_meta_from_sqlite(&session_path).expect("sqlite meta");
+        let (expected_ms, expected_size) =
+            session_file_stats(&session_path).expect("sqlite file stats");
+
+        assert_eq!(meta.message_count, 1);
+        assert_eq!(meta.size_bytes, expected_size);
+        assert_eq!(meta.last_modified_ms, expected_ms);
     }
 
     // ── with_theme_and_root constructor ────────────────────────────────
@@ -1116,6 +1593,97 @@ mod tests {
             "delete should be idempotent when file is already gone"
         );
         assert!(!session_path.exists(), "session file should remain deleted");
+    }
+
+    #[cfg(feature = "sqlite-sessions")]
+    #[test]
+    fn delete_sqlite_session_removes_wal_and_shm_sidecars() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_path = tmp.path().join("sqlite-session.sqlite");
+        let [wal_path, shm_path] = sqlite_auxiliary_paths(&session_path);
+        fs::write(&session_path, "db").expect("write sqlite session");
+        fs::write(&wal_path, "wal").expect("write sqlite wal");
+        fs::write(&shm_path, "shm").expect("write sqlite shm");
+
+        let result = delete_session_file_with_trash_cmd(
+            &session_path,
+            "__pi_agent_rust_nonexistent_trash_command__",
+        );
+        assert!(result.is_ok(), "delete should fall back to remove_file");
+        assert!(
+            !session_path.exists(),
+            "sqlite session file should be deleted"
+        );
+        assert!(!wal_path.exists(), "sqlite wal sidecar should be deleted");
+        assert!(!shm_path.exists(), "sqlite shm sidecar should be deleted");
+    }
+
+    #[cfg(feature = "sqlite-sessions")]
+    #[test]
+    fn delete_sqlite_session_preserves_sidecars_when_primary_delete_fails() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_path = tmp.path().join("delete-fails.sqlite");
+        let [wal_path, shm_path] = sqlite_auxiliary_paths(&session_path);
+        fs::create_dir(&session_path).expect("create directory in place of sqlite session");
+        fs::write(&wal_path, "wal").expect("write sqlite wal");
+        fs::write(&shm_path, "shm").expect("write sqlite shm");
+
+        let result = delete_session_file_with_trash_cmd(
+            &session_path,
+            "__pi_agent_rust_nonexistent_trash_command__",
+        );
+        assert!(
+            result.is_err(),
+            "directory-backed sqlite session path should fail deletion"
+        );
+        assert!(
+            wal_path.exists(),
+            "wal sidecar must be preserved on primary delete failure"
+        );
+        assert!(
+            shm_path.exists(),
+            "shm sidecar must be preserved on primary delete failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_session_file_preserves_sidecar_when_primary_delete_fails() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_path = tmp.path().join("delete-fails.jsonl");
+        fs::create_dir(&session_path).expect("create directory in place of session file");
+
+        let sidecar_path = crate::session_store_v2::v2_sidecar_path(&session_path);
+        fs::create_dir_all(&sidecar_path).expect("create sidecar");
+        fs::write(sidecar_path.join("manifest.json"), "{}\n").expect("write sidecar marker");
+
+        let trash_script = tmp.path().join("fake-trash-sidecar-only.sh");
+        fs::write(
+            &trash_script,
+            r#"#!/bin/sh
+case "$1" in
+  *.v2) mv "$1" "$1.trashed"; exit 0 ;;
+  *) exit 2 ;;
+esac
+"#,
+        )
+        .expect("write script");
+        let mut perms = fs::metadata(&trash_script).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&trash_script, perms).expect("chmod");
+
+        let trash_cmd = trash_script.to_string_lossy();
+        let result = delete_session_file_with_trash_cmd(&session_path, &trash_cmd);
+        assert!(
+            result.is_err(),
+            "directory-backed session path should fail deletion"
+        );
+        assert!(
+            sidecar_path.exists(),
+            "sidecar must be preserved when the main session path could not be deleted"
+        );
     }
 
     mod proptest_session_picker {

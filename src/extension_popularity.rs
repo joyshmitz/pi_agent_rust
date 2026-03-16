@@ -172,7 +172,10 @@ pub fn github_repo_candidate_from_url(input: &str) -> Option<GitHubRepoCandidate
 
     if let Some(rest) = raw.strip_prefix("git@") {
         // SCP-like: git@github.com:owner/repo(.git)
-        let (_host, path) = rest.split_once(':')?;
+        let (host, path) = rest.split_once(':')?;
+        if !host.eq_ignore_ascii_case("github.com") {
+            return None;
+        }
         return parse_owner_repo_from_path(path).map(GitHubRepoCandidate::Repo);
     }
 
@@ -521,6 +524,11 @@ mod tests {
     }
 
     #[test]
+    fn url_git_at_non_github_returns_none() {
+        assert!(github_repo_candidate_from_url("git@gitlab.com:owner/repo.git").is_none());
+    }
+
+    #[test]
     fn url_with_trailing_path() {
         let c = github_repo_candidate_from_url("https://github.com/owner/repo/tree/main").unwrap();
         assert_eq!(
@@ -763,7 +771,7 @@ mod tests {
                 assert_eq!(repo, "https://github.com/owner/repo.git");
                 assert_eq!(path, Some("packages/core".to_string()));
             }
-            _ => panic!("expected Git variant"),
+            _ => panic!(),
         }
     }
 
@@ -787,7 +795,7 @@ mod tests {
                 assert_eq!(version, "1.2.3");
                 assert!(url.contains("registry.npmjs.org"));
             }
-            _ => panic!("expected Npm variant"),
+            _ => panic!(),
         }
     }
 
@@ -803,7 +811,7 @@ mod tests {
             CandidateSource::Url { url } => {
                 assert_eq!(url, "https://example.com/ext.tgz");
             }
-            _ => panic!("expected Url variant"),
+            _ => panic!(),
         }
     }
 
@@ -819,7 +827,7 @@ mod tests {
             CandidateSource::Git { path, .. } => {
                 assert_eq!(path, None);
             }
-            _ => panic!("expected Git variant"),
+            _ => panic!(),
         }
     }
 

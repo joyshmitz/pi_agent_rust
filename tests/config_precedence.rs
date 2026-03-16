@@ -40,6 +40,55 @@ fn write_file(path: &Path, contents: &str) {
 }
 
 #[test]
+fn dropin174_config_surface_logs_include_requirement_id() {
+    let harness = TestHarness::new("dropin174_config_surface_logs_include_requirement_id");
+    harness.log().info_ctx(
+        "dropin174.config",
+        "Config precedence parity assertion",
+        |ctx| {
+            ctx.push((
+                "requirement_id".to_string(),
+                "DROPIN-174-CONFIG".to_string(),
+            ));
+            ctx.push(("surface".to_string(), "config".to_string()));
+            ctx.push((
+                "parity_requirement".to_string(),
+                "Config/env precedence parity".to_string(),
+            ));
+        },
+    );
+
+    let jsonl = harness.log().dump_jsonl();
+    let validation_errors = validate_jsonl(&jsonl);
+    assert!(
+        validation_errors.is_empty(),
+        "expected valid structured logs, got {validation_errors:?}"
+    );
+
+    let has_requirement_log = jsonl
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|record| {
+            record.get("category").and_then(serde_json::Value::as_str) == Some("dropin174.config")
+                && record
+                    .get("context")
+                    .and_then(|ctx| ctx.get("requirement_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("DROPIN-174-CONFIG")
+                && record
+                    .get("context")
+                    .and_then(|ctx| ctx.get("surface"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("config")
+        });
+
+    assert!(
+        has_requirement_log,
+        "expected structured log entry to include requirement_id + surface context"
+    );
+}
+
+#[test]
 fn config_load_pi_config_path_override_beats_project_and_global() {
     let _lock = config_lock();
     let harness = TestHarness::new("config_load_pi_config_path_override_beats_project_and_global");
@@ -227,50 +276,4 @@ fn config_terminal_defaults_and_overrides() {
     };
     assert!(!config.terminal_show_images());
     assert!(config.terminal_clear_on_shrink());
-}
-
-#[test]
-fn dropin174_config_surface_logs_include_requirement_id() {
-    let harness = TestHarness::new("dropin174_config_surface_logs_include_requirement_id");
-    harness
-        .log()
-        .info_ctx("parity", "DROPIN-174 config parity trace", |ctx| {
-            ctx.push(("requirement_id".to_string(), "DROPIN-142".to_string()));
-            ctx.push(("surface".to_string(), "config".to_string()));
-            ctx.push((
-                "parity_requirement".to_string(),
-                "Configuration and environment precedence parity".to_string(),
-            ));
-        });
-
-    let jsonl = harness.dump_logs();
-    let errors = validate_jsonl(&jsonl);
-    assert!(
-        errors.is_empty(),
-        "harness log JSONL must validate: {errors:?}"
-    );
-
-    let matched = jsonl
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid json log line"))
-        .filter(|value| value.get("category").and_then(serde_json::Value::as_str) == Some("parity"))
-        .any(|value| {
-            let Some(ctx) = value.get("context").and_then(serde_json::Value::as_object) else {
-                return false;
-            };
-            ctx.get("requirement_id")
-                .and_then(serde_json::Value::as_str)
-                == Some("DROPIN-142")
-                && ctx.get("surface").and_then(serde_json::Value::as_str) == Some("config")
-                && ctx
-                    .get("parity_requirement")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("Configuration and environment precedence parity")
-        });
-
-    assert!(
-        matched,
-        "expected a parity log line with DROPIN-142 config requirement context"
-    );
 }

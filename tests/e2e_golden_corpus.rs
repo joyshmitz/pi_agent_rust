@@ -106,6 +106,8 @@ impl GoldenTestHarness {
         let _ = fs::create_dir_all(&env_root);
 
         // Fully isolate global/project state for determinism.
+        env.insert("HOME".to_string(), env_root.display().to_string());
+        env.insert("USERPROFILE".to_string(), env_root.display().to_string());
         env.insert(
             "PI_CODING_AGENT_DIR".to_string(),
             env_root.join("agent").display().to_string(),
@@ -223,6 +225,14 @@ impl GoldenTestHarness {
 
         let start = Instant::now();
         let mut command = Command::new(&self.binary_path);
+        command.env_remove("ANTHROPIC_API_KEY");
+        command.env_remove("OPENAI_API_KEY");
+        command.env_remove("GEMINI_API_KEY");
+        command.env_remove("GROQ_API_KEY");
+        command.env_remove("KIMI_API_KEY");
+        command.env_remove("AZURE_OPENAI_API_KEY");
+        command.env_remove("PI_OPENROUTER_API_KEY");
+        command.env_remove("PI_AWS_ACCESS_KEY_ID");
         command
             .args(args)
             .envs(self.env.clone())

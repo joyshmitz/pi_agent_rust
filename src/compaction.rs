@@ -171,13 +171,13 @@ fn extract_file_ops_from_message(
         };
 
         match name.as_str() {
-            "read" => {
+            "read" | "grep" | "find" | "ls" => {
                 file_ops.read.insert(path.to_string());
             }
             "write" => {
                 file_ops.written.insert(path.to_string());
             }
-            "edit" => {
+            "edit" | "hashline_edit" => {
                 file_ops.edited.insert(path.to_string());
             }
             _ => {}
@@ -254,7 +254,7 @@ const fn calculate_context_tokens(usage: &Usage) -> u64 {
     if usage.total_tokens > 0 {
         usage.total_tokens
     } else {
-        usage.input + usage.output
+        usage.input.saturating_add(usage.output)
     }
 }
 
@@ -294,12 +294,22 @@ fn estimate_context_tokens(messages: &[SessionMessage]) -> ContextUsageEstimate 
     };
 
     let usage_tokens = calculate_context_tokens(usage);
+
+    // Fall back to heuristic estimation if the provider didn't return usage metrics
+    if usage_tokens == 0 {
+        let total = messages.iter().map(estimate_tokens).sum();
+        return ContextUsageEstimate {
+            tokens: total,
+            last_usage_index: None,
+        };
+    }
+
     let trailing_tokens = messages[usage_index + 1..]
         .iter()
         .map(estimate_tokens)
-        .sum::<u64>();
+        .fold(0u64, u64::saturating_add);
     ContextUsageEstimate {
-        tokens: usage_tokens + trailing_tokens,
+        tokens: usage_tokens.saturating_add(trailing_tokens),
         last_usage_index: Some(usage_index),
     }
 }
@@ -481,10 +491,11 @@ fn find_cut_point(
 
     for i in (start_index..end_index).rev() {
         let entry = &entries[i];
-        let SessionEntry::Message(msg_entry) = entry else {
+        if let Some(msg) = message_from_entry(entry) {
+            accumulated_tokens = accumulated_tokens.saturating_add(estimate_tokens(&msg));
+        } else {
             continue;
-        };
-        accumulated_tokens = accumulated_tokens.saturating_add(estimate_tokens(&msg_entry.message));
+        }
 
         if accumulated_tokens >= u64::from(keep_recent_tokens) {
             // Binary search: find the largest cut point <= i.
@@ -1336,6 +1347,21 @@ mod tests {
         assert!(estimate.last_usage_index.is_none());
     }
 
+    #[test]
+    fn estimate_context_zero_usage_falls_back_to_heuristics() {
+        let messages = vec![
+            make_user_text("hi"),
+            make_assistant_text("hello", 0, 0),
+            make_user_text("bye"),
+        ];
+        let estimate = estimate_context_tokens(&messages);
+        // Zero provider usage should not collapse the estimate to trailing
+        // messages only. We should fall back to whole-history heuristics:
+        // "hi" => 1, "hello" => 2, "bye" => 1.
+        assert_eq!(estimate.tokens, 4);
+        assert!(estimate.last_usage_index.is_none());
+    }
+
     // ── extract_file_ops_from_message ────────────────────────────────
 
     #[test]
@@ -1705,7 +1731,7 @@ mod tests {
             assert_eq!(summary, "branch summary text");
             assert_eq!(from_id, "parent");
         } else {
-            panic!("expected BranchSummary");
+            panic!();
         }
     }
 
@@ -1721,7 +1747,7 @@ mod tests {
             assert_eq!(summary, "compact summary");
             assert_eq!(tokens_before, 500);
         } else {
-            panic!("expected CompactionSummary");
+            panic!();
         }
     }
 
@@ -2153,10 +2179,10 @@ mod tests {
                 if let UserContent::Text(t) = content {
                     assert_eq!(t, "user");
                 } else {
-                    panic!("wrong content");
+                    panic!();
                 }
             }
-            _ => panic!("expected user message in turn prefix"),
+            _ => panic!(),
         }
     }
 

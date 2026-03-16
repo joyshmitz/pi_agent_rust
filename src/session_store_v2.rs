@@ -10,12 +10,23 @@ use crate::error::{Error, Result};
 use crate::session::SessionEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::BTreeSet;
-use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+
+fn secure_open_options() -> OpenOptions {
+    let mut opts = OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts
+}
 
 pub const SEGMENT_FRAME_SCHEMA: &str = "pi.session_store_v2.segment_frame.v1";
 pub const OFFSET_INDEX_SCHEMA: &str = "pi.session_store_v2.offset_index.v1";
@@ -23,13 +34,16 @@ pub const CHECKPOINT_SCHEMA: &str = "pi.session_store_v2.checkpoint.v1";
 pub const MANIFEST_SCHEMA: &str = "pi.session_store_v2.manifest.v1";
 pub const MIGRATION_EVENT_SCHEMA: &str = "pi.session_store_v2.migration_event.v1";
 
+/// Maximum size for a single frame line (100MB) to prevent OOM on corrupted files.
+const MAX_FRAME_READ_BYTES: u64 = 100 * 1024 * 1024;
+
 /// Initial chain hash before any frames are appended.
 const GENESIS_CHAIN_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SegmentFrame {
-    pub schema: String,
+    pub schema: Cow<'static, str>,
     pub segment_seq: u64,
     pub frame_seq: u64,
     pub entry_seq: u64,
@@ -40,7 +54,7 @@ pub struct SegmentFrame {
     pub timestamp: String,
     pub payload_sha256: String,
     pub payload_bytes: u64,
-    pub payload: Value,
+    pub payload: Box<RawValue>,
 }
 
 impl SegmentFrame {
@@ -51,11 +65,11 @@ impl SegmentFrame {
         entry_id: String,
         parent_entry_id: Option<String>,
         entry_type: String,
-        payload: Value,
+        payload: Box<RawValue>,
     ) -> Result<Self> {
         let (payload_sha256, payload_bytes) = payload_hash_and_size(&payload)?;
         Ok(Self {
-            schema: SEGMENT_FRAME_SCHEMA.to_string(),
+            schema: Cow::Borrowed(SEGMENT_FRAME_SCHEMA),
             segment_seq,
             frame_seq,
             entry_seq,
@@ -73,7 +87,7 @@ impl SegmentFrame {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OffsetIndexEntry {
-    pub schema: String,
+    pub schema: Cow<'static, str>,
     pub entry_seq: u64,
     pub entry_id: String,
     pub segment_seq: u64,
@@ -81,7 +95,7 @@ pub struct OffsetIndexEntry {
     pub byte_offset: u64,
     pub byte_length: u64,
     pub crc32c: String,
-    pub state: String,
+    pub state: Cow<'static, str>,
 }
 
 /// Current head position of the store (last written entry).
@@ -219,6 +233,26 @@ pub struct SessionStoreV2 {
 }
 
 impl SessionStoreV2 {
+    /// Open a store handle for read-only inspection without bootstrap recovery.
+    pub fn open_for_inspection(root: impl AsRef<Path>, max_segment_bytes: u64) -> Result<Self> {
+        if max_segment_bytes == 0 {
+            return Err(Error::validation("max_segment_bytes must be > 0"));
+        }
+
+        Ok(Self {
+            root: root.as_ref().to_path_buf(),
+            max_segment_bytes,
+            next_segment_seq: 1,
+            next_frame_seq: 1,
+            next_entry_seq: 1,
+            current_segment_bytes: 0,
+            chain_hash: GENESIS_CHAIN_HASH.to_string(),
+            total_bytes: 0,
+            last_entry_id: None,
+            last_crc32c: "00000000".to_string(),
+        })
+    }
+
     pub fn create(root: impl AsRef<Path>, max_segment_bytes: u64) -> Result<Self> {
         if max_segment_bytes == 0 {
             return Err(Error::validation("max_segment_bytes must be > 0"));
@@ -337,6 +371,7 @@ impl SessionStoreV2 {
         Ok(false)
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     pub fn append_entry(
         &mut self,
         entry_id: impl Into<String>,
@@ -347,6 +382,14 @@ impl SessionStoreV2 {
         let entry_id = entry_id.into();
         let entry_type = entry_type.into();
 
+        // Convert the generic Value into a RawValue (string slice) to avoid
+        // re-serializing the payload when writing the full frame.
+        // We do this by first serializing the Value to a string, then
+        // creating a Box<RawValue> from it.
+        let raw_string = serde_json::to_string(&payload)?;
+        let raw_payload = RawValue::from_string(raw_string)
+            .map_err(|e| Error::session(format!("failed to convert payload to RawValue: {e}")))?;
+
         let mut frame = SegmentFrame::new(
             self.next_segment_seq,
             self.next_frame_seq,
@@ -354,7 +397,7 @@ impl SessionStoreV2 {
             entry_id,
             parent_entry_id,
             entry_type,
-            payload,
+            raw_payload,
         )?;
         let mut encoded = serde_json::to_vec(&frame)?;
         let mut line_len = line_length_u64(&encoded)?;
@@ -383,21 +426,28 @@ impl SessionStoreV2 {
         }
 
         let segment_path = self.segment_file_path(self.next_segment_seq);
-        let byte_offset = fs::metadata(&segment_path).map_or(0, |meta| meta.len());
 
-        let mut segment = OpenOptions::new()
+        // Prepare the write buffer by appending the newline to the encoded JSON
+        let mut write_buf = encoded;
+        write_buf.push(b'\n');
+
+        let is_new_segment = self.next_frame_seq == 1;
+        let mut segment = secure_open_options()
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(is_new_segment)
             .open(&segment_path)?;
-        segment.write_all(&encoded)?;
-        segment.write_all(b"\n")?;
-        segment.flush()?;
 
-        let mut persisted = encoded;
-        persisted.push(b'\n');
-        let crc = crc32c_upper(&persisted);
+        let byte_offset = segment.seek(SeekFrom::End(0))?;
+        if let Err(e) = segment.write_all(&write_buf) {
+            let _ = segment.set_len(byte_offset);
+            return Err(Error::from(e));
+        }
+
+        // Use write_buf (which includes the newline) for CRC calculation
+        let crc = crc32c_upper(&write_buf);
         let index_entry = OffsetIndexEntry {
-            schema: OFFSET_INDEX_SCHEMA.to_string(),
+            schema: Cow::Borrowed(OFFSET_INDEX_SCHEMA),
             entry_seq: frame.entry_seq,
             entry_id: frame.entry_id.clone(),
             segment_seq: frame.segment_seq,
@@ -405,9 +455,14 @@ impl SessionStoreV2 {
             byte_offset,
             byte_length: line_len,
             crc32c: crc.clone(),
-            state: "active".to_string(),
+            state: Cow::Borrowed("active"),
         };
-        append_jsonl_line(&self.index_file_path(), &index_entry)?;
+
+        if let Err(e) = append_jsonl_line(&self.index_file_path(), &index_entry) {
+            // Rollback: truncate segment to remove the unindexed frame.
+            let _ = segment.set_len(byte_offset);
+            return Err(e);
+        }
 
         self.chain_hash = chain_hash_step(&self.chain_hash, &frame.payload_sha256);
         self.total_bytes = self.total_bytes.saturating_add(line_len);
@@ -451,18 +506,19 @@ impl SessionStoreV2 {
         let Some(row) = row else {
             return Ok(None);
         };
-        seek_read_frame(self, row)
+        SegmentFileReader::new(self).read_frame(row)
     }
 
     /// Read all entries with `entry_seq >= from_entry_seq` (tail reading).
     pub fn read_entries_from(&self, from_entry_seq: u64) -> Result<Vec<SegmentFrame>> {
         let index_rows = self.read_index()?;
         let mut frames = Vec::new();
+        let mut reader = SegmentFileReader::new(self);
         for row in &index_rows {
             if row.entry_seq < from_entry_seq {
                 continue;
             }
-            if let Some(frame) = seek_read_frame(self, row)? {
+            if let Some(frame) = reader.read_frame(row)? {
                 frames.push(frame);
             }
         }
@@ -480,8 +536,9 @@ impl SessionStoreV2 {
         let total = index_rows.len();
         let skip = total.saturating_sub(usize::try_from(count).unwrap_or(usize::MAX));
         let mut frames = Vec::with_capacity(total.saturating_sub(skip));
+        let mut reader = SegmentFileReader::new(self);
         for row in &index_rows[skip..] {
-            if let Some(frame) = seek_read_frame(self, row)? {
+            if let Some(frame) = reader.read_frame(row)? {
                 frames.push(frame);
             }
         }
@@ -492,25 +549,51 @@ impl SessionStoreV2 {
     /// Returns frames in root→leaf order.
     pub fn read_active_path(&self, leaf_entry_id: &str) -> Result<Vec<SegmentFrame>> {
         let index_rows = self.read_index()?;
-        let id_to_row: std::collections::HashMap<&str, &OffsetIndexEntry> = index_rows
-            .iter()
-            .map(|row| (row.entry_id.as_str(), row))
-            .collect();
+        let mut id_to_row: std::collections::HashMap<&str, &OffsetIndexEntry> =
+            std::collections::HashMap::with_capacity(index_rows.len());
+        for row in &index_rows {
+            if id_to_row.insert(row.entry_id.as_str(), row).is_some() {
+                return Err(Error::session(format!(
+                    "duplicate entry_id detected while reading active path: {}",
+                    row.entry_id
+                )));
+            }
+        }
 
         let mut frames = Vec::new();
         let mut current_id: Option<String> = Some(leaf_entry_id.to_string());
+        let mut reader = SegmentFileReader::new(self);
+        let mut visited = std::collections::HashSet::new();
         while let Some(ref entry_id) = current_id {
-            let row = id_to_row.get(entry_id.as_str());
-            let row = match row {
-                Some(r) => *r,
-                None => break,
+            if !visited.insert(entry_id.clone()) {
+                return Err(Error::session(format!(
+                    "cyclic parent chain detected while reading active path at entry_id={entry_id}"
+                )));
+            }
+            let Some(&row) = id_to_row.get(entry_id.as_str()) else {
+                if frames.is_empty() {
+                    break;
+                }
+                return Err(Error::session(format!(
+                    "missing parent entry detected while reading active path at entry_id={entry_id}"
+                )));
             };
-            match seek_read_frame(self, row)? {
+            match reader.read_frame(row)? {
                 Some(frame) => {
+                    if frame.entry_id != row.entry_id {
+                        return Err(Error::session(format!(
+                            "active path index/frame mismatch for entry_id={} frame={}",
+                            row.entry_id, frame.entry_id
+                        )));
+                    }
                     current_id.clone_from(&frame.parent_entry_id);
                     frames.push(frame);
                 }
-                None => break,
+                None => {
+                    return Err(Error::session(format!(
+                        "index references missing frame while reading active path at entry_id={entry_id}"
+                    )));
+                }
             }
         }
         frames.reverse();
@@ -560,7 +643,23 @@ impl SessionStoreV2 {
             .root
             .join("tmp")
             .join(format!("{checkpoint_seq:016}.json.tmp"));
-        fs::write(&tmp_path, serde_json::to_vec_pretty(&checkpoint)?)?;
+
+        let write_result: Result<()> = (|| {
+            let mut file = secure_open_options()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)?;
+            file.write_all(&serde_json::to_vec_pretty(&checkpoint)?)?;
+            file.sync_all()?;
+            Ok(())
+        })();
+
+        if let Err(err) = write_result {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+
         fs::rename(&tmp_path, self.checkpoint_path(checkpoint_seq))?;
         Ok(checkpoint)
     }
@@ -649,8 +748,7 @@ impl SessionStoreV2 {
                         Some(keep_len) if keep_len > 0 => {
                             let current_len = fs::metadata(&path)?.len();
                             if keep_len < current_len {
-                                let file = OpenOptions::new().write(true).open(&path)?;
-                                file.set_len(keep_len)?;
+                                truncate_file_to(&path, keep_len)?;
                             }
                         }
                         _ => {
@@ -662,6 +760,9 @@ impl SessionStoreV2 {
 
             let index_path = self.index_file_path();
             let index_tmp = self.root.join("tmp").join("offsets.rollback.tmp");
+            if let Some(parent) = index_tmp.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
             write_jsonl_lines(&index_tmp, &index_rows)?;
             fs::rename(index_tmp, index_path)?;
 
@@ -761,33 +862,44 @@ impl SessionStoreV2 {
         let session_id = session_id.into();
         let source_format = source_format.into();
         let index_rows = self.read_index()?;
-        let frames = self.read_all_entries()?;
 
-        let mut parent_counts: std::collections::HashMap<&str, u64> =
+        let mut parent_counts: std::collections::HashMap<String, u64> =
             std::collections::HashMap::new();
         let mut message_count = 0u64;
         let mut compaction_count = 0u64;
-        let mut entry_ids = std::collections::HashSet::with_capacity(frames.len());
-        for frame in &frames {
-            entry_ids.insert(frame.entry_id.as_str());
-            if frame.entry_type == "message" {
-                message_count = message_count.saturating_add(1);
-            }
-            if frame.entry_type == "compaction" {
-                compaction_count = compaction_count.saturating_add(1);
-            }
-            if let Some(parent_id) = frame.parent_entry_id.as_deref() {
-                *parent_counts.entry(parent_id).or_insert(0) += 1;
+        let mut entry_ids = std::collections::HashSet::with_capacity(index_rows.len());
+
+        let mut recomputed_chain = GENESIS_CHAIN_HASH.to_string();
+        let mut parent_links_closed = true;
+        let mut reader = SegmentFileReader::new(self);
+
+        for row in &index_rows {
+            if let Some(frame) = reader.read_frame(row)? {
+                entry_ids.insert(frame.entry_id.clone());
+
+                if frame.entry_type == "message" {
+                    message_count = message_count.saturating_add(1);
+                }
+                if frame.entry_type == "compaction" {
+                    compaction_count = compaction_count.saturating_add(1);
+                }
+
+                if let Some(parent_id) = frame.parent_entry_id.as_deref() {
+                    *parent_counts.entry(parent_id.to_string()).or_insert(0) += 1;
+
+                    // In a valid append-only log, the parent must have appeared
+                    // (and thus been added to entry_ids) before the child.
+                    if !entry_ids.contains(parent_id) {
+                        parent_links_closed = false;
+                    }
+                }
+
+                recomputed_chain = chain_hash_step(&recomputed_chain, &frame.payload_sha256);
             }
         }
+
         let branches_total = u64::try_from(parent_counts.values().filter(|&&n| n > 1).count())
             .map_err(|_| Error::session("branch count exceeds u64"))?;
-        let parent_links_closed = frames.iter().all(|frame| {
-            frame
-                .parent_entry_id
-                .as_deref()
-                .is_none_or(|parent| entry_ids.contains(parent))
-        });
 
         let mut monotonic_entry_seq = true;
         let mut monotonic_segment_seq = true;
@@ -804,10 +916,6 @@ impl SessionStoreV2 {
             last_segment_seq = row.segment_seq;
         }
 
-        let mut recomputed_chain = GENESIS_CHAIN_HASH.to_string();
-        for frame in &frames {
-            recomputed_chain = chain_hash_step(&recomputed_chain, &frame.payload_sha256);
-        }
         let hash_chain_valid = recomputed_chain == self.chain_hash;
 
         let head = self.head().unwrap_or(StoreHead {
@@ -865,7 +973,23 @@ impl SessionStoreV2 {
         manifest.integrity.manifest_hash = manifest_hash_hex(&manifest)?;
 
         let tmp = self.root.join("tmp").join("manifest.json.tmp");
-        fs::write(&tmp, serde_json::to_vec_pretty(&manifest)?)?;
+
+        let write_result: Result<()> = (|| {
+            let mut file = secure_open_options()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)?;
+            file.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
+            file.sync_all()?;
+            Ok(())
+        })();
+
+        if let Err(err) = write_result {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
+
         fs::rename(&tmp, self.manifest_path())?;
         Ok(manifest)
     }
@@ -904,12 +1028,29 @@ impl SessionStoreV2 {
 
     /// Rebuild the offset index by scanning all segment files.
     /// This is the recovery path when the index is missing or corrupted.
+    #[allow(clippy::too_many_lines)]
     pub fn rebuild_index(&mut self) -> Result<u64> {
         let mut rebuilt_count = 0u64;
         let index_path = self.index_file_path();
-        if index_path.exists() {
-            fs::remove_file(&index_path)?;
+        let index_tmp_path = self.root.join("tmp").join("offsets.rebuild.tmp");
+
+        // Ensure tmp dir exists
+        if let Some(parent) = index_tmp_path.parent() {
+            fs::create_dir_all(parent)?;
         }
+
+        // Start fresh with the temp file
+        if index_tmp_path.exists() {
+            fs::remove_file(&index_tmp_path)?;
+        }
+
+        let mut index_writer = std::io::BufWriter::new(
+            secure_open_options()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&index_tmp_path)?,
+        );
 
         self.chain_hash = GENESIS_CHAIN_HASH.to_string();
         self.total_bytes = 0;
@@ -917,21 +1058,38 @@ impl SessionStoreV2 {
         self.last_crc32c = "00000000".to_string();
 
         let segment_files = self.list_segment_files()?;
-        for (_seg_seq, seg_path) in segment_files {
-            let file = File::open(&seg_path)?;
+        let mut last_observed_seq = 0u64;
+
+        'segments: for (i, (segment_seq, seg_path)) in segment_files.iter().enumerate() {
+            let file = File::open(seg_path)?;
             let mut reader = BufReader::new(file);
             let mut byte_offset = 0u64;
             let mut line_number = 0u64;
+            let mut expected_frame_seq = 1u64;
             let mut line = String::new();
 
             loop {
                 line.clear();
-                let bytes_read = reader.read_line(&mut line)?;
+                // Use bounded read to prevent OOM on corrupted files (e.g. missing newlines)
+                let bytes_read =
+                    match read_line_with_limit(&mut reader, &mut line, MAX_FRAME_READ_BYTES) {
+                        Ok(n) => n,
+                        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                            return Err(Error::session(format!(
+                                "failed to read segment frame while rebuilding index: \
+                             segment={} line={}: {e}",
+                                seg_path.display(),
+                                line_number.saturating_add(1),
+                            )));
+                        }
+                        Err(e) => return Err(Error::Io(Box::new(e))),
+                    };
+
                 if bytes_read == 0 {
                     break;
                 }
                 line_number = line_number.saturating_add(1);
-                let line_len = u64::try_from(bytes_read)
+                let mut line_len = u64::try_from(bytes_read)
                     .map_err(|_| Error::session("line length exceeds u64"))?;
 
                 if line.trim().is_empty() {
@@ -939,50 +1097,95 @@ impl SessionStoreV2 {
                     continue;
                 }
 
+                let missing_newline = !line.ends_with('\n');
                 let json_line = line.trim_end_matches('\n').trim_end_matches('\r');
                 let frame: SegmentFrame = match serde_json::from_str(json_line) {
-                    Ok(frame) => frame,
-                    Err(err) => {
-                        let at_eof = reader.fill_buf()?.is_empty();
-                        let missing_newline = !line.ends_with('\n');
-                        if at_eof && missing_newline {
+                    Ok(frame) => {
+                        if missing_newline {
+                            use std::io::Write;
                             tracing::warn!(
                                 segment = %seg_path.display(),
                                 line_number,
-                                error = %err,
-                                "SessionStoreV2 dropping truncated trailing segment frame during index rebuild"
+                                "SessionStoreV2 encountered valid frame missing trailing newline; healing segment"
                             );
-                            // Trim the incomplete tail so subsequent reads and appends remain valid.
-                            OpenOptions::new()
-                                .write(true)
-                                .open(&seg_path)?
-                                .set_len(byte_offset)?;
-                            break;
+                            let mut f = secure_open_options().append(true).open(seg_path)?;
+                            f.write_all(b"\n")?;
+                            line.push('\n');
+                            line_len += 1;
                         }
-                        // Non-EOF corruption: fail closed to prevent silent data loss.
-                        return Err(Error::session(format!(
-                            "failed to parse segment frame while rebuilding index: \
-                             segment={} line={line_number}: {err}",
-                            seg_path.display()
-                        )));
+                        frame
+                    }
+                    Err(err) => {
+                        let at_eof = reader.fill_buf().is_ok_and(<[u8]>::is_empty);
+                        if !at_eof {
+                            return Err(Error::session(format!(
+                                "failed to parse segment frame while rebuilding index: \
+                                 segment={} line={line_number}: {err}",
+                                seg_path.display()
+                            )));
+                        }
+                        tracing::warn!(
+                            segment = %seg_path.display(),
+                            line_number,
+                            error = %err,
+                            at_eof,
+                            missing_newline,
+                            "SessionStoreV2 dropping corrupted frame during index rebuild; truncating segment and quarantining subsequent segments"
+                        );
+                        // Trim the incomplete tail so subsequent reads and appends remain valid.
+                        drop(reader);
+                        truncate_file_to(seg_path, byte_offset)?;
+                        quarantine_segment_tail(&segment_files[i + 1..])?;
+                        break 'segments;
                     }
                 };
 
-                let record_bytes = line.as_bytes().to_vec();
-                let crc = crc32c_upper(&record_bytes);
+                if frame.segment_seq != *segment_seq || frame.frame_seq != expected_frame_seq {
+                    tracing::warn!(
+                        segment = %seg_path.display(),
+                        line_number,
+                        expected_segment_seq = *segment_seq,
+                        actual_segment_seq = frame.segment_seq,
+                        expected_frame_seq,
+                        actual_frame_seq = frame.frame_seq,
+                        "SessionStoreV2 detected mismatched embedded frame coordinates during rebuild; truncating segment and quarantining subsequent segments"
+                    );
+                    drop(reader);
+                    truncate_file_to(seg_path, byte_offset)?;
+                    quarantine_segment_tail(&segment_files[i + 1..])?;
+                    break 'segments;
+                }
+
+                if frame.entry_seq <= last_observed_seq {
+                    tracing::warn!(
+                        segment = %seg_path.display(),
+                        line_number,
+                        entry_seq = frame.entry_seq,
+                        last_seq = last_observed_seq,
+                        "SessionStoreV2 detected non-monotonic entry sequence during rebuild; truncating segment and quarantining subsequent segments"
+                    );
+                    drop(reader);
+                    truncate_file_to(seg_path, byte_offset)?;
+                    quarantine_segment_tail(&segment_files[i + 1..])?;
+                    break 'segments;
+                }
+                last_observed_seq = frame.entry_seq;
+
+                let crc = crc32c_upper(line.as_bytes());
 
                 let index_entry = OffsetIndexEntry {
-                    schema: OFFSET_INDEX_SCHEMA.to_string(),
+                    schema: Cow::Borrowed(OFFSET_INDEX_SCHEMA),
                     entry_seq: frame.entry_seq,
                     entry_id: frame.entry_id.clone(),
-                    segment_seq: frame.segment_seq,
-                    frame_seq: frame.frame_seq,
+                    segment_seq: *segment_seq,
+                    frame_seq: expected_frame_seq,
                     byte_offset,
                     byte_length: line_len,
                     crc32c: crc.clone(),
-                    state: "active".to_string(),
+                    state: Cow::Borrowed("active"),
                 };
-                append_jsonl_line(&index_path, &index_entry)?;
+                serde_json::to_writer(&mut index_writer, &index_entry)?;
+                index_writer.write_all(b"\n")?;
 
                 self.chain_hash = chain_hash_step(&self.chain_hash, &frame.payload_sha256);
                 self.total_bytes = self.total_bytes.saturating_add(line_len);
@@ -991,8 +1194,21 @@ impl SessionStoreV2 {
 
                 byte_offset = byte_offset.saturating_add(line_len);
                 rebuilt_count = rebuilt_count.saturating_add(1);
+                expected_frame_seq = expected_frame_seq
+                    .checked_add(1)
+                    .ok_or_else(|| Error::session("frame sequence overflow during rebuild"))?;
             }
         }
+
+        index_writer.flush()?;
+        let file = index_writer
+            .into_inner()
+            .map_err(std::io::IntoInnerError::into_error)?;
+        file.sync_all()?;
+        drop(file); // Close the file handle before renaming (fixes Windows ERROR_SHARING_VIOLATION)
+
+        // Atomically replace the old index with the rebuilt one
+        fs::rename(&index_tmp_path, &index_path)?;
 
         self.next_segment_seq = 1;
         self.next_frame_seq = 1;
@@ -1006,8 +1222,13 @@ impl SessionStoreV2 {
     pub fn validate_integrity(&self) -> Result<()> {
         let index_rows = self.read_index()?;
         let mut last_entry_seq = 0;
+        let mut parent_by_entry: std::collections::HashMap<String, Option<String>> =
+            std::collections::HashMap::with_capacity(index_rows.len());
 
-        for row in index_rows {
+        // Group rows by segment to minimize file opens
+        let mut rows_by_segment: std::collections::BTreeMap<u64, Vec<&OffsetIndexEntry>> =
+            std::collections::BTreeMap::new();
+        for row in &index_rows {
             if row.entry_seq <= last_entry_seq {
                 return Err(Error::session(format!(
                     "entry sequence is not strictly increasing at entry_seq={}",
@@ -1015,71 +1236,90 @@ impl SessionStoreV2 {
                 )));
             }
             last_entry_seq = row.entry_seq;
+            rows_by_segment
+                .entry(row.segment_seq)
+                .or_default()
+                .push(row);
+        }
 
-            let segment_path = self.segment_file_path(row.segment_seq);
-            let segment_len =
-                fs::metadata(&segment_path)
-                    .map(|meta| meta.len())
-                    .map_err(|err| {
-                        Error::session(format!(
-                            "failed to stat segment {}: {err}",
-                            segment_path.display()
-                        ))
-                    })?;
-            let end = row
-                .byte_offset
-                .checked_add(row.byte_length)
-                .ok_or_else(|| Error::session("index byte range overflow"))?;
-            if end > segment_len {
-                return Err(Error::session(format!(
-                    "index out of bounds for segment {}: end={} len={segment_len}",
-                    segment_path.display(),
-                    end
-                )));
-            }
+        for (segment_seq, rows) in rows_by_segment {
+            let segment_path = self.segment_file_path(segment_seq);
+            let mut file = File::open(&segment_path).map_err(|err| {
+                Error::session(format!(
+                    "failed to open segment {}: {err}",
+                    segment_path.display()
+                ))
+            })?;
+            let segment_len = file.metadata()?.len();
 
-            let mut file = File::open(&segment_path)?;
-            file.seek(SeekFrom::Start(row.byte_offset))?;
-            let mut record_bytes = vec![
-                0u8;
-                usize::try_from(row.byte_length).map_err(|_| {
-                    Error::session(format!("byte length too large: {}", row.byte_length))
-                })?
-            ];
-            file.read_exact(&mut record_bytes)?;
+            for row in rows {
+                let end = row
+                    .byte_offset
+                    .checked_add(row.byte_length)
+                    .ok_or_else(|| Error::session("index byte range overflow"))?;
+                if end > segment_len {
+                    return Err(Error::session(format!(
+                        "index out of bounds for segment {}: end={} len={segment_len}",
+                        segment_path.display(),
+                        end
+                    )));
+                }
 
-            let checksum = crc32c_upper(&record_bytes);
-            if checksum != row.crc32c {
-                return Err(Error::session(format!(
-                    "checksum mismatch for entry_seq={} expected={} actual={checksum}",
-                    row.entry_seq, row.crc32c
-                )));
-            }
+                file.seek(SeekFrom::Start(row.byte_offset))?;
+                let mut record_bytes = vec![
+                    0u8;
+                    usize::try_from(row.byte_length).map_err(|_| {
+                        Error::session(format!("byte length too large: {}", row.byte_length))
+                    })?
+                ];
+                file.read_exact(&mut record_bytes)?;
 
-            if record_bytes.last() == Some(&b'\n') {
-                record_bytes.pop();
-            }
-            let frame: SegmentFrame = serde_json::from_slice(&record_bytes)?;
+                let checksum = crc32c_upper(&record_bytes);
+                if checksum != row.crc32c {
+                    return Err(Error::session(format!(
+                        "checksum mismatch for entry_seq={} expected={} actual={checksum}",
+                        row.entry_seq, row.crc32c
+                    )));
+                }
 
-            if frame.entry_seq != row.entry_seq
-                || frame.entry_id != row.entry_id
-                || frame.segment_seq != row.segment_seq
-                || frame.frame_seq != row.frame_seq
-            {
-                return Err(Error::session(format!(
-                    "index/frame mismatch at entry_seq={}",
-                    row.entry_seq
-                )));
-            }
+                if record_bytes.last() == Some(&b'\n') {
+                    record_bytes.pop();
+                }
+                let frame: SegmentFrame = serde_json::from_slice(&record_bytes)?;
 
-            let (payload_hash, payload_bytes) = payload_hash_and_size(&frame.payload)?;
-            if frame.payload_sha256 != payload_hash || frame.payload_bytes != payload_bytes {
-                return Err(Error::session(format!(
-                    "payload integrity mismatch at entry_seq={}",
-                    row.entry_seq
-                )));
+                if frame.entry_seq != row.entry_seq
+                    || frame.entry_id != row.entry_id
+                    || frame.segment_seq != row.segment_seq
+                    || frame.frame_seq != row.frame_seq
+                {
+                    return Err(Error::session(format!(
+                        "index/frame mismatch at entry_seq={}",
+                        row.entry_seq
+                    )));
+                }
+
+                let (payload_hash, payload_bytes) = payload_hash_and_size(&frame.payload)?;
+                if frame.payload_sha256 != payload_hash || frame.payload_bytes != payload_bytes {
+                    return Err(Error::session(format!(
+                        "payload integrity mismatch at entry_seq={}",
+                        row.entry_seq
+                    )));
+                }
+
+                if parent_by_entry
+                    .insert(frame.entry_id.clone(), frame.parent_entry_id.clone())
+                    .is_some()
+                {
+                    return Err(Error::session(format!(
+                        "duplicate entry_id detected in session store: {}",
+                        frame.entry_id
+                    )));
+                }
             }
         }
+
+        validate_parent_graph_links(&parent_by_entry)?;
+        validate_parent_graph_acyclic(&parent_by_entry)?;
 
         Ok(())
     }
@@ -1097,23 +1337,41 @@ impl SessionStoreV2 {
                 .checked_add(1)
                 .ok_or_else(|| Error::session("frame sequence overflow while bootstrapping"))?;
             let segment_path = self.segment_file_path(last.segment_seq);
-            self.current_segment_bytes = fs::metadata(&segment_path)
-                .map(|meta| meta.len())
-                .map_err(|err| {
-                    Error::session(format!(
-                        "failed to stat active segment {} while bootstrapping: {err}",
-                        segment_path.display()
-                    ))
-                })?;
+            let expected_segment_bytes = last.byte_offset.saturating_add(last.byte_length);
+            let actual_segment_bytes =
+                fs::metadata(&segment_path)
+                    .map(|meta| meta.len())
+                    .map_err(|err| {
+                        Error::session(format!(
+                            "failed to stat active segment {} while bootstrapping: {err}",
+                            segment_path.display()
+                        ))
+                    })?;
+
+            if actual_segment_bytes > expected_segment_bytes {
+                tracing::warn!(
+                    segment = %segment_path.display(),
+                    expected = expected_segment_bytes,
+                    actual = actual_segment_bytes,
+                    "SessionStoreV2 truncating unindexed trailing bytes from active segment after crash recovery"
+                );
+                truncate_file_to(&segment_path, expected_segment_bytes)?;
+            }
+            self.current_segment_bytes = expected_segment_bytes;
             self.last_entry_id = Some(last.entry_id.clone());
             self.last_crc32c.clone_from(&last.crc32c);
 
             let mut chain = GENESIS_CHAIN_HASH.to_string();
             let mut total = 0u64;
+            let mut reader = SegmentFileReader::new(self);
             for row in &index_rows {
-                if let Some(frame) = seek_read_frame(self, row)? {
-                    chain = chain_hash_step(&chain, &frame.payload_sha256);
-                }
+                let frame = reader.read_frame(row)?.ok_or_else(|| {
+                    Error::session(format!(
+                        "index references missing frame during bootstrap: entry_seq={}, segment={}",
+                        row.entry_seq, row.segment_seq
+                    ))
+                })?;
+                chain = chain_hash_step(&chain, &frame.payload_sha256);
                 total = total.saturating_add(row.byte_length);
             }
             self.chain_hash = chain;
@@ -1161,17 +1419,87 @@ fn is_recoverable_index_error(error: &Error) -> bool {
             lower.contains("checksum mismatch")
                 || lower.contains("index out of bounds")
                 || lower.contains("index/frame mismatch")
+                || lower.contains("index references missing frame")
                 || lower.contains("payload integrity mismatch")
                 || lower.contains("entry sequence is not strictly increasing")
                 || lower.contains("index byte range overflow")
+                || lower.contains("failed to stat active segment")
         }
         _ => false,
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParentGraphVisitState {
+    Visiting,
+    Visited,
+}
+
+fn validate_parent_graph_links(
+    parent_by_entry: &std::collections::HashMap<String, Option<String>>,
+) -> Result<()> {
+    for (entry_id, parent_id) in parent_by_entry {
+        if let Some(parent_id) = parent_id.as_deref()
+            && !parent_by_entry.contains_key(parent_id)
+        {
+            return Err(Error::session(format!(
+                "missing parent entry detected in session store: entry_id={entry_id} parent_id={parent_id}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_parent_graph_acyclic(
+    parent_by_entry: &std::collections::HashMap<String, Option<String>>,
+) -> Result<()> {
+    let mut visit_state: std::collections::HashMap<&str, ParentGraphVisitState> =
+        std::collections::HashMap::with_capacity(parent_by_entry.len());
+
+    for entry_id in parent_by_entry.keys() {
+        if visit_state.get(entry_id.as_str()) == Some(&ParentGraphVisitState::Visited) {
+            continue;
+        }
+
+        let mut stack = vec![(entry_id.as_str(), false)];
+        while let Some((current_id, expanded)) = stack.pop() {
+            if expanded {
+                visit_state.insert(current_id, ParentGraphVisitState::Visited);
+                continue;
+            }
+
+            match visit_state.get(current_id).copied() {
+                Some(ParentGraphVisitState::Visited) => continue,
+                Some(ParentGraphVisitState::Visiting) => {
+                    return Err(Error::session(format!(
+                        "cyclic parent chain detected in session store at entry_id={current_id}"
+                    )));
+                }
+                None => {}
+            }
+
+            visit_state.insert(current_id, ParentGraphVisitState::Visiting);
+            stack.push((current_id, true));
+
+            if let Some(parent_id) = parent_by_entry
+                .get(current_id)
+                .and_then(std::option::Option::as_deref)
+                && parent_by_entry.contains_key(parent_id)
+            {
+                stack.push((parent_id, false));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Convert a V2 `SegmentFrame` payload back into a `SessionEntry`.
 pub fn frame_to_session_entry(frame: &SegmentFrame) -> Result<SessionEntry> {
-    let entry: SessionEntry = serde_json::from_value(frame.payload.clone()).map_err(|e| {
+    // Deserialize directly from the RawValue to avoid extra allocation/copying.
+    // serde_json::from_str works on RawValue.get() which is &str.
+    let entry: SessionEntry = serde_json::from_str(frame.payload.get()).map_err(|e| {
         Error::session(format!(
             "failed to deserialize SessionEntry from frame entry_id={}: {e}",
             frame.entry_id
@@ -1221,23 +1549,73 @@ pub fn session_entry_to_frame_args(
     Ok((entry_id, parent_entry_id, entry_type.to_string(), payload))
 }
 
-/// Seek-read a single frame from a segment using an index row.
-fn seek_read_frame(store: &SessionStoreV2, row: &OffsetIndexEntry) -> Result<Option<SegmentFrame>> {
-    let segment_path = store.segment_file_path(row.segment_seq);
-    if !segment_path.exists() {
-        return Ok(None);
+/// Helper to cache the file descriptor when reading multiple frames sequentially.
+struct SegmentFileReader<'a> {
+    store: &'a SessionStoreV2,
+    current_segment_seq: Option<u64>,
+    current_file: Option<File>,
+    current_len: u64,
+}
+
+impl<'a> SegmentFileReader<'a> {
+    const fn new(store: &'a SessionStoreV2) -> Self {
+        Self {
+            store,
+            current_segment_seq: None,
+            current_file: None,
+            current_len: 0,
+        }
     }
-    let mut file = File::open(&segment_path)?;
-    file.seek(SeekFrom::Start(row.byte_offset))?;
-    let byte_len = usize::try_from(row.byte_length)
-        .map_err(|_| Error::session(format!("byte length too large: {}", row.byte_length)))?;
-    let mut buf = vec![0u8; byte_len];
-    file.read_exact(&mut buf)?;
-    if buf.last() == Some(&b'\n') {
-        buf.pop();
+
+    fn read_frame(&mut self, row: &OffsetIndexEntry) -> Result<Option<SegmentFrame>> {
+        if self.current_segment_seq != Some(row.segment_seq) {
+            self.current_segment_seq = Some(row.segment_seq);
+            let path = self.store.segment_file_path(row.segment_seq);
+            if path.exists() {
+                let file = File::open(&path)?;
+                self.current_len = file.metadata()?.len();
+                self.current_file = Some(file);
+            } else {
+                self.current_file = None;
+            }
+        }
+
+        let Some(file) = self.current_file.as_mut() else {
+            return Ok(None);
+        };
+
+        let end_offset = row
+            .byte_offset
+            .checked_add(row.byte_length)
+            .ok_or_else(|| Error::session("index byte range overflow"))?;
+
+        if end_offset > self.current_len {
+            return Err(Error::session(format!(
+                "index out of bounds for segment {}: end={} len={}",
+                self.store.segment_file_path(row.segment_seq).display(),
+                end_offset,
+                self.current_len
+            )));
+        }
+
+        file.seek(SeekFrom::Start(row.byte_offset))?;
+        let byte_len = usize::try_from(row.byte_length)
+            .map_err(|_| Error::session(format!("byte length too large: {}", row.byte_length)))?;
+
+        if row.byte_length > self.store.max_segment_bytes.max(100 * 1024 * 1024) {
+            return Err(Error::session(format!(
+                "frame byte length {byte_len} exceeds limit"
+            )));
+        }
+
+        let mut buf = vec![0u8; byte_len];
+        file.read_exact(&mut buf)?;
+        if buf.last() == Some(&b'\n') {
+            buf.pop();
+        }
+        let frame: SegmentFrame = serde_json::from_slice(&buf)?;
+        Ok(Some(frame))
     }
-    let frame: SegmentFrame = serde_json::from_slice(&buf)?;
-    Ok(Some(frame))
 }
 
 /// Compute next hash chain value: `SHA-256(prev_chain_hex || payload_sha256_hex)`.
@@ -1270,46 +1648,120 @@ pub fn has_v2_sidecar(jsonl_path: &Path) -> bool {
 }
 
 fn append_jsonl_line<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    serde_json::to_writer(&mut file, value)?;
-    file.write_all(b"\n")?;
-    file.flush()?;
+    let file = secure_open_options().create(true).append(true).open(path)?;
+    let mut writer = std::io::BufWriter::new(file);
+    // Serialize directly to buffered file — avoids intermediate Vec<u8> allocation
+    // while preventing excessive write syscalls.
+    serde_json::to_writer(&mut writer, value)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn truncate_file_to(path: &Path, len: u64) -> Result<()> {
+    let file = secure_open_options()
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    file.set_len(len)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn quarantine_segment_file(path: &Path) -> Result<PathBuf> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::session(format!("segment has no parent: {}", path.display())))?;
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or_else(|| Error::session(format!("segment has no filename: {}", path.display())))?;
+
+    for suffix in 0u32..10_000 {
+        let backup_name = if suffix == 0 {
+            format!("{file_name}.bak")
+        } else {
+            format!("{file_name}.bak.{suffix}")
+        };
+        let backup_path = parent.join(backup_name);
+        if backup_path.exists() {
+            continue;
+        }
+
+        fs::rename(path, &backup_path).map_err(|err| {
+            Error::session(format!(
+                "failed to quarantine segment {} -> {}: {err}",
+                path.display(),
+                backup_path.display()
+            ))
+        })?;
+        return Ok(backup_path);
+    }
+
+    Err(Error::session(format!(
+        "failed to quarantine segment {}: exhausted backup suffixes",
+        path.display()
+    )))
+}
+
+fn quarantine_segment_tail(segment_files: &[(u64, PathBuf)]) -> Result<()> {
+    for (_, path) in segment_files {
+        let backup_path = quarantine_segment_file(path)?;
+        tracing::warn!(
+            segment = %path.display(),
+            backup = %backup_path.display(),
+            "SessionStoreV2 quarantined trailing segment during rebuild"
+        );
+    }
     Ok(())
 }
 
 fn write_jsonl_lines<T: Serialize>(path: &Path, rows: &[T]) -> Result<()> {
-    let mut file = OpenOptions::new()
+    let file = secure_open_options()
         .create(true)
         .write(true)
         .truncate(true)
         .open(path)?;
+    let mut writer = std::io::BufWriter::new(file);
     for row in rows {
-        serde_json::to_writer(&mut file, row)?;
-        file.write_all(b"\n")?;
+        serde_json::to_writer(&mut writer, row)?;
+        writer.write_all(b"\n")?;
     }
-    file.flush()?;
+    writer.flush()?;
+    let file = writer
+        .into_inner()
+        .map_err(std::io::IntoInnerError::into_error)?;
+    file.sync_all()?;
     Ok(())
 }
 
 fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>> {
     let file = File::open(path)?;
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
     let mut out = Vec::new();
-    for line in reader.lines() {
-        let line = line?;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes_read = read_line_with_limit(&mut reader, &mut line, MAX_FRAME_READ_BYTES)
+            .map_err(|e| Error::Io(Box::new(e)))?;
+        if bytes_read == 0 {
+            break;
+        }
         if line.trim().is_empty() {
             continue;
         }
-        out.push(serde_json::from_str::<T>(&line)?);
+        let json_line = line.trim_end_matches('\n').trim_end_matches('\r');
+        out.push(serde_json::from_str::<T>(json_line)?);
     }
     Ok(out)
 }
 
-fn payload_hash_and_size(payload: &Value) -> Result<(String, u64)> {
-    let bytes = serde_json::to_vec(payload)?;
+fn payload_hash_and_size(payload: &RawValue) -> Result<(String, u64)> {
+    // For RawValue, we can just get the string content directly.
+    let bytes = payload.get().as_bytes();
     let payload_bytes = u64::try_from(bytes.len())
         .map_err(|_| Error::session(format!("payload is too large: {} bytes", bytes.len())))?;
-    let hash = format!("{:x}", Sha256::digest(&bytes));
+    let hash = format!("{:x}", Sha256::digest(bytes));
     Ok((hash, payload_bytes))
 }
 
@@ -1322,23 +1774,29 @@ fn line_length_u64(encoded: &[u8]) -> Result<u64> {
 }
 
 fn crc32c_upper(data: &[u8]) -> String {
-    const POLY: u32 = 0x82f6_3b78;
-    let mut crc = !0u32;
-    for &byte in data {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            let lsb_set = crc & 1;
-            crc >>= 1;
-            if lsb_set != 0 {
-                crc ^= POLY;
-            }
+    let crc = crc32c::crc32c(data);
+    format!("{crc:08X}")
+}
+
+fn read_line_with_limit<R: BufRead>(
+    reader: &mut R,
+    buf: &mut String,
+    limit: u64,
+) -> std::io::Result<usize> {
+    let mut take = reader.take(limit);
+    let n = take.read_line(buf)?;
+    if n > 0 && take.limit() == 0 && !buf.ends_with('\n') {
+        // We reached the limit, but this might just be the exact end of the file.
+        // Check if there is more data in the underlying reader.
+        let is_eof = take.into_inner().fill_buf()?.is_empty();
+        if !is_eof {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Line length exceeds limit of {limit} bytes"),
+            ));
         }
     }
-    crc = !crc;
-
-    let mut out = String::with_capacity(8);
-    let _ = write!(&mut out, "{crc:08X}");
-    out
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -1346,6 +1804,97 @@ mod proptests {
     use super::*;
     use proptest::prelude::*;
     use serde_json::json;
+    use std::fs;
+
+    #[test]
+    fn quarantine_segment_file_moves_segment_to_backup() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let segment = tmp.path().join("0000000000000002.seg");
+        fs::write(&segment, b"hello").expect("write segment");
+
+        let backup = quarantine_segment_file(&segment).expect("quarantine segment");
+
+        assert_eq!(backup, tmp.path().join("0000000000000002.seg.bak"));
+        assert!(!segment.exists(), "original segment should be moved away");
+        assert_eq!(fs::read(&backup).expect("read backup"), b"hello");
+    }
+
+    #[test]
+    fn quarantine_segment_file_uses_next_available_backup_suffix() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let segment = tmp.path().join("0000000000000002.seg");
+        let existing_backup = tmp.path().join("0000000000000002.seg.bak");
+        fs::write(&segment, b"new").expect("write segment");
+        fs::write(&existing_backup, b"old").expect("write existing backup");
+
+        let backup = quarantine_segment_file(&segment).expect("quarantine segment");
+
+        assert_eq!(backup, tmp.path().join("0000000000000002.seg.bak.1"));
+        assert_eq!(
+            fs::read(&existing_backup).expect("read existing backup"),
+            b"old"
+        );
+        assert_eq!(fs::read(&backup).expect("read new backup"), b"new");
+    }
+
+    #[test]
+    fn create_recovers_from_index_row_that_references_missing_segment() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("store");
+        let mut store = SessionStoreV2::create(&root, 4096).expect("create store");
+        store
+            .append_entry("entry-1", None, "message", json!({"n": 1}))
+            .expect("append entry");
+
+        let mut rows = store.read_index().expect("read index");
+        assert_eq!(rows.len(), 1);
+        rows[0].segment_seq = 999;
+        write_jsonl_lines(&store.index_file_path(), &rows).expect("write corrupted index");
+        drop(store);
+
+        let reopened = SessionStoreV2::create(&root, 4096).expect("reopen store");
+        assert_eq!(reopened.entry_count(), 1);
+
+        let rebuilt_rows = reopened.read_index().expect("read rebuilt index");
+        assert_eq!(rebuilt_rows.len(), 1);
+        assert_eq!(rebuilt_rows[0].segment_seq, 1);
+        assert!(reopened.lookup_entry(1).expect("lookup entry").is_some());
+    }
+
+    #[test]
+    fn create_drops_frame_with_mismatched_embedded_segment_seq_during_rebuild() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("store");
+        let mut store = SessionStoreV2::create(&root, 4096).expect("create store");
+        store
+            .append_entry("entry-1", None, "message", json!({"n": 1}))
+            .expect("append first entry");
+        store
+            .append_entry(
+                "entry-2",
+                Some("entry-1".to_string()),
+                "message",
+                json!({"n": 2}),
+            )
+            .expect("append second entry");
+
+        let segment_path = store.segment_file_path(1);
+        let mut frames = store.read_segment(1).expect("read segment");
+        assert_eq!(frames.len(), 2);
+        frames[1].segment_seq = 77;
+        write_jsonl_lines(&segment_path, &frames).expect("write corrupted segment");
+        fs::remove_file(store.index_file_path()).expect("remove index");
+        drop(store);
+
+        let reopened = SessionStoreV2::create(&root, 4096).expect("reopen store");
+        assert_eq!(reopened.entry_count(), 1);
+
+        let rebuilt_rows = reopened.read_index().expect("read rebuilt index");
+        assert_eq!(rebuilt_rows.len(), 1);
+        assert_eq!(rebuilt_rows[0].entry_seq, 1);
+        assert_eq!(reopened.read_segment(1).expect("read segment").len(), 1);
+        assert!(reopened.lookup_entry(2).expect("lookup entry").is_none());
+    }
 
     // ====================================================================
     // chain_hash_step
@@ -1422,7 +1971,9 @@ mod proptests {
         #[test]
         fn payload_hash_is_64_hex(s in "[a-z]{0,50}") {
             let val = json!(s);
-            let (hash, _size) = payload_hash_and_size(&val).unwrap();
+            let raw_string = serde_json::to_string(&val).unwrap();
+            let raw = RawValue::from_string(raw_string).unwrap();
+            let (hash, _size) = payload_hash_and_size(&raw).unwrap();
             assert_eq!(hash.len(), 64);
             assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
         }
@@ -1430,7 +1981,9 @@ mod proptests {
         #[test]
         fn payload_size_matches_serialization(s in "[a-z]{0,50}") {
             let val = json!(s);
-            let (_, size) = payload_hash_and_size(&val).unwrap();
+            let raw_string = serde_json::to_string(&val).unwrap();
+            let raw = RawValue::from_string(raw_string).unwrap();
+            let (_, size) = payload_hash_and_size(&raw).unwrap();
             let expected = serde_json::to_vec(&val).unwrap().len() as u64;
             assert_eq!(size, expected);
         }
@@ -1438,8 +1991,10 @@ mod proptests {
         #[test]
         fn payload_hash_deterministic(n in 0i64..10000) {
             let val = json!(n);
-            let (h1, s1) = payload_hash_and_size(&val).unwrap();
-            let (h2, s2) = payload_hash_and_size(&val).unwrap();
+            let raw_string = serde_json::to_string(&val).unwrap();
+            let raw = RawValue::from_string(raw_string).unwrap();
+            let (h1, s1) = payload_hash_and_size(&raw).unwrap();
+            let (h2, s2) = payload_hash_and_size(&raw).unwrap();
             assert_eq!(h1, h2);
             assert_eq!(s1, s2);
         }

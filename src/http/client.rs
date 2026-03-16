@@ -17,6 +17,8 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::stream::{self, BoxStream};
 use std::pin::Pin;
+#[cfg(not(test))]
+use std::sync::OnceLock;
 use std::task::{Context, Poll};
 
 const DEFAULT_USER_AGENT: &str = concat!("pi_agent_rust/", env!("CARGO_PKG_VERSION"));
@@ -25,7 +27,42 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 const READ_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_BUFFERED_BYTES: usize = 256 * 1024;
 const MAX_TEXT_BODY_BYTES: usize = 50 * 1024 * 1024;
-const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Maximum number of consecutive `Ok(0)` returns from `poll_write` before we
+/// give up and surface `ErrorKind::WriteZero`.  TLS transports can temporarily
+/// return 0 when internal buffers are full; a short backoff usually unblocks
+/// the next write.
+const WRITE_ZERO_MAX_RETRIES: usize = 10;
+
+/// Initial backoff duration when a write returns `Ok(0)`.
+const WRITE_ZERO_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+#[cfg(not(test))]
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
+
+fn default_request_timeout_from_env() -> Option<std::time::Duration> {
+    #[cfg(test)]
+    {
+        // Disable timeouts in unit tests to prevent `asupersync`'s virtual timer
+        // from instantly fast-forwarding and failing mock server requests.
+        None
+    }
+
+    #[cfg(not(test))]
+    {
+        static REQUEST_TIMEOUT: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+        *REQUEST_TIMEOUT.get_or_init(|| {
+            let timeout_secs = std::env::var("PI_HTTP_REQUEST_TIMEOUT_SECS")
+                .ok()
+                .and_then(|raw| raw.trim().parse::<u64>().ok())
+                .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS);
+            if timeout_secs == 0 {
+                None
+            } else {
+                Some(std::time::Duration::from_secs(timeout_secs))
+            }
+        })
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -111,13 +148,24 @@ impl<'a> RequestBuilder<'a> {
             url: url.to_string(),
             headers: Vec::new(),
             body: Vec::new(),
-            timeout: Some(DEFAULT_REQUEST_TIMEOUT),
+            timeout: default_request_timeout_from_env(),
         }
     }
 
     #[must_use]
     pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.headers.push((key.into(), value.into()));
+        let key = key.into();
+        let value = value.into();
+        if let Some((existing_key, existing_value)) = self
+            .headers
+            .iter_mut()
+            .find(|(existing_key, _)| existing_key.eq_ignore_ascii_case(&key))
+        {
+            *existing_key = key;
+            *existing_value = value;
+        } else {
+            self.headers.push((key, value));
+        }
         self
     }
 
@@ -143,8 +191,7 @@ impl<'a> RequestBuilder<'a> {
     }
 
     pub fn json<T: serde::Serialize>(mut self, payload: &T) -> Result<Self> {
-        self.headers
-            .push(("Content-Type".to_string(), "application/json".to_string()));
+        self = self.header("Content-Type", "application/json");
         self.body = serde_json::to_vec(payload)?;
         Ok(self)
     }
@@ -175,36 +222,108 @@ impl<'a> RequestBuilder<'a> {
                 status,
                 headers: response_headers,
                 stream,
+                timeout_info: None,
             });
         }
 
         let send_fut = send_parts(client, method, &url, &headers, &body);
 
-        let (status, response_headers, stream) = if let Some(duration) = timeout {
+        let (status, response_headers, stream, timeout_info) = if let Some(duration) = timeout {
             use asupersync::time::{sleep, wall_now};
             use futures::future::{Either, FutureExt, select};
 
-            let now = asupersync::Cx::current()
+            let asupersync_now = asupersync::Cx::current()
                 .and_then(|cx| cx.timer_driver())
                 .map_or_else(wall_now, |timer| timer.now());
-            let sleep_fut = sleep(now, duration).fuse();
+
+            let sleep_fut = sleep(asupersync_now, duration).fuse();
             let send_fut = send_fut.fuse();
             futures::pin_mut!(sleep_fut, send_fut);
 
-            match select(send_fut, sleep_fut).await {
+            let (status, response_headers, stream) = match select(send_fut, sleep_fut).await {
                 Either::Left((res, _)) => res?,
                 Either::Right(_) => return Err(Error::api("Request timed out")),
-            }
+            };
+            (
+                status,
+                response_headers,
+                stream,
+                Some((asupersync_now, duration)),
+            )
         } else {
-            send_fut.await?
+            let (status, response_headers, stream) = send_fut.await?;
+            (status, response_headers, stream, None)
         };
 
         Ok(Response {
             status,
             headers: response_headers,
             stream,
+            timeout_info,
         })
     }
+}
+
+/// Like `write_all`, but retries on `Ok(0)` with exponential backoff instead
+/// of immediately failing with `ErrorKind::WriteZero`.
+///
+/// TLS transports (and, less commonly, TCP under memory pressure) can return
+/// `Ok(0)` from `write()` when internal buffers are temporarily full.  The
+/// standard `write_all` implementation treats this as an unrecoverable error,
+/// which causes spurious "IO error: write zero" failures — especially for
+/// large request bodies such as resumed session contexts.
+async fn write_all_with_retry<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    mut buf: &[u8],
+) -> std::io::Result<()> {
+    use asupersync::time::{sleep, wall_now};
+
+    let mut consecutive_zeros: usize = 0;
+    let mut backoff = WRITE_ZERO_BACKOFF;
+
+    while !buf.is_empty() {
+        let n = futures::future::poll_fn(|cx| Pin::new(&mut *writer).poll_write(cx, buf)).await?;
+
+        if n == 0 {
+            consecutive_zeros += 1;
+            if consecutive_zeros > WRITE_ZERO_MAX_RETRIES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    format!(
+                        "transport returned Ok(0) {} consecutive times ({} bytes remaining)",
+                        consecutive_zeros,
+                        buf.len(),
+                    ),
+                ));
+            }
+            tracing::debug!(
+                attempt = consecutive_zeros,
+                remaining = buf.len(),
+                backoff_ms = backoff.as_millis(),
+                "write returned Ok(0), backing off before retry"
+            );
+
+            // Flushing the writer is crucial when TLS buffers are full, otherwise
+            // we will sleep and retry without any progress being made. If flush
+            // itself fails, surface that real transport error immediately rather
+            // than misreporting the retry loop as a generic write-zero failure.
+            futures::future::poll_fn(|cx| Pin::new(&mut *writer).poll_flush(cx)).await?;
+
+            let now = asupersync::Cx::current()
+                .and_then(|cx| cx.timer_driver())
+                .map_or_else(wall_now, |timer| timer.now());
+            sleep(now, backoff).await;
+
+            // Exponential backoff: 10ms, 20ms, 40ms, …
+            backoff = backoff.saturating_mul(2);
+        } else {
+            // Successful partial write — advance the buffer and reset retry state.
+            buf = &buf[n..];
+            consecutive_zeros = 0;
+            backoff = WRITE_ZERO_BACKOFF;
+        }
+    }
+    Ok(())
 }
 
 async fn send_parts(
@@ -222,14 +341,14 @@ async fn send_parts(
     let mut transport = connect_transport(&parsed, client).await?;
 
     let request_bytes = build_request_bytes(method, &parsed, &client.user_agent, headers, body);
-    transport.write_all(&request_bytes).await?;
+    write_all_with_retry(&mut transport, &request_bytes).await?;
     if !body.is_empty() {
-        transport.write_all(body).await?;
+        write_all_with_retry(&mut transport, body).await?;
     }
     transport.flush().await?;
 
     let (status, response_headers, leftover) = Box::pin(read_response_head(&mut transport)).await?;
-    let body_kind = body_kind_from_headers(&response_headers);
+    let body_kind = body_kind_from_response(status, &response_headers)?;
 
     let state = BodyStreamState::new(transport, body_kind, leftover);
     let stream = stream::try_unfold(state, |mut state| async move {
@@ -288,6 +407,7 @@ pub struct Response {
     status: u16,
     headers: Vec<(String, String)>,
     stream: Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>>,
+    timeout_info: Option<(asupersync::Time, std::time::Duration)>,
 }
 
 impl Response {
@@ -307,7 +427,8 @@ impl Response {
     }
 
     pub async fn text(self) -> Result<String> {
-        let bytes = self
+        let timeout_info = self.timeout_info;
+        let read_fut = self
             .stream
             .try_fold(Vec::new(), |mut acc, chunk| async move {
                 if acc.len().saturating_add(chunk.len()) > MAX_TEXT_BODY_BYTES {
@@ -315,9 +436,37 @@ impl Response {
                 }
                 acc.extend_from_slice(&chunk);
                 Ok::<_, std::io::Error>(acc)
-            })
-            .await
-            .map_err(Error::from)?;
+            });
+
+        let bytes = if let Some((start_time, timeout)) = timeout_info {
+            use asupersync::time::{sleep, wall_now};
+            use futures::future::{Either, FutureExt, select};
+
+            let asupersync_now = asupersync::Cx::current()
+                .and_then(|cx| cx.timer_driver())
+                .map_or_else(wall_now, |timer| timer.now());
+
+            let elapsed =
+                std::time::Duration::from_nanos(asupersync_now.duration_since(start_time));
+            if elapsed >= timeout {
+                return Err(Error::api("Request timed out reading body"));
+            }
+
+            let sleep_fut = sleep(
+                asupersync_now,
+                timeout.checked_sub(elapsed).unwrap_or_default(),
+            )
+            .fuse();
+            let read_fut = read_fut.fuse();
+            futures::pin_mut!(sleep_fut, read_fut);
+
+            match select(read_fut, sleep_fut).await {
+                Either::Left((res, _)) => res.map_err(Error::from)?,
+                Either::Right(_) => return Err(Error::api("Request timed out reading body")),
+            }
+        } else {
+            read_fut.await.map_err(Error::from)?
+        };
 
         match String::from_utf8(bytes) {
             Ok(s) => Ok(s),
@@ -346,9 +495,46 @@ async fn connect_transport(parsed: &ParsedUrl, client: &Client) -> Result<Transp
     }
 }
 
-/// Strip CR/LF from header names and values to prevent HTTP header injection.
+/// Strip CR/LF from header values to prevent HTTP header injection.
 fn sanitize_header_value(value: &str) -> String {
     value.chars().filter(|&c| c != '\r' && c != '\n').collect()
+}
+
+/// Preserve only RFC 9110 token characters in outbound header names.
+fn sanitize_header_name(name: &str) -> String {
+    name.bytes()
+        .filter(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    *b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+        .map(char::from)
+        .collect()
+}
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers.iter().rev().find_map(|(key, value)| {
+        if key.eq_ignore_ascii_case(name) {
+            Some(value.as_str())
+        } else {
+            None
+        }
+    })
 }
 
 fn build_request_bytes(
@@ -359,17 +545,33 @@ fn build_request_bytes(
     body: &[u8],
 ) -> Vec<u8> {
     let mut out = String::new();
+    let effective_user_agent =
+        sanitize_header_value(header_value(headers, "user-agent").unwrap_or(user_agent));
+    let host_header = host_header_value(parsed);
     let _ = std::fmt::Write::write_fmt(
         &mut out,
         format_args!("{} {} HTTP/1.1\r\n", method.as_str(), parsed.path),
     );
-    let _ = std::fmt::Write::write_fmt(&mut out, format_args!("Host: {}\r\n", parsed.host));
-    let _ = std::fmt::Write::write_fmt(&mut out, format_args!("User-Agent: {user_agent}\r\n"));
+    let _ = std::fmt::Write::write_fmt(&mut out, format_args!("Host: {host_header}\r\n"));
+    let _ = std::fmt::Write::write_fmt(
+        &mut out,
+        format_args!("User-Agent: {effective_user_agent}\r\n"),
+    );
     let _ =
         std::fmt::Write::write_fmt(&mut out, format_args!("Content-Length: {}\r\n", body.len()));
 
     for (name, value) in headers {
-        let clean_name = sanitize_header_value(name);
+        let clean_name = sanitize_header_name(name);
+        if clean_name.is_empty()
+            || clean_name.eq_ignore_ascii_case("host")
+            || clean_name.eq_ignore_ascii_case("user-agent")
+            || clean_name.eq_ignore_ascii_case("content-length")
+            // This client only emits fixed-length request bodies, so
+            // caller-supplied transfer codings would lie about the wire format.
+            || clean_name.eq_ignore_ascii_case("transfer-encoding")
+        {
+            continue;
+        }
         let clean_value = sanitize_header_value(value);
         let _ =
             std::fmt::Write::write_fmt(&mut out, format_args!("{clean_name}: {clean_value}\r\n"));
@@ -377,6 +579,25 @@ fn build_request_bytes(
 
     out.push_str("\r\n");
     out.into_bytes()
+}
+
+fn host_header_value(parsed: &ParsedUrl) -> String {
+    let host = if parsed.host.contains(':') && !parsed.host.starts_with('[') {
+        format!("[{}]", parsed.host)
+    } else {
+        parsed.host.clone()
+    };
+
+    let default_port = match parsed.scheme {
+        Scheme::Http => 80,
+        Scheme::Https => 443,
+    };
+
+    if parsed.port == default_port {
+        host
+    } else {
+        format!("{host}:{}", parsed.port)
+    }
 }
 
 async fn read_response_head(
@@ -411,13 +632,21 @@ async fn read_response_head(
 }
 
 fn find_headers_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+    for i in 0..buf.len().saturating_sub(1) {
+        if buf[i..].starts_with(b"\r\n\r\n") {
+            return Some(i + 4);
+        }
+        if buf[i..].starts_with(b"\n\n") {
+            return Some(i + 2);
+        }
+    }
+    None
 }
 
 fn parse_response_head(head: &[u8]) -> Result<(u16, Vec<(String, String)>)> {
     let text =
         std::str::from_utf8(head).map_err(|e| Error::api(format!("Invalid HTTP headers: {e}")))?;
-    let mut lines = text.split("\r\n");
+    let mut lines = text.lines();
 
     let status_line = lines
         .next()
@@ -455,30 +684,64 @@ enum BodyKind {
     Eof,
 }
 
-fn body_kind_from_headers(headers: &[(String, String)]) -> BodyKind {
+fn body_kind_from_response(status: u16, headers: &[(String, String)]) -> Result<BodyKind> {
+    if matches!(status, 100..=199 | 204 | 205 | 304) {
+        return Ok(BodyKind::Empty);
+    }
+    body_kind_from_headers(headers)
+}
+
+fn body_kind_from_headers(headers: &[(String, String)]) -> Result<BodyKind> {
     let mut content_length = None;
-    let mut transfer_encoding = None;
+    let mut transfer_encodings = Vec::new();
+    let mut saw_transfer_encoding = false;
 
     for (name, value) in headers {
         let name_lc = name.to_ascii_lowercase();
         if name_lc == "content-length" {
-            content_length = value.trim().parse::<usize>().ok();
+            for part in value.split(',') {
+                let parsed = part
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| Error::api("Invalid HTTP Content-Length header"))?;
+                if let Some(existing) = content_length {
+                    if existing != parsed {
+                        return Err(Error::api("Conflicting HTTP Content-Length headers"));
+                    }
+                } else {
+                    content_length = Some(parsed);
+                }
+            }
         } else if name_lc == "transfer-encoding" {
-            transfer_encoding = Some(value.to_ascii_lowercase());
+            saw_transfer_encoding = true;
+            transfer_encodings.extend(
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_ascii_lowercase),
+            );
         }
     }
 
-    if let Some(te) = transfer_encoding {
-        if te.split(',').any(|v| v.trim() == "chunked") {
-            return BodyKind::Chunked;
+    if saw_transfer_encoding {
+        let Some(last) = transfer_encodings.last() else {
+            return Err(Error::api("Invalid HTTP Transfer-Encoding header"));
+        };
+        if last != "chunked" {
+            return Err(Error::api("Unsupported HTTP Transfer-Encoding header"));
         }
+        if transfer_encodings.len() != 1 {
+            return Err(Error::api("Unsupported HTTP Transfer-Encoding header"));
+        }
+        return Ok(BodyKind::Chunked);
     }
 
-    match content_length {
+    Ok(match content_length {
         Some(0) => BodyKind::Empty,
         Some(n) => BodyKind::ContentLength(n),
         None => BodyKind::Eof,
-    }
+    })
 }
 
 struct Buffer {
@@ -507,7 +770,7 @@ impl Buffer {
     }
 
     fn consume(&mut self, n: usize) {
-        self.pos = self.pos.saturating_add(n);
+        self.pos = self.pos.saturating_add(n).min(self.bytes.len());
         if self.pos == self.bytes.len() {
             self.bytes.clear();
             self.pos = 0;
@@ -627,11 +890,12 @@ impl BodyStreamState {
         Ok(Some(out))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn next_chunked(&mut self) -> std::io::Result<Option<Vec<u8>>> {
         loop {
             match self.chunked_state {
                 ChunkedState::SizeLine => {
-                    if let Some(line_end) = find_crlf(self.buf.available()) {
+                    if let Some((line_end, len)) = find_crlf(self.buf.available()) {
                         let line = &self.buf.available()[..line_end];
                         let line_str = std::str::from_utf8(line).map_err(std::io::Error::other)?;
                         let size_part = line_str.split(';').next().unwrap_or("").trim();
@@ -640,7 +904,7 @@ impl BodyStreamState {
                         }
                         let chunk_size = usize::from_str_radix(size_part, 16)
                             .map_err(|_| std::io::Error::other("invalid chunk size"))?;
-                        self.buf.consume(line_end + 2);
+                        self.buf.consume(line_end + len);
                         if chunk_size == 0 {
                             self.chunked_state = ChunkedState::Trailers;
                         } else {
@@ -687,21 +951,34 @@ impl BodyStreamState {
                 ChunkedState::DataCrlf => {
                     if self.buf.len() < 2 {
                         let n = Box::pin(self.read_more()).await?;
+                        if n == 0 && self.buf.is_empty() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "unexpected EOF reading chunk CRLF",
+                            ));
+                        }
+                        // Continue to let starts_with handle single byte \n or full \r\n
+                    }
+
+                    let bytes = self.buf.available();
+                    if bytes.starts_with(b"\r\n") {
+                        self.buf.consume(2);
+                        self.chunked_state = ChunkedState::SizeLine;
+                    } else if bytes.starts_with(b"\n") {
+                        self.buf.consume(1);
+                        self.chunked_state = ChunkedState::SizeLine;
+                    } else if bytes.len() >= 2 {
+                        return Err(std::io::Error::other("invalid chunk CRLF"));
+                    } else {
+                        // wait for more data
+                        let n = Box::pin(self.read_more()).await?;
                         if n == 0 {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::UnexpectedEof,
                                 "unexpected EOF reading chunk CRLF",
                             ));
                         }
-                        continue;
                     }
-
-                    let bytes = self.buf.available();
-                    if bytes[0] != b'\r' || bytes[1] != b'\n' {
-                        return Err(std::io::Error::other("invalid chunk CRLF"));
-                    }
-                    self.buf.consume(2);
-                    self.chunked_state = ChunkedState::SizeLine;
                 }
 
                 ChunkedState::Trailers => {
@@ -709,12 +986,17 @@ impl BodyStreamState {
                     // the terminator is a single CRLF (`0\r\n\r\n` total, with the final
                     // `\r\n` remaining after consuming the size line).
                     let bytes = self.buf.available();
-                    if bytes.len() >= 2 && bytes[0] == b'\r' && bytes[1] == b'\n' {
+                    if bytes.starts_with(b"\r\n") {
                         self.buf.consume(2);
                         self.chunked_state = ChunkedState::Done;
                         return Ok(None);
                     }
-                    if let Some(end) = find_double_crlf(self.buf.available()) {
+                    if bytes.starts_with(b"\n") {
+                        self.buf.consume(1);
+                        self.chunked_state = ChunkedState::Done;
+                        return Ok(None);
+                    }
+                    if let Some(end) = find_headers_end(self.buf.available()) {
                         self.buf.consume(end);
                         self.chunked_state = ChunkedState::Done;
                         return Ok(None);
@@ -735,12 +1017,16 @@ impl BodyStreamState {
     }
 }
 
-fn find_crlf(buf: &[u8]) -> Option<usize> {
-    buf.windows(2).position(|w| w == b"\r\n")
-}
-
-fn find_double_crlf(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+fn find_crlf(buf: &[u8]) -> Option<(usize, usize)> {
+    for i in 0..buf.len() {
+        if buf[i..].starts_with(b"\r\n") {
+            return Some((i, 2));
+        }
+        if buf[i..].starts_with(b"\n") {
+            return Some((i, 1));
+        }
+    }
+    None
 }
 
 async fn read_some<R: AsyncRead + Unpin>(reader: &mut R, dst: &mut [u8]) -> std::io::Result<usize> {
@@ -807,6 +1093,7 @@ impl AsyncWrite for Transport {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::VecDeque;
 
     // ── Method ──────────────────────────────────────────────────────────
     #[test]
@@ -846,7 +1133,12 @@ mod tests {
     // ── find_crlf ──────────────────────────────────────────────────────
     #[test]
     fn find_crlf_present() {
-        assert_eq!(find_crlf(b"abc\r\ndef"), Some(3));
+        assert_eq!(find_crlf(b"abc\r\ndef"), Some((3, 2)));
+    }
+
+    #[test]
+    fn find_crlf_present_lf() {
+        assert_eq!(find_crlf(b"abc\ndef"), Some((3, 1)));
     }
 
     #[test]
@@ -856,19 +1148,12 @@ mod tests {
 
     #[test]
     fn find_crlf_at_start() {
-        assert_eq!(find_crlf(b"\r\ndata"), Some(0));
-    }
-
-    // ── find_double_crlf ───────────────────────────────────────────────
-    #[test]
-    fn find_double_crlf_present() {
-        let buf = b"headers\r\n\r\nbody";
-        assert_eq!(find_double_crlf(buf), Some(11));
+        assert_eq!(find_crlf(b"\r\ndata"), Some((0, 2)));
     }
 
     #[test]
-    fn find_double_crlf_absent() {
-        assert!(find_double_crlf(b"headers\r\nbody").is_none());
+    fn find_crlf_at_start_lf() {
+        assert_eq!(find_crlf(b"\ndata"), Some((0, 1)));
     }
 
     // ── parse_response_head ────────────────────────────────────────────
@@ -934,7 +1219,7 @@ mod tests {
     fn body_kind_content_length() {
         let headers = vec![("Content-Length".to_string(), "42".to_string())];
         assert!(matches!(
-            body_kind_from_headers(&headers),
+            body_kind_from_headers(&headers).unwrap(),
             BodyKind::ContentLength(42)
         ));
     }
@@ -942,26 +1227,58 @@ mod tests {
     #[test]
     fn body_kind_content_length_zero() {
         let headers = vec![("Content-Length".to_string(), "0".to_string())];
-        assert!(matches!(body_kind_from_headers(&headers), BodyKind::Empty));
+        assert!(matches!(
+            body_kind_from_headers(&headers).unwrap(),
+            BodyKind::Empty
+        ));
     }
 
     #[test]
     fn body_kind_chunked() {
         let headers = vec![("Transfer-Encoding".to_string(), "chunked".to_string())];
         assert!(matches!(
-            body_kind_from_headers(&headers),
+            body_kind_from_headers(&headers).unwrap(),
             BodyKind::Chunked
         ));
     }
 
     #[test]
-    fn body_kind_chunked_mixed() {
-        // Transfer-Encoding with multiple values
+    fn body_kind_rejects_chunked_with_additional_transfer_codings() {
         let headers = vec![("Transfer-Encoding".to_string(), "gzip, chunked".to_string())];
-        assert!(matches!(
-            body_kind_from_headers(&headers),
-            BodyKind::Chunked
-        ));
+        assert!(body_kind_from_headers(&headers).is_err());
+    }
+
+    #[test]
+    fn body_kind_rejects_repeated_transfer_encoding_headers_with_extra_codings() {
+        let headers = vec![
+            ("Transfer-Encoding".to_string(), "gzip".to_string()),
+            ("Transfer-Encoding".to_string(), "chunked".to_string()),
+        ];
+        assert!(body_kind_from_headers(&headers).is_err());
+    }
+
+    #[test]
+    fn body_kind_rejects_repeated_chunked_transfer_encoding() {
+        let headers = vec![
+            ("Transfer-Encoding".to_string(), "chunked".to_string()),
+            ("Transfer-Encoding".to_string(), "chunked".to_string()),
+        ];
+        assert!(body_kind_from_headers(&headers).is_err());
+    }
+
+    #[test]
+    fn body_kind_rejects_transfer_encoding_when_chunked_is_not_final() {
+        let headers = vec![
+            ("Transfer-Encoding".to_string(), "chunked".to_string()),
+            ("Transfer-Encoding".to_string(), "gzip".to_string()),
+        ];
+        assert!(body_kind_from_headers(&headers).is_err());
+    }
+
+    #[test]
+    fn body_kind_rejects_non_chunked_transfer_encoding() {
+        let headers = vec![("Transfer-Encoding".to_string(), "gzip".to_string())];
+        assert!(body_kind_from_headers(&headers).is_err());
     }
 
     #[test]
@@ -972,7 +1289,7 @@ mod tests {
             ("Transfer-Encoding".to_string(), "chunked".to_string()),
         ];
         assert!(matches!(
-            body_kind_from_headers(&headers),
+            body_kind_from_headers(&headers).unwrap(),
             BodyKind::Chunked
         ));
     }
@@ -980,15 +1297,45 @@ mod tests {
     #[test]
     fn body_kind_eof_no_headers() {
         let headers: Vec<(String, String)> = Vec::new();
-        assert!(matches!(body_kind_from_headers(&headers), BodyKind::Eof));
+        assert!(matches!(
+            body_kind_from_headers(&headers).unwrap(),
+            BodyKind::Eof
+        ));
     }
 
     #[test]
     fn body_kind_case_insensitive() {
         let headers = vec![("content-length".to_string(), "10".to_string())];
         assert!(matches!(
-            body_kind_from_headers(&headers),
+            body_kind_from_headers(&headers).unwrap(),
             BodyKind::ContentLength(10)
+        ));
+    }
+
+    #[test]
+    fn body_kind_response_204_without_headers_is_empty() {
+        let headers: Vec<(String, String)> = Vec::new();
+        assert!(matches!(
+            body_kind_from_response(204, &headers).unwrap(),
+            BodyKind::Empty
+        ));
+    }
+
+    #[test]
+    fn body_kind_response_304_ignores_content_length() {
+        let headers = vec![("Content-Length".to_string(), "7".to_string())];
+        assert!(matches!(
+            body_kind_from_response(304, &headers).unwrap(),
+            BodyKind::Empty
+        ));
+    }
+
+    #[test]
+    fn body_kind_response_205_without_headers_is_empty() {
+        let headers: Vec<(String, String)> = Vec::new();
+        assert!(matches!(
+            body_kind_from_response(205, &headers).unwrap(),
+            BodyKind::Empty
         ));
     }
 
@@ -1029,6 +1376,58 @@ mod tests {
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains("Authorization: Bearer sk-test\r\n"));
         assert!(text.contains("X-Custom: value\r\n"));
+    }
+
+    #[test]
+    fn build_request_bytes_reserved_headers_are_canonicalized() {
+        let parsed = ParsedUrl::parse("https://api.example.com/v1/messages").unwrap();
+        let headers = vec![
+            ("Host".to_string(), "spoofed.example.com".to_string()),
+            ("User-Agent".to_string(), "custom-agent".to_string()),
+            ("Content-Length".to_string(), "999".to_string()),
+            ("X-Test".to_string(), "1".to_string()),
+        ];
+        let body = b"hello";
+        let bytes = build_request_bytes(Method::Post, &parsed, "default-agent", &headers, body);
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert_eq!(text.matches("Host: ").count(), 1);
+        assert!(text.contains("Host: api.example.com\r\n"));
+        assert!(!text.contains("Host: spoofed.example.com\r\n"));
+
+        assert_eq!(text.matches("User-Agent: ").count(), 1);
+        assert!(text.contains("User-Agent: custom-agent\r\n"));
+        assert!(!text.contains("User-Agent: default-agent\r\n"));
+
+        assert_eq!(text.matches("Content-Length: ").count(), 1);
+        assert!(text.contains("Content-Length: 5\r\n"));
+        assert!(!text.contains("Content-Length: 999\r\n"));
+
+        assert!(text.contains("X-Test: 1\r\n"));
+    }
+
+    #[test]
+    fn build_request_bytes_non_default_port_includes_port_in_host_header() {
+        let parsed = ParsedUrl::parse("http://example.com:8080/api/test").unwrap();
+        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &[], &[]);
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert!(text.contains("Host: example.com:8080\r\n"));
+    }
+
+    #[test]
+    fn build_request_bytes_sanitizes_overridden_user_agent() {
+        let parsed = ParsedUrl::parse("http://example.com/test").unwrap();
+        let headers = vec![(
+            "User-Agent".to_string(),
+            "custom-agent\r\nX-Injected: nope".to_string(),
+        )];
+        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &headers, &[]);
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert!(text.contains("User-Agent: custom-agentX-Injected: nope\r\n"));
+        assert_eq!(text.matches("User-Agent: ").count(), 1);
+        assert!(!text.contains("\r\nX-Injected: nope\r\n"));
     }
 
     // ── build_recorded_request ─────────────────────────────────────────
@@ -1201,6 +1600,19 @@ mod tests {
     }
 
     #[test]
+    fn request_builder_header_replaces_case_insensitive_duplicate_names() {
+        let client = Client::new();
+        let builder = client
+            .post("https://api.example.com")
+            .header("Authorization", "Bearer first")
+            .header("authorization", "Bearer second");
+
+        assert_eq!(builder.headers.len(), 1);
+        assert!(builder.headers[0].0.eq_ignore_ascii_case("authorization"));
+        assert_eq!(builder.headers[0].1, "Bearer second");
+    }
+
+    #[test]
     fn request_builder_json() {
         let client = Client::new();
         let builder = client
@@ -1230,7 +1642,8 @@ mod tests {
     fn request_builder_default_timeout() {
         let client = Client::new();
         let builder = client.get("https://api.example.com");
-        assert_eq!(builder.timeout, Some(DEFAULT_REQUEST_TIMEOUT));
+        // During tests, default timeout is disabled to avoid virtual timer issues.
+        assert_eq!(builder.timeout, None);
     }
 
     #[test]
@@ -1249,6 +1662,83 @@ mod tests {
         assert_eq!(builder.timeout, None);
     }
 
+    struct MockRetryWriter {
+        writes: VecDeque<std::io::Result<usize>>,
+        flushes: VecDeque<std::io::Result<()>>,
+        written: Vec<u8>,
+    }
+
+    impl MockRetryWriter {
+        fn new(
+            writes: impl IntoIterator<Item = std::io::Result<usize>>,
+            flushes: impl IntoIterator<Item = std::io::Result<()>>,
+        ) -> Self {
+            Self {
+                writes: writes.into_iter().collect(),
+                flushes: flushes.into_iter().collect(),
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl AsyncWrite for MockRetryWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let result = self.writes.pop_front().unwrap_or(Ok(buf.len()));
+            if let Ok(written) = result {
+                self.written
+                    .extend_from_slice(&buf[..written.min(buf.len())]);
+            }
+            Poll::Ready(result)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(self.flushes.pop_front().unwrap_or(Ok(())))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn write_all_with_retry_propagates_flush_error_after_zero_write() {
+        asupersync::test_utils::run_test(|| async {
+            let mut writer = MockRetryWriter::new(
+                [Ok(0)],
+                [Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "flush failed",
+                ))],
+            );
+
+            let err = write_all_with_retry(&mut writer, b"hello")
+                .await
+                .expect_err("flush failure should not be swallowed");
+            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+            assert_eq!(err.to_string(), "flush failed");
+            assert!(writer.written.is_empty());
+        });
+    }
+
+    #[test]
+    fn write_all_with_retry_recovers_after_zero_write_when_flush_succeeds() {
+        asupersync::test_utils::run_test(|| async {
+            let mut writer = MockRetryWriter::new([Ok(0), Ok(2), Ok(3)], [Ok(())]);
+
+            write_all_with_retry(&mut writer, b"hello")
+                .await
+                .expect("retry helper should recover after transient zero write");
+            assert_eq!(writer.written, b"hello");
+        });
+    }
+
     // ── Response ───────────────────────────────────────────────────────
     #[test]
     fn response_accessors() {
@@ -1256,6 +1746,7 @@ mod tests {
             status: 200,
             headers: vec![("Content-Type".to_string(), "text/plain".to_string())],
             stream: Box::pin(futures::stream::empty()),
+            timeout_info: None,
         };
         assert_eq!(response.status(), 200);
         assert_eq!(response.headers().len(), 1);
@@ -1270,6 +1761,7 @@ mod tests {
                 status: 200,
                 headers: Vec::new(),
                 stream: Box::pin(futures::stream::iter(chunks)),
+                timeout_info: None,
             };
             let text = response.text().await.unwrap();
             assert_eq!(text, "hello world");
@@ -1283,6 +1775,7 @@ mod tests {
                 status: 200,
                 headers: Vec::new(),
                 stream: Box::pin(futures::stream::empty()),
+                timeout_info: None,
             };
             let text = response.text().await.unwrap();
             assert_eq!(text, "");
@@ -1297,6 +1790,7 @@ mod tests {
                 status: 200,
                 headers: Vec::new(),
                 stream: Box::pin(futures::stream::iter(chunks)),
+                timeout_info: None,
             };
             let mut stream = response.bytes_stream();
             let first = stream.next().await.unwrap().unwrap();
@@ -1316,6 +1810,7 @@ mod tests {
                 status: 200,
                 headers: vec![("Content-Length".to_string(), "13".to_string())],
                 stream: Box::pin(futures::stream::iter(chunks)),
+                timeout_info: None,
             };
             let text = response.text().await.unwrap();
             assert_eq!(text, "Hello, World!");
@@ -1334,6 +1829,7 @@ mod tests {
                 status: 200,
                 headers: Vec::new(),
                 stream: Box::pin(futures::stream::iter(chunks)),
+                timeout_info: None,
             };
             let text = response.text().await.unwrap();
             assert_eq!(text, "chunk1chunk2chunk3");
@@ -1354,6 +1850,7 @@ mod tests {
                 status: 200,
                 headers: Vec::new(),
                 stream: Box::pin(futures::stream::iter(chunks)),
+                timeout_info: None,
             };
             let result = response.text().await;
             assert!(result.is_err());
@@ -1388,10 +1885,33 @@ mod tests {
     }
 
     #[test]
-    fn body_kind_invalid_content_length_falls_to_eof() {
+    fn body_kind_invalid_content_length_is_error() {
         let headers = vec![("Content-Length".to_string(), "not-a-number".to_string())];
-        // parse fails, content_length stays None → Eof
-        assert!(matches!(body_kind_from_headers(&headers), BodyKind::Eof));
+        assert!(body_kind_from_headers(&headers).is_err());
+    }
+
+    #[test]
+    fn body_kind_conflicting_content_length_headers_is_error() {
+        let headers = vec![
+            ("Content-Length".to_string(), "5".to_string()),
+            ("content-length".to_string(), "7".to_string()),
+        ];
+        assert!(body_kind_from_headers(&headers).is_err());
+    }
+
+    #[test]
+    fn body_kind_coalesced_identical_content_length_is_accepted() {
+        let headers = vec![("Content-Length".to_string(), "5, 5".to_string())];
+        assert!(matches!(
+            body_kind_from_headers(&headers).unwrap(),
+            BodyKind::ContentLength(5)
+        ));
+    }
+
+    #[test]
+    fn body_kind_coalesced_conflicting_content_length_is_error() {
+        let headers = vec![("Content-Length".to_string(), "5, 7".to_string())];
+        assert!(body_kind_from_headers(&headers).is_err());
     }
 
     #[test]
@@ -1440,6 +1960,48 @@ mod tests {
         assert!(!text.contains("\r\nX-Bad: smuggled\r\n"));
     }
 
+    #[test]
+    fn build_request_bytes_strips_invalid_chars_from_header_names() {
+        let parsed = ParsedUrl::parse("http://example.com/test").unwrap();
+        let headers = vec![("X:Injected Header".to_string(), "value".to_string())];
+        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &headers, &[]);
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert!(text.contains("XInjectedHeader: value\r\n"));
+        assert!(!text.contains("X:Injected Header: value\r\n"));
+    }
+
+    #[test]
+    fn build_request_bytes_drops_headers_that_normalize_to_reserved_names() {
+        let parsed = ParsedUrl::parse("http://example.com/test").unwrap();
+        let headers = vec![
+            ("Host:".to_string(), "evil.example".to_string()),
+            ("Content-Length ".to_string(), "999".to_string()),
+            ("User-Agent:".to_string(), "spoofed".to_string()),
+        ];
+        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &headers, &[]);
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert!(text.contains("Host: example.com\r\n"));
+        assert!(text.contains("User-Agent: agent\r\n"));
+        assert!(text.contains("Content-Length: 0\r\n"));
+        assert!(!text.contains("Host: evil.example\r\n"));
+        assert!(!text.contains("Content-Length: 999\r\n"));
+        assert!(!text.contains("User-Agent: spoofed\r\n"));
+    }
+
+    #[test]
+    fn build_request_bytes_drops_transfer_encoding_header() {
+        let parsed = ParsedUrl::parse("http://example.com/test").unwrap();
+        let headers = vec![("Transfer-Encoding".to_string(), "chunked".to_string())];
+        let body = b"hello";
+        let bytes = build_request_bytes(Method::Post, &parsed, "agent", &headers, body);
+        let text = String::from_utf8(bytes).unwrap();
+
+        assert!(text.contains("Content-Length: 5\r\n"));
+        assert!(!text.contains("Transfer-Encoding: chunked\r\n"));
+    }
+
     // ── Response body size limit ──────────────────────────────────────
     #[test]
     fn response_text_rejects_oversized_body() {
@@ -1451,6 +2013,7 @@ mod tests {
                 status: 200,
                 headers: Vec::new(),
                 stream: Box::pin(futures::stream::iter(chunks)),
+                timeout_info: None,
             };
             let result = response.text().await;
             assert!(result.is_err());
@@ -1471,6 +2034,7 @@ mod tests {
                 status: 200,
                 headers: Vec::new(),
                 stream: Box::pin(futures::stream::iter(chunks)),
+                timeout_info: None,
             };
             let result = response.text().await;
             assert!(result.is_ok());

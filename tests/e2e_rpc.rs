@@ -136,6 +136,36 @@ fn parse_response(line: &str) -> Value {
     serde_json::from_str(line.trim()).expect("parse JSON response")
 }
 
+async fn recv_response(out_rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> Value {
+    let start = Instant::now();
+
+    loop {
+        let line = recv_line(out_rx, label)
+            .await
+            .unwrap_or_else(|err| panic!("{err}"));
+        let value = parse_response(&line);
+
+        match value.get("type").and_then(Value::as_str) {
+            Some("response") => return value,
+            Some("agent_end") => {
+                let has_error = value
+                    .get("error")
+                    .is_some_and(|error| !error.is_null() && error != "");
+                assert!(
+                    !has_error,
+                    "{label}: unexpected agent_end error while waiting for response: {value}"
+                );
+            }
+            _ => {}
+        }
+
+        assert!(
+            start.elapsed() <= Duration::from_secs(10),
+            "{label}: timed out waiting for RPC response"
+        );
+    }
+}
+
 /// Send a command and get the response.
 async fn send_recv(
     in_tx: &asupersync::channel::mpsc::Sender<String>,
@@ -148,10 +178,7 @@ async fn send_recv(
         .send(&cx, cmd.to_string())
         .await
         .unwrap_or_else(|_| panic!("send {label}"));
-    let line = recv_line(out_rx, label)
-        .await
-        .unwrap_or_else(|err| panic!("{err}"));
-    parse_response(&line)
+    recv_response(out_rx, label).await
 }
 
 /// Assert that a response indicates success with the expected command.
@@ -966,6 +993,81 @@ fn rpc_bash_nonzero_exit() {
     });
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn rpc_abort_bash_kills_background_children() {
+    let harness = TestHarness::new("rpc_abort_bash_kills_background_children");
+    let cassette_dir = cassette_root();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let agent_session = build_agent_session(Session::in_memory(), &cassette_dir);
+        let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+        let marker = harness.temp_path("rpc_bash_survived.txt");
+        let marker_str = marker.to_string_lossy();
+        let command = format!(
+            r#"{{"id":"1","type":"bash","command":"(sleep 3; echo leaked > '{marker_str}') & sleep 30"}}"#
+        );
+        let cx = asupersync::Cx::for_testing();
+        in_tx
+            .send(&cx, command)
+            .await
+            .expect("send long-running bash");
+
+        asupersync::time::sleep(
+            asupersync::time::wall_now(),
+            Duration::from_millis(100),
+        )
+        .await;
+
+        in_tx
+            .send(&cx, r#"{"id":"2","type":"abort_bash"}"#.to_string())
+            .await
+            .expect("send abort_bash");
+
+        let mut abort_resp = None;
+        let mut bash_resp = None;
+        for label in ["rpc_abort_bash:first", "rpc_abort_bash:second"] {
+            let resp = parse_response(
+                &recv_line(&out_rx, label)
+                    .await
+                    .unwrap_or_else(|err| panic!("{err}")),
+            );
+            match (resp["command"].as_str(), resp["id"].as_str()) {
+                (Some("abort_bash"), Some("2")) => abort_resp = Some(resp),
+                (Some("bash"), Some("1")) => bash_resp = Some(resp),
+                other => panic!("unexpected response ordering/content: {other:?}"),
+            }
+        }
+
+        let abort_resp = abort_resp.expect("missing abort_bash response");
+        assert_ok(&abort_resp, "abort_bash");
+        let bash_resp = bash_resp.expect("missing bash response");
+        assert_ok(&bash_resp, "bash");
+        assert_eq!(bash_resp["id"], "1");
+        assert_eq!(bash_resp["data"]["cancelled"], true);
+
+        std::thread::sleep(Duration::from_secs(4));
+        assert!(
+            !marker.exists(),
+            "background child survived rpc abort"
+        );
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "rpc server error: {result:?}");
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Tests: Request ID handling
 // ---------------------------------------------------------------------------
@@ -1275,6 +1377,65 @@ fn rpc_prompt_missing_message() {
 }
 
 #[test]
+fn rpc_prompt_dispatches_registered_extension_command() {
+    let harness = TestHarness::new("rpc_prompt_dispatches_registered_extension_command");
+    let cassette_dir = cassette_root();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let (agent_session, _manager) = build_agent_session_with_js_extension(
+            Session::in_memory(),
+            &cassette_dir,
+            &harness,
+            RPC_PROMPT_EXTENSION_COMMAND_EXT,
+        )
+        .await;
+        let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+        let resp = send_recv(
+            &in_tx,
+            &out_rx,
+            r#"{"id":"1","type":"prompt","message":"/emit-now"}"#,
+            "prompt(extension command)",
+        )
+        .await;
+        assert_ok(&resp, "prompt");
+
+        let messages = wait_for_custom_message(
+            &in_tx,
+            &out_rx,
+            "rpc-note",
+            "rpc-message",
+            "get_messages(after extension command)",
+        )
+        .await;
+        let messages = messages["data"]["messages"]
+            .as_array()
+            .expect("messages array");
+        assert!(
+            messages.iter().any(|message| {
+                message["role"] == "custom"
+                    && message["customType"] == "rpc-note"
+                    && message["content"] == "rpc-message"
+            }),
+            "expected RPC prompt command to append custom message, got {messages:?}"
+        );
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "rpc server error: {result:?}");
+    });
+}
+
+#[test]
 fn rpc_steer_missing_message() {
     let harness = TestHarness::new("rpc_steer_missing_message");
     let cassette_dir = cassette_root();
@@ -1540,6 +1701,70 @@ fn build_agent_session_with_extensions(
     (agent_session, manager)
 }
 
+async fn build_agent_session_with_js_extension(
+    session: Session,
+    cassette_dir: &Path,
+    harness: &TestHarness,
+    source: &str,
+) -> (AgentSession, ExtensionManager) {
+    let cwd = harness.temp_dir().to_path_buf();
+    let ext_entry_path = harness.create_file("extensions/ext.mjs", source.as_bytes());
+    let mut agent_session = build_agent_session(session, cassette_dir);
+    agent_session
+        .enable_extensions(&[], &cwd, None, &[ext_entry_path])
+        .await
+        .expect("enable extensions");
+    let manager = agent_session
+        .extensions
+        .as_ref()
+        .expect("extension region")
+        .manager()
+        .clone();
+    (agent_session, manager)
+}
+
+const SESSION_SWITCH_CANCEL_EXT: &str = r#"
+export default function init(pi) {
+    pi.on("session_before_switch", () => ({ cancelled: true }));
+}
+"#;
+
+const SESSION_SWITCH_RECORD_EXT: &str = r#"
+export default function init(pi) {
+    const events = [];
+
+    pi.on("session_before_switch", () => ({ cancelled: false }));
+    pi.on("session_switch", (event) => {
+        events.push(event);
+        return null;
+    });
+
+    pi.registerCommand("get-events", {
+        description: "Return recorded session switch events",
+        handler: async () => JSON.stringify(events),
+    });
+}
+"#;
+
+const RPC_PROMPT_EXTENSION_COMMAND_EXT: &str = r#"
+export default function init(pi) {
+    pi.registerCommand("emit-now", {
+        description: "Record a custom message through RPC prompt dispatch",
+        handler: async () => {
+            await pi.events("sendMessage", {
+                message: {
+                    customType: "rpc-note",
+                    content: "rpc-message",
+                    display: true
+                },
+                options: { triggerTurn: false }
+            });
+            return "queued";
+        }
+    });
+}
+"#;
+
 /// Wait for an `extension_ui_request` event on the RPC output channel.
 /// Skips any non-event / non-ui-request lines.
 async fn recv_ui_request(out_rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> Value {
@@ -1573,6 +1798,275 @@ async fn recv_ui_request(out_rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> 
         );
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(5)).await;
     }
+}
+
+async fn wait_for_custom_message(
+    in_tx: &asupersync::channel::mpsc::Sender<String>,
+    out_rx: &Arc<Mutex<Receiver<String>>>,
+    custom_type: &str,
+    content: &str,
+    label: &str,
+) -> Value {
+    let start = Instant::now();
+    let mut attempt = 0usize;
+
+    loop {
+        attempt = attempt.saturating_add(1);
+        let cmd = json!({
+            "id": format!("wait-{attempt}"),
+            "type": "get_messages",
+        })
+        .to_string();
+        let resp = send_recv(in_tx, out_rx, &cmd, label).await;
+        assert_ok(&resp, "get_messages");
+
+        if resp["data"]["messages"].as_array().is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message["role"] == "custom"
+                    && message["customType"] == custom_type
+                    && message["content"] == content
+            })
+        }) {
+            return resp;
+        }
+
+        assert!(
+            start.elapsed() <= Duration::from_secs(10),
+            "{label}: timed out waiting for custom message {custom_type}/{content}"
+        );
+        asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests: RPC session switch hooks
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rpc_new_session_can_be_cancelled_by_extension() {
+    let harness = TestHarness::new("rpc_new_session_can_be_cancelled_by_extension");
+    let cassette_dir = cassette_root();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let session = Session::in_memory();
+        let original_session_id = session.header.id.clone();
+        let (agent_session, _manager) = build_agent_session_with_js_extension(
+            session,
+            &cassette_dir,
+            &harness,
+            SESSION_SWITCH_CANCEL_EXT,
+        )
+        .await;
+        let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+        let resp = send_recv(
+            &in_tx,
+            &out_rx,
+            r#"{"id":"1","type":"new_session"}"#,
+            "new_session(cancelled)",
+        )
+        .await;
+        assert_ok(&resp, "new_session");
+        assert_eq!(resp["data"]["cancelled"], true);
+
+        let state = send_recv(
+            &in_tx,
+            &out_rx,
+            r#"{"id":"2","type":"get_state"}"#,
+            "get_state(after cancelled new_session)",
+        )
+        .await;
+        assert_ok(&state, "get_state");
+        assert_eq!(state["data"]["sessionId"], original_session_id);
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "rpc server error: {result:?}");
+    });
+}
+
+#[test]
+fn rpc_switch_session_can_be_cancelled_by_extension() {
+    let harness = TestHarness::new("rpc_switch_session_can_be_cancelled_by_extension");
+    let cassette_dir = cassette_root();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let session = Session::in_memory();
+        let original_session_id = session.header.id.clone();
+
+        let target_root = tempfile::tempdir().expect("target session dir");
+        let mut target = Session::create_with_dir(Some(target_root.path().to_path_buf()));
+        target.append_message(SessionMessage::User {
+            content: UserContent::Text("target".to_string()),
+            timestamp: Some(1_700_000_000_000),
+        });
+        target.save().await.expect("save target session");
+        let target_path = target
+            .path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .expect("target session path");
+
+        let (agent_session, _manager) = build_agent_session_with_js_extension(
+            session,
+            &cassette_dir,
+            &harness,
+            SESSION_SWITCH_CANCEL_EXT,
+        )
+        .await;
+        let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+        let cmd = json!({
+            "id": "1",
+            "type": "switch_session",
+            "sessionPath": target_path,
+        })
+        .to_string();
+        let resp = send_recv(&in_tx, &out_rx, &cmd, "switch_session(cancelled)").await;
+        assert_ok(&resp, "switch_session");
+        assert_eq!(resp["data"]["cancelled"], true);
+
+        let state = send_recv(
+            &in_tx,
+            &out_rx,
+            r#"{"id":"2","type":"get_state"}"#,
+            "get_state(after cancelled switch_session)",
+        )
+        .await;
+        assert_ok(&state, "get_state");
+        assert_eq!(state["data"]["sessionId"], original_session_id);
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "rpc server error: {result:?}");
+    });
+}
+
+#[test]
+fn rpc_session_switch_events_are_emitted_for_new_and_resume() {
+    let harness = TestHarness::new("rpc_session_switch_events_are_emitted_for_new_and_resume");
+    let cassette_dir = cassette_root();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let current_root = tempfile::tempdir().expect("current session dir");
+        let mut current = Session::create_with_dir(Some(current_root.path().to_path_buf()));
+        current.append_message(SessionMessage::User {
+            content: UserContent::Text("current".to_string()),
+            timestamp: Some(1_700_000_000_000),
+        });
+        current.save().await.expect("save current session");
+        let current_path = current
+            .path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .expect("current session path");
+
+        let target_root = tempfile::tempdir().expect("target session dir");
+        let mut target = Session::create_with_dir(Some(target_root.path().to_path_buf()));
+        target.append_message(SessionMessage::User {
+            content: UserContent::Text("target".to_string()),
+            timestamp: Some(1_700_000_000_100),
+        });
+        target.save().await.expect("save target session");
+        let target_path = target
+            .path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .expect("target session path");
+
+        let (agent_session, manager) = build_agent_session_with_js_extension(
+            current,
+            &cassette_dir,
+            &harness,
+            SESSION_SWITCH_RECORD_EXT,
+        )
+        .await;
+        let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+        let new_resp = send_recv(
+            &in_tx,
+            &out_rx,
+            r#"{"id":"1","type":"new_session"}"#,
+            "new_session(recorded)",
+        )
+        .await;
+        assert_ok(&new_resp, "new_session");
+        assert_eq!(new_resp["data"]["cancelled"], false);
+
+        let switch_cmd = json!({
+            "id": "2",
+            "type": "switch_session",
+            "sessionPath": target_path.clone(),
+        })
+        .to_string();
+        let switch_resp = send_recv(&in_tx, &out_rx, &switch_cmd, "switch_session(recorded)").await;
+        assert_ok(&switch_resp, "switch_session");
+        assert_eq!(switch_resp["data"]["cancelled"], false);
+
+        let events_json = manager
+            .execute_command("get-events", "", 5000)
+            .await
+            .expect("get recorded events");
+        let events: Vec<Value> = serde_json::from_str(events_json.as_str().expect("events string"))
+            .expect("parse events");
+
+        assert_eq!(
+            events.len(),
+            2,
+            "expected new + resume events, got {events:?}"
+        );
+        assert_eq!(events[0]["reason"], "new");
+        assert_eq!(events[0]["previousSessionFile"], current_path);
+        assert!(
+            events[0]["sessionId"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "expected new-session event to include sessionId: {:?}",
+            events[0]
+        );
+
+        assert_eq!(events[1]["reason"], "resume");
+        assert_eq!(events[1]["previousSessionFile"], Value::Null);
+        assert_eq!(events[1]["targetSessionFile"], target_path);
+        assert!(
+            events[1]["sessionId"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "expected resume event to include sessionId: {:?}",
+            events[1]
+        );
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "rpc server error: {result:?}");
+    });
 }
 
 // ---------------------------------------------------------------------------

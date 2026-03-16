@@ -327,7 +327,7 @@ fn provider_base_strategy() -> impl Strategy<Value = String> {
 fn normalize_openai_base_appends_for_plain_host() {
     let harness = TestHarness::new("normalize_openai_base_appends_for_plain_host");
     let input = "https://api.openai.com";
-    let expected = "https://api.openai.com/chat/completions";
+    let expected = "https://api.openai.com/v1/chat/completions";
     harness.log().info_ctx("normalize", "plain host", |ctx| {
         ctx.push(("input".to_string(), input.to_string()));
         ctx.push(("expected".to_string(), expected.to_string()));
@@ -357,6 +357,21 @@ fn normalize_openai_base_trims_trailing_slash() {
     harness
         .log()
         .info_ctx("normalize", "trailing slash", |ctx| {
+            ctx.push(("input".to_string(), input.to_string()));
+            ctx.push(("expected".to_string(), expected.to_string()));
+        });
+    let normalized = normalize_openai_base(input);
+    assert_eq!(normalized, expected);
+}
+
+#[test]
+fn normalize_openai_base_empty_uses_default_endpoint() {
+    let harness = TestHarness::new("normalize_openai_base_empty_uses_default_endpoint");
+    let input = "   ";
+    let expected = "https://api.openai.com/v1/chat/completions";
+    harness
+        .log()
+        .info_ctx("normalize", "empty uses default", |ctx| {
             ctx.push(("input".to_string(), input.to_string()));
             ctx.push(("expected".to_string(), expected.to_string()));
         });
@@ -418,6 +433,21 @@ fn normalize_openai_responses_base_trims_trailing_slash() {
     harness
         .log()
         .info_ctx("normalize", "responses trailing slash", |ctx| {
+            ctx.push(("input".to_string(), input.to_string()));
+            ctx.push(("expected".to_string(), expected.to_string()));
+        });
+    let normalized = normalize_openai_responses_base(input);
+    assert_eq!(normalized, expected);
+}
+
+#[test]
+fn normalize_openai_responses_base_empty_uses_default_endpoint() {
+    let harness = TestHarness::new("normalize_openai_responses_base_empty_uses_default_endpoint");
+    let input = "";
+    let expected = "https://api.openai.com/v1/responses";
+    harness
+        .log()
+        .info_ctx("normalize", "empty uses default", |ctx| {
             ctx.push(("input".to_string(), input.to_string()));
             ctx.push(("expected".to_string(), expected.to_string()));
         });

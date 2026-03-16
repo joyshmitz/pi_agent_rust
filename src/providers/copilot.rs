@@ -377,7 +377,7 @@ mod tests {
         })
         .to_string();
         let cassette = Cassette {
-            version: "1".to_string(),
+            version: "1.0".to_string(),
             test_name: test_name.to_string(),
             recorded_at: "2025-01-01T00:00:00Z".to_string(),
             interactions: vec![Interaction {
@@ -455,7 +455,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let test_name = "copilot_token_error";
         let cassette = Cassette {
-            version: "1".to_string(),
+            version: "1.0".to_string(),
             test_name: test_name.to_string(),
             recorded_at: "2025-01-01T00:00:00Z".to_string(),
             interactions: vec![Interaction {

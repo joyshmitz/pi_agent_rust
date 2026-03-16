@@ -330,9 +330,12 @@ impl ExtensionIndexStore {
             let encoded = serde_json::to_string_pretty(index)?;
             tmp.write_all(encoded.as_bytes())?;
             tmp.flush()?;
-            tmp.persist(&self.path)
-                .map(|_| ())
-                .map_err(|e| Error::from(Box::new(e.error)))
+            persist_tempfile_for_cache(tmp, &self.path).map_err(|err| {
+                Error::config(format!(
+                    "Failed to persist extension index to {}: {err}",
+                    self.path.display()
+                ))
+            })
         } else {
             Err(Error::config(format!(
                 "Invalid extension index path: {}",
@@ -410,6 +413,46 @@ impl ExtensionIndexStore {
             },
         ))
     }
+}
+
+fn persist_tempfile_for_cache(tmp: NamedTempFile, path: &Path) -> std::io::Result<()> {
+    match tmp.persist(path) {
+        Ok(_) => Ok(()),
+        Err(err) => persist_tempfile_for_cache_after_conflict(err, path),
+    }
+}
+
+#[cfg(windows)]
+fn persist_tempfile_for_cache_after_conflict(
+    err: tempfile::PersistError,
+    path: &Path,
+) -> std::io::Result<()> {
+    if err.error.kind() != std::io::ErrorKind::AlreadyExists {
+        return Err(err.error);
+    }
+
+    // Extension index writes are documented as fail-open cache refreshes.
+    // On Windows, `persist()` may reject replacing an existing file, so retry
+    // with a best-effort remove+persist fallback instead of surfacing a
+    // permanent refresh failure.
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(remove_err) if remove_err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(remove_err) => return Err(remove_err),
+    }
+
+    err.file
+        .persist(path)
+        .map(|_| ())
+        .map_err(|persist_err| persist_err.error)
+}
+
+#[cfg(not(windows))]
+fn persist_tempfile_for_cache_after_conflict(
+    err: tempfile::PersistError,
+    _path: &Path,
+) -> std::io::Result<()> {
+    Err(err.error)
 }
 
 fn merge_entries(
@@ -720,14 +763,17 @@ pub fn seed_index() -> Result<ExtensionIndex> {
             .filter(|value| !value.trim().is_empty() && !value.eq_ignore_ascii_case("unknown"));
 
         let (source, install_source, tags) = match &item.source {
-            ArtifactProvenanceSource::Npm { version, url, .. } => {
-                let spec = version.as_ref().map_or_else(
-                    || item.name.clone(),
-                    |v| format!("{}@{}", item.name, v.trim()),
-                );
+            ArtifactProvenanceSource::Npm {
+                package,
+                version,
+                url,
+            } => {
+                let spec = version
+                    .as_ref()
+                    .map_or_else(|| package.clone(), |v| format!("{}@{}", package, v.trim()));
                 (
                     Some(ExtensionIndexSource::Npm {
-                        package: item.name.clone(),
+                        package: package.clone(),
                         version: version.clone(),
                         url: url.clone(),
                     }),
@@ -794,6 +840,37 @@ mod tests {
     fn seed_index_parses_and_has_entries() {
         let index = seed_index().expect("seed index");
         assert!(index.entries.len() > 10);
+    }
+
+    #[test]
+    fn seed_index_uses_npm_package_for_install_source() {
+        let index = seed_index().expect("seed index");
+        let entry = index
+            .entries
+            .iter()
+            .find(|entry| {
+                matches!(
+                    &entry.source,
+                    Some(ExtensionIndexSource::Npm { package, .. }) if package != &entry.name
+                )
+            })
+            .expect("seed should include an npm package whose display name differs from package");
+
+        let Some(ExtensionIndexSource::Npm {
+            package, version, ..
+        }) = &entry.source
+        else {
+            unreachable!("entry source should be npm");
+        };
+
+        let expected_install = version.as_ref().map_or_else(
+            || format!("npm:{package}"),
+            |version| format!("npm:{package}@{version}"),
+        );
+        assert_eq!(
+            entry.install_source.as_deref(),
+            Some(expected_install.as_str())
+        );
     }
 
     #[test]
@@ -1267,6 +1344,45 @@ mod tests {
     }
 
     #[test]
+    fn store_save_overwrites_existing_file() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_dir.path().join("index.json");
+        let store = ExtensionIndexStore::new(path);
+
+        let mut first = ExtensionIndex::new_empty();
+        first.entries.push(test_entry(
+            "npm/first",
+            "first",
+            Some("first version"),
+            &["test"],
+        ));
+        store.save(&first).expect("save first");
+
+        let mut second = ExtensionIndex::new_empty();
+        second.generated_at = Some("2026-03-09T00:00:00Z".to_string());
+        second.last_refreshed_at = Some("2026-03-09T01:00:00Z".to_string());
+        second.entries.push(test_entry(
+            "npm/second",
+            "second",
+            Some("second version"),
+            &["fresh"],
+        ));
+        store.save(&second).expect("overwrite existing cache");
+
+        let loaded = store.load().expect("load").expect("some");
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].name, "second");
+        assert_eq!(
+            loaded.entries[0].description.as_deref(),
+            Some("second version")
+        );
+        assert_eq!(
+            loaded.last_refreshed_at.as_deref(),
+            Some("2026-03-09T01:00:00Z")
+        );
+    }
+
+    #[test]
     fn store_load_nonexistent_returns_none() {
         let store = ExtensionIndexStore::new(std::path::PathBuf::from("/nonexistent/path.json"));
         assert!(store.load().expect("load").is_none());
@@ -1485,8 +1601,8 @@ mod tests {
                 // The case-insensitivity is on the *entry* fields, not tokens.
                 let lower_entry = make_entry("id", &name);
                 let upper_entry = make_entry("id", &name.to_uppercase());
-                let token = vec![name];
-                assert_eq!(score_entry(&lower_entry, &token), score_entry(&upper_entry, &token));
+                let search_token = vec![name];
+                assert_eq!(score_entry(&lower_entry, &search_token), score_entry(&upper_entry, &search_token));
             }
 
             /// Name match gives 300 points per token.

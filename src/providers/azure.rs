@@ -28,23 +28,48 @@ use std::pin::Pin;
 pub(crate) const DEFAULT_API_VERSION: &str = "2024-02-15-preview";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 
-/// Map a role string (which may come from compat config at runtime) to a `&'static str`.
-///
-/// The Azure OpenAI API uses a small, well-known set of role names.  When the
-/// value matches one of these we return the corresponding string literal (zero
-/// allocation).  For an unknown role name (extremely rare -- only possible via
-/// exotic compat overrides) we leak a heap copy so that callers can always
-/// work with `&'static str`.
-fn to_static_role(role: &str) -> &'static str {
-    match role {
-        "system" => "system",
-        "developer" => "developer",
-        "user" => "user",
-        "assistant" => "assistant",
-        "tool" => "tool",
-        "function" => "function",
-        other => Box::leak(other.to_string().into_boxed_str()),
+/// Normalize Azure role names while preserving unknown compat overrides as-is.
+fn normalize_role(role: &str) -> String {
+    let trimmed = role.trim();
+    match trimmed {
+        "system" | "developer" | "user" | "assistant" | "tool" | "function" => trimmed.to_string(),
+        _ => {
+            let lowered = trimmed.to_ascii_lowercase();
+            match lowered.as_str() {
+                "system" | "developer" | "user" | "assistant" | "tool" | "function" => lowered,
+                _ => trimmed.to_string(),
+            }
+        }
     }
+}
+
+fn authorization_override(
+    options: &StreamOptions,
+    compat: Option<&CompatConfig>,
+) -> Option<String> {
+    super::first_non_empty_header_value_case_insensitive(&options.headers, &["authorization"])
+        .or_else(|| {
+            compat
+                .and_then(|compat| compat.custom_headers.as_ref())
+                .and_then(|headers| {
+                    super::first_non_empty_header_value_case_insensitive(
+                        headers,
+                        &["authorization"],
+                    )
+                })
+        })
+}
+
+fn api_key_override(options: &StreamOptions, compat: Option<&CompatConfig>) -> Option<String> {
+    super::first_non_empty_header_value_case_insensitive(&options.headers, &["api-key"]).or_else(
+        || {
+            compat
+                .and_then(|compat| compat.custom_headers.as_ref())
+                .and_then(|headers| {
+                    super::first_non_empty_header_value_case_insensitive(headers, &["api-key"])
+                })
+        },
+    )
 }
 
 // ============================================================================
@@ -159,7 +184,7 @@ impl AzureOpenAIProvider {
         // Add system prompt as first message
         if let Some(system) = &context.system_prompt {
             messages.push(AzureMessage {
-                role: to_static_role(system_role),
+                role: normalize_role(system_role),
                 content: Some(AzureContent::Text(system.to_string())),
                 tool_calls: None,
                 tool_call_id: None,
@@ -194,11 +219,19 @@ impl Provider for AzureOpenAIProvider {
         context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-        let auth_value = options
-            .api_key
-            .clone()
-            .or_else(|| std::env::var("AZURE_OPENAI_API_KEY").ok())
-            .ok_or_else(|| Error::provider("azure-openai", "Missing API key for Azure OpenAI. Set AZURE_OPENAI_API_KEY or configure in settings."))?;
+        let has_auth_override = api_key_override(options, self.compat.as_ref()).is_some()
+            || authorization_override(options, self.compat.as_ref()).is_some();
+        let auth_value = if has_auth_override {
+            None
+        } else {
+            Some(
+                options
+                    .api_key
+                    .clone()
+                    .or_else(|| std::env::var("AZURE_OPENAI_API_KEY").ok())
+                    .ok_or_else(|| Error::provider("azure-openai", "Missing API key for provider. Configure credentials with /login <provider> or set the provider's API key env var."))?,
+            )
+        };
 
         let request_body = self.build_request(context, options);
 
@@ -208,21 +241,28 @@ impl Provider for AzureOpenAIProvider {
         let mut request = self
             .client
             .post(&endpoint_url)
-            .header("Accept", "text/event-stream")
-            .header("api-key", &auth_value); // Azure uses api-key header, not Authorization
+            .header("Accept", "text/event-stream");
+
+        if let Some(auth_value) = auth_value {
+            request = request.header("api-key", &auth_value); // Azure uses api-key header, not Authorization
+        }
 
         // Apply provider-specific custom headers from compat config.
         if let Some(compat) = &self.compat {
             if let Some(custom_headers) = &compat.custom_headers {
-                for (key, value) in custom_headers {
-                    request = request.header(key, value);
-                }
+                request = super::apply_headers_ignoring_blank_auth_overrides(
+                    request,
+                    custom_headers,
+                    &["authorization", "api-key"],
+                );
             }
         }
 
-        for (key, value) in &options.headers {
-            request = request.header(key, value);
-        }
+        request = super::apply_headers_ignoring_blank_auth_overrides(
+            request,
+            &options.headers,
+            &["authorization", "api-key"],
+        );
 
         let request = request.json(&request_body)?;
 
@@ -400,8 +440,8 @@ where
 
     #[allow(clippy::unnecessary_wraps, clippy::too_many_lines)]
     fn process_event(&mut self, data: &str) -> Result<()> {
-        let chunk: AzureStreamChunk =
-            serde_json::from_str(data).map_err(|e| Error::api(format!("JSON parse error: {e}")))?;
+        let chunk: AzureStreamChunk = serde_json::from_str(data)
+            .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
 
         // Process usage if present
         if let Some(usage) = chunk.usage {
@@ -479,20 +519,20 @@ where
 
                     // Update the tool call state
                     if let Some(id) = tc.id {
-                        tc_state.id.clone_from(&id);
+                        tc_state.id.push_str(&id);
                         if let Some(ContentBlock::ToolCall(block)) =
                             self.partial.content.get_mut(content_index)
                         {
-                            block.id = id;
+                            block.id.clone_from(&tc_state.id);
                         }
                     }
                     if let Some(func) = tc.function {
                         if let Some(name) = func.name {
-                            tc_state.name.clone_from(&name);
+                            tc_state.name.push_str(&name);
                             if let Some(ContentBlock::ToolCall(block)) =
                                 self.partial.content.get_mut(content_index)
                             {
-                                block.name = name;
+                                block.name.clone_from(&tc_state.name);
                             }
                         }
                         if let Some(args) = func.arguments {
@@ -527,12 +567,17 @@ where
                 // Finalize tool call arguments
                 self.finalize_tool_call_arguments();
 
-                // Emit TextEnd for all open text blocks.
+                // Emit TextEnd/ThinkingEnd for all open text/thinking blocks.
                 for (content_index, block) in self.partial.content.iter().enumerate() {
                     if let ContentBlock::Text(t) = block {
                         self.pending_events.push_back(StreamEvent::TextEnd {
                             content_index,
                             content: t.text.clone(),
+                        });
+                    } else if let ContentBlock::Thinking(t) = block {
+                        self.pending_events.push_back(StreamEvent::ThinkingEnd {
+                            content_index,
+                            content: t.thinking.clone(),
                         });
                     }
                 }
@@ -580,7 +625,7 @@ struct AzureStreamOptions {
 
 #[derive(Debug, Serialize)]
 struct AzureMessage {
-    role: &'static str,
+    role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<AzureContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -694,16 +739,17 @@ struct AzureUsage {
 // Conversion Functions
 // ============================================================================
 
+#[allow(clippy::too_many_lines)]
 fn convert_message_to_azure(message: &Message) -> Vec<AzureMessage> {
     match message {
         Message::User(user) => vec![AzureMessage {
-            role: "user",
+            role: "user".to_string(),
             content: Some(convert_user_content(&user.content)),
             tool_calls: None,
             tool_call_id: None,
         }],
         Message::Custom(custom) => vec![AzureMessage {
-            role: "user",
+            role: "user".to_string(),
             content: Some(AzureContent::Text(custom.content.clone())),
             tool_calls: None,
             tool_call_id: None,
@@ -719,8 +765,7 @@ fn convert_message_to_azure(message: &Message) -> Vec<AzureMessage> {
                     ContentBlock::Text(t) => Some(t.text.as_str()),
                     _ => None,
                 })
-                .collect::<Vec<_>>()
-                .join("");
+                .collect::<String>();
 
             // Collect tool calls
             let tool_calls: Vec<AzureToolCallRef> = assistant
@@ -752,7 +797,7 @@ fn convert_message_to_azure(message: &Message) -> Vec<AzureMessage> {
             };
 
             messages.push(AzureMessage {
-                role: "assistant",
+                role: "assistant".to_string(),
                 content,
                 tool_calls,
                 tool_call_id: None,
@@ -761,41 +806,53 @@ fn convert_message_to_azure(message: &Message) -> Vec<AzureMessage> {
             messages
         }
         Message::ToolResult(result) => {
-            let parts: Vec<AzureContentPart> = result
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text(t) => Some(AzureContentPart::Text {
-                        text: t.text.clone(),
-                    }),
+            let mut text_parts = Vec::new();
+            let mut image_parts = Vec::new();
+
+            for block in &result.content {
+                match block {
+                    ContentBlock::Text(t) => text_parts.push(t.text.clone()),
                     ContentBlock::Image(img) => {
                         let url = format!("data:{};base64,{}", img.mime_type, img.data);
-                        Some(AzureContentPart::ImageUrl {
+                        image_parts.push(AzureContentPart::ImageUrl {
                             image_url: AzureImageUrl { url },
-                        })
+                        });
                     }
-                    _ => None,
-                })
-                .collect();
+                    _ => {}
+                }
+            }
 
-            let content = if parts.is_empty() {
-                None
-            } else if parts.len() == 1 && matches!(parts[0], AzureContentPart::Text { .. }) {
-                if let AzureContentPart::Text { text } = &parts[0] {
-                    Some(AzureContent::Text(text.clone()))
+            let text_content = if text_parts.is_empty() {
+                if image_parts.is_empty() {
+                    None
                 } else {
-                    Some(AzureContent::Parts(parts))
+                    Some(AzureContent::Text("(see attached image)".to_string()))
                 }
             } else {
-                Some(AzureContent::Parts(parts))
+                Some(AzureContent::Text(text_parts.join("\n")))
             };
 
-            vec![AzureMessage {
-                role: "tool",
-                content,
+            let mut messages = vec![AzureMessage {
+                role: "tool".to_string(),
+                content: text_content,
                 tool_calls: None,
                 tool_call_id: Some(result.tool_call_id.clone()),
-            }]
+            }];
+
+            if !image_parts.is_empty() {
+                let mut parts = vec![AzureContentPart::Text {
+                    text: "Attached image(s) from tool result:".to_string(),
+                }];
+                parts.extend(image_parts);
+                messages.push(AzureMessage {
+                    role: "user".to_string(),
+                    content: Some(AzureContent::Parts(parts)),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
+
+            messages
         }
     }
 }
@@ -842,13 +899,18 @@ fn convert_tool_to_azure(tool: &ToolDef) -> AzureTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{TextContent, ToolCall, UserMessage};
+    use crate::model::{ImageContent, TextContent, ToolCall, ToolResultMessage, UserMessage};
     use crate::provider::ToolDef;
     use asupersync::runtime::RuntimeBuilder;
     use futures::{StreamExt, stream};
     use serde::{Deserialize, Serialize};
     use serde_json::{Value, json};
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     #[test]
     fn test_azure_provider_creation() {
@@ -985,6 +1047,42 @@ mod tests {
     }
 
     #[test]
+    fn test_azure_build_request_normalizes_known_system_role_name() {
+        let provider =
+            AzureOpenAIProvider::new("contoso", "gpt-4o").with_compat(Some(CompatConfig {
+                system_role_name: Some("SYSTEM ".to_string()),
+                ..CompatConfig::default()
+            }));
+        let context = Context {
+            system_prompt: Some("You are deterministic.".to_string().into()),
+            messages: Vec::new().into(),
+            tools: Vec::new().into(),
+        };
+
+        let request = provider.build_request(&context, &StreamOptions::default());
+        let request_json = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(request_json["messages"][0]["role"], json!("system"));
+    }
+
+    #[test]
+    fn test_azure_build_request_preserves_unknown_system_role_name() {
+        let provider =
+            AzureOpenAIProvider::new("contoso", "gpt-4o").with_compat(Some(CompatConfig {
+                system_role_name: Some("custom_role".to_string()),
+                ..CompatConfig::default()
+            }));
+        let context = Context {
+            system_prompt: Some("You are deterministic.".to_string().into()),
+            messages: Vec::new().into(),
+            tools: Vec::new().into(),
+        };
+
+        let request = provider.build_request(&context, &StreamOptions::default());
+        let request_json = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(request_json["messages"][0]["role"], json!("custom_role"));
+    }
+
+    #[test]
     fn test_azure_message_conversion() {
         let message = Message::User(UserMessage {
             content: UserContent::Text("Hello".to_string()),
@@ -1080,6 +1178,149 @@ mod tests {
         );
     }
 
+    #[derive(Debug)]
+    struct CapturedRequest {
+        headers: HashMap<String, String>,
+        body: String,
+    }
+
+    #[test]
+    fn test_stream_compat_api_key_header_works_without_api_key() {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let mut custom_headers = HashMap::new();
+        custom_headers.insert("api-key".to_string(), "compat-azure-key".to_string());
+        let provider = AzureOpenAIProvider::new("contoso", "gpt-4o")
+            .with_endpoint_url(base_url)
+            .with_compat(Some(CompatConfig {
+                custom_headers: Some(custom_headers),
+                ..CompatConfig::default()
+            }));
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider
+                .stream(&context, &StreamOptions::default())
+                .await
+                .expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let captured = rx.recv_timeout(Duration::from_secs(2)).expect("captured");
+        assert_eq!(
+            captured.headers.get("api-key").map(String::as_str),
+            Some("compat-azure-key")
+        );
+        let body: Value = serde_json::from_str(&captured.body).expect("body json");
+        assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn test_stream_compat_authorization_header_works_without_api_key() {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let mut custom_headers = HashMap::new();
+        custom_headers.insert(
+            "Authorization".to_string(),
+            "Bearer compat-azure-token".to_string(),
+        );
+        let provider = AzureOpenAIProvider::new("contoso", "gpt-4o")
+            .with_endpoint_url(base_url)
+            .with_compat(Some(CompatConfig {
+                custom_headers: Some(custom_headers),
+                ..CompatConfig::default()
+            }));
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider
+                .stream(&context, &StreamOptions::default())
+                .await
+                .expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let captured = rx.recv_timeout(Duration::from_secs(2)).expect("captured");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some("Bearer compat-azure-token")
+        );
+        let body: Value = serde_json::from_str(&captured.body).expect("body json");
+        assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn test_blank_compat_api_key_header_does_not_override_builtin_api_key() {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let mut custom_headers = HashMap::new();
+        custom_headers.insert("api-key".to_string(), "   ".to_string());
+        let provider = AzureOpenAIProvider::new("contoso", "gpt-4o")
+            .with_endpoint_url(base_url)
+            .with_compat(Some(CompatConfig {
+                custom_headers: Some(custom_headers),
+                ..CompatConfig::default()
+            }));
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let options = StreamOptions {
+            api_key: Some("fallback-azure-key".to_string()),
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let captured = rx.recv_timeout(Duration::from_secs(2)).expect("captured");
+        assert_eq!(
+            captured.headers.get("api-key").map(String::as_str),
+            Some("fallback-azure-key")
+        );
+    }
+
     fn load_fixture(file_name: &str) -> ProviderFixture {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/provider_responses")
@@ -1131,6 +1372,116 @@ mod tests {
 
             out
         })
+    }
+
+    fn success_sse_body() -> String {
+        [
+            r#"data: {"choices":[{"delta":{}}]}"#,
+            "",
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+            "",
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n")
+    }
+
+    fn spawn_test_server(
+        status_code: u16,
+        content_type: &str,
+        body: &str,
+    ) -> (String, mpsc::Receiver<CapturedRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let (tx, rx) = mpsc::channel();
+        let body = body.to_string();
+        let content_type = content_type.to_string();
+
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set read timeout");
+
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match socket.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        bytes.extend_from_slice(&chunk[..n]);
+                        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::WouldBlock
+                            || err.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        break;
+                    }
+                    Err(err) => panic!("{err}"),
+                }
+            }
+
+            let header_end = bytes
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .expect("request header boundary");
+            let header_text = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+            let headers = parse_headers(&header_text);
+            let mut request_body = bytes[header_end + 4..].to_vec();
+
+            let content_length = headers
+                .get("content-length")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            while request_body.len() < content_length {
+                match socket.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => request_body.extend_from_slice(&chunk[..n]),
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::WouldBlock
+                            || err.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        break;
+                    }
+                    Err(err) => panic!("{err}"),
+                }
+            }
+
+            tx.send(CapturedRequest {
+                headers,
+                body: String::from_utf8_lossy(&request_body).to_string(),
+            })
+            .expect("send captured request");
+
+            let reason = match status_code {
+                401 => "Unauthorized",
+                500 => "Internal Server Error",
+                _ => "OK",
+            };
+            let response = format!(
+                "HTTP/1.1 {status_code} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .expect("write response");
+            socket.flush().expect("flush response");
+        });
+
+        (format!("http://{addr}/azure"), rx)
+    }
+
+    fn parse_headers(header_text: &str) -> HashMap<String, String> {
+        let mut headers = HashMap::new();
+        for line in header_text.lines().skip(1) {
+            if let Some((name, value)) = line.split_once(':') {
+                headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+            }
+        }
+        headers
     }
 
     fn summarize_event(event: &StreamEvent) -> EventSummary {
@@ -1204,6 +1555,109 @@ mod tests {
             StopReason::Aborted => "aborted",
         }
         .to_string()
+    }
+
+    fn make_tool_result(content: Vec<ContentBlock>) -> Message {
+        Message::tool_result(ToolResultMessage {
+            tool_call_id: "call_123".to_string(),
+            tool_name: "test_tool".to_string(),
+            content,
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        })
+    }
+
+    #[test]
+    fn tool_result_text_only_produces_single_tool_message() {
+        let msg = make_tool_result(vec![ContentBlock::Text(TextContent {
+            text: "result text".to_string(),
+            text_signature: None,
+        })]);
+        let azure_msgs = convert_message_to_azure(&msg);
+        assert_eq!(azure_msgs.len(), 1);
+        assert_eq!(azure_msgs[0].role, "tool");
+        assert_eq!(azure_msgs[0].tool_call_id.as_deref(), Some("call_123"));
+        let json = serde_json::to_value(&azure_msgs[0]).expect("serialize");
+        assert_eq!(json["content"], "result text");
+    }
+
+    #[test]
+    fn tool_result_image_only_produces_tool_plus_user_message() {
+        let msg = make_tool_result(vec![ContentBlock::Image(ImageContent {
+            data: "aW1hZ2U=".to_string(),
+            mime_type: "image/png".to_string(),
+        })]);
+        let azure_msgs = convert_message_to_azure(&msg);
+        assert_eq!(
+            azure_msgs.len(),
+            2,
+            "image-only should produce tool + user messages"
+        );
+        assert_eq!(azure_msgs[0].role, "tool");
+        assert_eq!(azure_msgs[1].role, "user");
+
+        let tool_json = serde_json::to_value(&azure_msgs[0]).expect("serialize tool");
+        assert_eq!(tool_json["content"], "(see attached image)");
+
+        let user_json = serde_json::to_value(&azure_msgs[1]).expect("serialize user");
+        let parts = user_json["content"].as_array().expect("parts array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+        assert!(
+            parts[1]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
+    }
+
+    #[test]
+    fn tool_result_mixed_text_and_image_splits_correctly() {
+        let msg = make_tool_result(vec![
+            ContentBlock::Text(TextContent {
+                text: "line one".to_string(),
+                text_signature: None,
+            }),
+            ContentBlock::Image(ImageContent {
+                data: "aW1hZ2U=".to_string(),
+                mime_type: "image/jpeg".to_string(),
+            }),
+            ContentBlock::Text(TextContent {
+                text: "line two".to_string(),
+                text_signature: None,
+            }),
+        ]);
+        let azure_msgs = convert_message_to_azure(&msg);
+        assert_eq!(
+            azure_msgs.len(),
+            2,
+            "mixed content should produce tool + user messages"
+        );
+
+        let tool_json = serde_json::to_value(&azure_msgs[0]).expect("serialize tool");
+        assert_eq!(tool_json["content"], "line one\nline two");
+        assert_eq!(tool_json["tool_call_id"], "call_123");
+
+        let user_json = serde_json::to_value(&azure_msgs[1]).expect("serialize user");
+        let parts = user_json["content"].as_array().expect("parts array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image_url");
+    }
+
+    #[test]
+    fn tool_result_empty_content_produces_single_tool_message_with_no_content() {
+        let msg = make_tool_result(vec![]);
+        let azure_msgs = convert_message_to_azure(&msg);
+        assert_eq!(azure_msgs.len(), 1);
+        assert_eq!(azure_msgs[0].role, "tool");
+        let json = serde_json::to_value(&azure_msgs[0]).expect("serialize");
+        assert!(
+            json["content"].is_null(),
+            "empty tool result should have null content"
+        );
     }
 }
 

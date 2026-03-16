@@ -266,12 +266,24 @@ pub fn evaluate_replay_capture_gate(
 /// # Errors
 ///
 /// Returns an error when the replay bundle fails deterministic validation.
+/// Schema mismatches relax only the schema-version check so diagnostics can
+/// still be emitted for otherwise well-formed foreign bundles.
 pub fn build_replay_diagnostic_snapshot(
     bundle: &ReplayTraceBundle,
     capture_gate: ReplayCaptureGateReport,
     divergence: Option<&ReplayDivergence>,
 ) -> Result<ReplayDiagnosticSnapshot, ReplayTraceValidationError> {
-    bundle.validate()?;
+    if matches!(
+        divergence,
+        Some(ReplayDivergence {
+            reason: ReplayDivergenceReason::SchemaMismatch { .. },
+            ..
+        })
+    ) {
+        bundle.validate_structure()?;
+    } else {
+        bundle.validate()?;
+    }
 
     let event_count = u64::try_from(bundle.events.len())
         .map_err(|_| ReplayTraceValidationError::TooManyEvents)?;
@@ -288,11 +300,11 @@ pub fn build_replay_diagnostic_snapshot(
 }
 
 fn compute_overhead_per_mille(baseline_micros: u64, captured_micros: u64) -> u32 {
-    if captured_micros <= baseline_micros {
-        return 0;
-    }
     if baseline_micros == 0 {
         return u32::MAX;
+    }
+    if captured_micros <= baseline_micros {
+        return 0;
     }
 
     let overhead = u128::from(captured_micros - baseline_micros);
@@ -379,12 +391,20 @@ impl ReplayTraceBundle {
     /// Returns an error when the bundle is malformed or violates replay
     /// ordering invariants.
     pub fn validate(&self) -> Result<(), ReplayTraceValidationError> {
+        self.validate_schema()?;
+        self.validate_structure()
+    }
+
+    fn validate_schema(&self) -> Result<(), ReplayTraceValidationError> {
         if self.schema != REPLAY_TRACE_SCHEMA_V1 {
             return Err(ReplayTraceValidationError::UnknownSchema(
                 self.schema.clone(),
             ));
         }
+        Ok(())
+    }
 
+    fn validate_structure(&self) -> Result<(), ReplayTraceValidationError> {
         if self.trace_id.trim().is_empty() {
             return Err(ReplayTraceValidationError::EmptyTraceId);
         }
@@ -450,7 +470,9 @@ impl ReplayTraceBundle {
 
 /// Compare two bundles and return the first deterministic divergence.
 ///
-/// Both bundles are validated before comparison.
+/// Both bundles must be structurally valid before comparison. If the schemas
+/// differ, the comparison reports a schema mismatch without requiring support
+/// for the foreign schema version.
 ///
 /// # Errors
 ///
@@ -459,8 +481,8 @@ pub fn first_divergence(
     expected: &ReplayTraceBundle,
     observed: &ReplayTraceBundle,
 ) -> Result<Option<ReplayDivergence>, ReplayTraceValidationError> {
-    expected.validate()?;
-    observed.validate()?;
+    expected.validate_structure()?;
+    observed.validate_structure()?;
 
     if expected.schema != observed.schema {
         return Ok(Some(ReplayDivergence {
@@ -471,6 +493,9 @@ pub fn first_divergence(
             },
         }));
     }
+
+    expected.validate_schema()?;
+    observed.validate_schema()?;
 
     if expected.trace_id != observed.trace_id {
         return Ok(Some(ReplayDivergence {
@@ -974,7 +999,8 @@ impl ReplayRecorder {
 ///
 /// # Errors
 ///
-/// Returns an error if either bundle fails validation.
+/// Returns an error if either bundle fails structural validation, or if a
+/// same-schema comparison uses an unsupported schema version.
 pub fn compare_replay_bundles(
     reference: &ReplayTraceBundle,
     observed: &ReplayTraceBundle,
@@ -1099,7 +1125,7 @@ mod tests {
             ReplayTraceCodecError::Validation(ReplayTraceValidationError::RetryWithoutCancel {
                 ..
             }) => {}
-            other => panic!("unexpected error: {other:?}"),
+            other => unreachable!("expected RetryWithoutCancel, got: {other:?}"),
         }
     }
 
@@ -1140,7 +1166,7 @@ mod tests {
                 assert_eq!(expected, 2);
                 assert_eq!(observed, 3);
             }
-            other => panic!("unexpected error: {other:?}"),
+            other => unreachable!("expected NonContiguousSequence, got: {other:?}"),
         }
     }
 
@@ -1164,7 +1190,7 @@ mod tests {
             ReplayDivergenceReason::EventFieldMismatch { field, .. } => {
                 assert_eq!(field, "kind");
             }
-            other => panic!("unexpected divergence reason: {other:?}"),
+            other => unreachable!("expected EventFieldMismatch, got: {other:?}"),
         }
     }
 
@@ -1188,7 +1214,7 @@ mod tests {
                 assert_eq!(expected, 2);
                 assert_eq!(observed, 1);
             }
-            other => panic!("unexpected divergence reason: {other:?}"),
+            other => unreachable!("expected EventCountMismatch, got: {other:?}"),
         }
     }
 
@@ -1261,6 +1287,24 @@ mod tests {
         let observation = ReplayCaptureObservation {
             baseline_micros: 0,
             captured_micros: 1,
+            trace_bytes: 64,
+        };
+
+        let report = evaluate_replay_capture_gate(budget, observation);
+        assert!(!report.capture_allowed);
+        assert_eq!(
+            report.reason,
+            ReplayCaptureGateReason::DisabledByInvalidBaseline
+        );
+        assert_eq!(report.observed_overhead_per_mille, u32::MAX);
+    }
+
+    #[test]
+    fn capture_gate_fails_closed_when_zero_baseline_reports_zero_capture_cost() {
+        let budget = standard_capture_budget();
+        let observation = ReplayCaptureObservation {
+            baseline_micros: 0,
+            captured_micros: 0,
             trace_bytes: 64,
         };
 
@@ -1579,19 +1623,31 @@ mod tests {
         let mut observed = standard_bundle();
         observed.schema = "pi.ext.replay.trace.v2".to_string();
 
-        // We can't use first_divergence because validate() would reject v2.
-        // Instead test the divergence reason enum directly.
-        let d = super::ReplayDivergence {
-            seq: None,
-            reason: ReplayDivergenceReason::SchemaMismatch {
-                expected: REPLAY_TRACE_SCHEMA_V1.to_string(),
-                observed: "pi.ext.replay.trace.v2".to_string(),
-            },
-        };
-        let json = serde_json::to_string(&d).expect("serialize divergence");
-        let roundtrip: super::ReplayDivergence =
-            serde_json::from_str(&json).expect("deserialize divergence");
-        assert_eq!(d, roundtrip);
+        let divergence = first_divergence(&standard_bundle(), &observed)
+            .expect("comparison should succeed")
+            .expect("schema mismatch expected");
+
+        assert_eq!(divergence.seq, None);
+        match divergence.reason {
+            ReplayDivergenceReason::SchemaMismatch { expected, observed } => {
+                assert_eq!(expected, REPLAY_TRACE_SCHEMA_V1);
+                assert_eq!(observed, "pi.ext.replay.trace.v2");
+            }
+            other => unreachable!("expected SchemaMismatch, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn divergence_rejects_same_unknown_schema() {
+        let mut expected = standard_bundle();
+        expected.schema = "pi.ext.replay.trace.v2".to_string();
+        let observed = expected.clone();
+
+        let error = first_divergence(&expected, &observed).expect_err("unsupported schema");
+        assert!(matches!(
+            error,
+            ReplayTraceValidationError::UnknownSchema(schema) if schema == "pi.ext.replay.trace.v2"
+        ));
     }
 
     #[test]
@@ -1618,7 +1674,7 @@ mod tests {
             ReplayDivergenceReason::EventFieldMismatch { field, .. } => {
                 assert_eq!(field, "attributes");
             }
-            other => panic!("unexpected: {other:?}"),
+            other => unreachable!("expected EventFieldMismatch for attributes, got: {other:?}"),
         }
     }
 
@@ -1787,7 +1843,7 @@ mod tests {
     #[test]
     fn overhead_per_mille_zero_baseline_returns_max() {
         assert_eq!(super::compute_overhead_per_mille(0, 1), u32::MAX);
-        assert_eq!(super::compute_overhead_per_mille(0, 0), 0);
+        assert_eq!(super::compute_overhead_per_mille(0, 0), u32::MAX);
     }
 
     // ── ReplayRecorder tests ──
@@ -2111,6 +2167,38 @@ mod tests {
         assert!(diagnostic.divergence.is_some());
     }
 
+    #[test]
+    fn compare_replay_bundles_reports_schema_mismatch_with_hint() {
+        let reference = standard_bundle();
+        let mut observed = standard_bundle();
+        observed.schema = "pi.ext.replay.trace.v2".to_string();
+        let gate =
+            evaluate_replay_capture_gate(standard_capture_budget(), within_budget_observation());
+
+        let (diagnostic, comparison) =
+            super::compare_replay_bundles(&reference, &observed, gate).expect("compare");
+
+        assert_eq!(
+            comparison.root_cause_hints,
+            vec![ReplayRootCauseHint::TraceSchemaMismatch]
+        );
+        assert_eq!(
+            diagnostic.root_cause_hints,
+            vec![ReplayRootCauseHint::TraceSchemaMismatch]
+        );
+        match comparison
+            .divergence
+            .expect("schema mismatch divergence")
+            .reason
+        {
+            ReplayDivergenceReason::SchemaMismatch { expected, observed } => {
+                assert_eq!(expected, REPLAY_TRACE_SCHEMA_V1);
+                assert_eq!(observed, "pi.ext.replay.trace.v2");
+            }
+            other => unreachable!("expected SchemaMismatch, got: {other:?}"),
+        }
+    }
+
     // ── ReplayLaneConfig tests ──
 
     #[test]
@@ -2217,12 +2305,12 @@ mod tests {
 
             #[test]
             fn compute_overhead_per_mille_zero_baseline_returns_max(
-                captured in 1..10_000u64,
+                captured in 0..10_000u64,
             ) {
                 let result = super::super::compute_overhead_per_mille(0, captured);
                 assert_eq!(
                     result, u32::MAX,
-                    "zero baseline with positive captured should be MAX"
+                    "zero baseline should always be treated as invalid telemetry"
                 );
             }
 

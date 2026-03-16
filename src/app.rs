@@ -15,8 +15,14 @@ use crate::auth::AuthStorage;
 use crate::cli;
 use crate::config::Config;
 use crate::model::{self, AssistantMessage, ContentBlock, ImageContent, TextContent};
-use crate::models::{ModelEntry, ModelRegistry, default_models_path};
+use crate::models::{
+    ModelEntry, ModelRegistry, default_models_path, model_entry_is_ready,
+    model_requires_configured_credential, normalize_api_key_opt,
+};
 use crate::provider::{StreamOptions, ThinkingBudgets};
+use crate::provider_metadata::{
+    canonical_provider_id, provider_ids_match, split_provider_model_spec,
+};
 use crate::session::Session;
 use crate::tools::process_file_arguments;
 
@@ -64,6 +70,7 @@ struct ContextFile {
 struct RestoreResult {
     model: Option<ModelEntry>,
     fallback_message: Option<String>,
+    deferred_warning: Option<String>,
 }
 
 pub fn apply_piped_stdin(cli: &mut cli::Cli, stdin_content: Option<String>) {
@@ -132,6 +139,7 @@ pub fn build_initial_content(initial: &InitialMessage) -> Vec<ContentBlock> {
     content
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_system_prompt(
     cli: &cli::Cli,
     cwd: &Path,
@@ -140,6 +148,7 @@ pub fn build_system_prompt(
     global_dir: &Path,
     package_dir: &Path,
     test_mode: bool,
+    include_cwd: bool,
 ) -> String {
     use std::fmt::Write as _;
 
@@ -174,12 +183,14 @@ pub fn build_system_prompt(
         format_current_datetime()
     };
     let _ = write!(prompt, "\nCurrent date and time: {date_time}");
-    let cwd_display = if test_mode {
-        "<CWD>".to_string()
-    } else {
-        cwd.display().to_string()
-    };
-    let _ = write!(prompt, "\nCurrent working directory: {cwd_display}");
+    if include_cwd {
+        let cwd_display = if test_mode {
+            "<CWD>".to_string()
+        } else {
+            cwd.display().to_string()
+        };
+        let _ = write!(prompt, "\nCurrent working directory: {cwd_display}");
+    }
 
     prompt
 }
@@ -212,10 +223,14 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
         ("write", "Create or overwrite files"),
         (
             "grep",
-            "Search file contents for patterns (respects .gitignore)",
+            "Search file contents for patterns (respects .gitignore, supports hashline=true for use with hashline_edit)",
         ),
         ("find", "Find files by glob pattern (respects .gitignore)"),
         ("ls", "List directory contents"),
+        (
+            "hashline_edit",
+            "Apply precise file edits using LINE#HASH tags from read or grep with hashline=true",
+        ),
     ];
 
     let mut tools = Vec::new();
@@ -239,6 +254,7 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
     let has_find = has_tool("find");
     let has_ls = has_tool("ls");
     let has_read = has_tool("read");
+    let has_hashline_edit = has_tool("hashline_edit");
 
     let mut guidelines_list = Vec::new();
     if has_bash && !has_grep && !has_find && !has_ls {
@@ -256,6 +272,11 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
     }
     if has_edit {
         guidelines_list.push("Use edit for precise changes (old text must match exactly)");
+    }
+    if has_hashline_edit && has_read {
+        guidelines_list.push(
+            "For large files or complex multi-site edits, use read or grep with hashline=true to get LINE#HASH tags, then use hashline_edit for precise line-addressed edits",
+        );
     }
     if has_write {
         guidelines_list.push("Use write only for new files or complete rewrites");
@@ -360,6 +381,7 @@ pub fn select_model_and_thinking(
     let mut selected_model: Option<ModelEntry> = None;
     let mut scoped_thinking: Option<model::ThinkingLevel> = None;
     let mut fallback_message = None;
+    let mut deferred_restore_warning = None;
 
     if let (Some(provider), Some(model_id)) = (cli.provider.as_deref(), cli.model.as_deref()) {
         let found = registry
@@ -370,20 +392,36 @@ pub fn select_model_and_thinking(
         }
         selected_model = found;
     } else if let Some(provider) = cli.provider.as_deref() {
-        let mut candidates: Vec<ModelEntry> = registry
+        let candidates: Vec<ModelEntry> = registry
             .models()
             .iter()
-            .filter(|m| m.model.provider == provider)
+            .filter(|m| provider_ids_match(&m.model.provider, provider))
             .cloned()
             .collect();
         if candidates.is_empty() {
             bail!("No models available for provider {provider}");
         }
-        if let Some(found) = candidates.iter().find(|m| m.api_key.is_some()) {
-            selected_model = Some(found.clone());
+        let ready_candidates: Vec<ModelEntry> = candidates
+            .iter()
+            .filter(|entry| model_entry_is_ready(entry))
+            .cloned()
+            .collect();
+        let preferred_pool = if ready_candidates.is_empty() {
+            candidates.as_slice()
         } else {
-            selected_model = Some(candidates.remove(0));
-        }
+            ready_candidates.as_slice()
+        };
+        selected_model = config
+            .default_model
+            .as_deref()
+            .and_then(|default_model| registry.find(provider, default_model))
+            .filter(|found| {
+                preferred_pool.iter().any(|candidate| {
+                    candidate.model.id.eq_ignore_ascii_case(&found.model.id)
+                        && provider_ids_match(&candidate.model.provider, &found.model.provider)
+                })
+            })
+            .or_else(|| Some(default_model_from_candidates(preferred_pool)));
     } else if let Some(model_id) = cli.model.as_deref() {
         if let Some((provider, scoped_model_id)) = split_provider_model_spec(model_id) {
             selected_model = registry
@@ -395,7 +433,7 @@ pub fn select_model_and_thinking(
             let matches: Vec<ModelEntry> = registry
                 .models()
                 .iter()
-                .filter(|m| m.model.id == model_id)
+                .filter(|m| m.model.id.eq_ignore_ascii_case(model_id))
                 .cloned()
                 .collect();
             if matches.is_empty() {
@@ -404,18 +442,13 @@ pub fn select_model_and_thinking(
             if let Some(default_provider) = config.default_provider.as_deref() {
                 if let Some(found) = matches
                     .iter()
-                    .find(|m| m.model.provider == default_provider)
+                    .find(|m| provider_ids_match(&m.model.provider, default_provider))
                 {
                     selected_model = Some(found.clone());
                 }
             }
             if selected_model.is_none() {
-                if let Some(found) = matches.iter().find(|m| m.api_key.is_some()) {
-                    selected_model = Some(found.clone());
-                }
-            }
-            if selected_model.is_none() {
-                selected_model = Some(matches[0].clone());
+                selected_model = select_preferred_exact_id_match(&matches);
             }
         }
     } else if !scoped_models.is_empty() && !is_continuing {
@@ -424,7 +457,8 @@ pub fn select_model_and_thinking(
             config.default_model.as_deref(),
         ) {
             if let Some(found) = scoped_models.iter().find(|sm| {
-                sm.model.model.provider == default_provider && sm.model.model.id == default_model
+                provider_ids_match(&sm.model.model.provider, default_provider)
+                    && sm.model.model.id.eq_ignore_ascii_case(default_model)
             }) {
                 selected_model = Some(found.model.clone());
                 if cli.thinking.is_none() {
@@ -446,6 +480,7 @@ pub fn select_model_and_thinking(
             let restore = restore_model_from_session(&provider, &model_id, None, registry);
             selected_model = restore.model;
             fallback_message = restore.fallback_message;
+            deferred_restore_warning = restore.deferred_warning;
         }
     }
 
@@ -463,14 +498,89 @@ pub fn select_model_and_thinking(
     if selected_model.is_none() {
         let available = registry.get_available();
         if !available.is_empty() {
-            selected_model = Some(default_model_from_available(&available));
+            let fallback = default_model_from_available(&available);
+            if fallback_message.is_none() {
+                if let Some(warning) = deferred_restore_warning.take() {
+                    fallback_message = Some(format!(
+                        "{warning} Using {}/{}.",
+                        fallback.model.provider, fallback.model.id
+                    ));
+                }
+            }
+            selected_model = Some(fallback);
         }
+    }
+
+    // If we restored or defaulted into a model that requires credentials but has
+    // none configured, prefer falling back to any ready model instead of forcing
+    // an immediate setup prompt. (Explicit CLI selection should still error.)
+    let explicit_model_selection = cli.provider.is_some() || cli.model.is_some();
+    let missing_creds = if explicit_model_selection {
+        None
+    } else {
+        selected_model.as_ref().and_then(|entry| {
+            if model_entry_is_ready(entry) {
+                None
+            } else {
+                Some((entry.model.provider.clone(), entry.model.id.clone()))
+            }
+        })
+    };
+    if let Some((missing_provider, missing_model_id)) = missing_creds {
+        let available = registry.get_available();
+        if !available.is_empty() {
+            let fallback = default_model_from_available(&available);
+            if fallback_message.is_none() {
+                fallback_message = Some(format!(
+                    "Missing credentials for {missing_provider}/{missing_model_id}. Using {}/{} based on detected keys.",
+                    fallback.model.provider, fallback.model.id
+                ));
+            }
+            selected_model = Some(fallback);
+        } else if !registry.models().is_empty() {
+            // No detected keys anywhere, but we still want to pick a stable default
+            // so startup can guide the user through the correct login flow.
+            let fallback = default_model_from_catalog(registry.models());
+            if fallback_message.is_none() {
+                fallback_message = Some(format!(
+                    "Missing credentials for {missing_provider}/{missing_model_id}. Defaulting to {}/{} for setup.",
+                    fallback.model.provider, fallback.model.id
+                ));
+            }
+            selected_model = Some(fallback);
+        }
+    }
+
+    // If nothing was selected yet, default to our preferred catalog entry even
+    // when no credentials are configured. This keeps first-run UX consistent
+    // and avoids the misleading "No models configured" path when built-ins exist.
+    if selected_model.is_none() && !registry.models().is_empty() {
+        let fallback = default_model_from_catalog(registry.models());
+        if fallback_message.is_none() {
+            if let Some(warning) = deferred_restore_warning.take() {
+                fallback_message = Some(format!(
+                    "{warning} Defaulting to {}/{} for setup.",
+                    fallback.model.provider, fallback.model.id
+                ));
+            }
+        }
+        selected_model = Some(fallback);
     }
 
     let Some(model_entry) = selected_model else {
         let models_path = default_models_path(global_dir);
         return Err(StartupError::NoModelsAvailable { models_path }.into());
     };
+
+    if let Some(warning) = deferred_restore_warning.take() {
+        fallback_message = Some(match fallback_message.take() {
+            Some(message) => format!("{warning} {message}"),
+            None => format!(
+                "{warning} Using {}/{}.",
+                model_entry.model.provider, model_entry.model.id
+            ),
+        });
+    }
 
     let mut thinking_level: Option<model::ThinkingLevel> = None;
 
@@ -492,7 +602,7 @@ pub fn select_model_and_thinking(
     }
 
     let thinking_level =
-        model_entry.clamp_thinking_level(thinking_level.unwrap_or(model::ThinkingLevel::Medium));
+        model_entry.clamp_thinking_level(thinking_level.unwrap_or(model::ThinkingLevel::XHigh));
 
     Ok(ModelSelection {
         model_entry,
@@ -575,6 +685,7 @@ fn restore_model_from_session(
         return RestoreResult {
             model: restored,
             fallback_message: None,
+            deferred_warning: None,
         };
     }
 
@@ -587,6 +698,7 @@ fn restore_model_from_session(
                 "Could not restore model {saved_provider}/{saved_model_id} ({reason}). Using {}/{}.",
                 current.model.provider, current.model.id
             )),
+            deferred_warning: None,
         };
     }
 
@@ -599,53 +711,134 @@ fn restore_model_from_session(
                 "Could not restore model {saved_provider}/{saved_model_id} ({reason}). Using {}/{}.",
                 fallback.model.provider, fallback.model.id
             )),
+            deferred_warning: None,
         };
     }
 
     RestoreResult {
         model: None,
         fallback_message: None,
+        deferred_warning: Some(format!(
+            "Could not restore model {saved_provider}/{saved_model_id} ({reason})."
+        )),
     }
 }
 
 fn default_model_from_available(available: &[ModelEntry]) -> ModelEntry {
+    default_model_from_candidates(available)
+}
+
+fn default_model_from_catalog(models: &[ModelEntry]) -> ModelEntry {
+    default_model_from_candidates(models)
+}
+
+pub fn bootstrap_model_entry(registry: &ModelRegistry) -> Option<ModelEntry> {
+    let available = registry.get_available();
+    if !available.is_empty() {
+        return Some(default_model_from_available(&available));
+    }
+
+    (!registry.models().is_empty()).then(|| default_model_from_catalog(registry.models()))
+}
+
+fn select_preferred_exact_id_match(candidates: &[ModelEntry]) -> Option<ModelEntry> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let ready_candidates: Vec<ModelEntry> = candidates
+        .iter()
+        .filter(|entry| model_entry_is_ready(entry))
+        .cloned()
+        .collect();
+    let preferred_pool = if ready_candidates.is_empty() {
+        candidates
+    } else {
+        ready_candidates.as_slice()
+    };
+
+    Some(default_model_from_candidates(preferred_pool))
+}
+
+fn default_model_from_candidates(candidates: &[ModelEntry]) -> ModelEntry {
     let defaults = [
-        ("anthropic", "claude-opus-4-5"),
+        // Prefer Codex (ChatGPT OAuth) when available.
+        ("openai-codex", "gpt-5.4"),
+        ("openai-codex", "gpt-5.3-codex"),
+        ("openai-codex", "gpt-5.2-codex"),
+        ("openai-codex", "gpt-5.1-codex-max"),
+        // Fall back to OpenAI API when configured.
+        ("openai", "gpt-5.4"),
+        ("openai", "gpt-5.3-codex"),
+        ("openai", "gpt-5.2-codex"),
         ("openai", "gpt-5.1-codex"),
+        ("amazon-bedrock", "us.anthropic.claude-opus-4-20250514-v1:0"),
+        ("anthropic", "claude-opus-4-5"),
+        ("azure-openai-responses", "gpt-5.2"),
         ("google", "gemini-2.5-pro"),
+        ("google-gemini-cli", "gemini-2.5-pro"),
+        ("google-antigravity", "gemini-3-pro-high"),
+        ("google-vertex", "gemini-3-pro-preview"),
+        ("github-copilot", "gpt-4o"),
+        ("openrouter", "openai/gpt-5.1-codex"),
+        ("vercel-ai-gateway", "anthropic/claude-opus-4.5"),
+        ("xai", "grok-4-fast-non-reasoning"),
+        ("groq", "openai/gpt-oss-120b"),
+        ("cerebras", "zai-glm-4.6"),
+        ("zai", "glm-4.6"),
+        ("mistral", "devstral-medium-latest"),
+        ("minimax", "MiniMax-M2.5"),
+        ("minimax-cn", "MiniMax-M2.5"),
+        ("huggingface", "moonshotai/Kimi-K2.5"),
+        ("opencode", "claude-opus-4-6"),
+        ("kimi-coding", "kimi-k2-thinking"),
     ];
 
+    let canonical = |provider: &str| {
+        canonical_provider_id(provider)
+            .unwrap_or(provider)
+            .to_ascii_lowercase()
+    };
+
     for (provider, model_id) in defaults {
-        if let Some(found) = available
-            .iter()
-            .find(|m| m.model.provider == provider && m.model.id == model_id)
-        {
+        if let Some(found) = candidates.iter().find(|m| {
+            canonical(&m.model.provider) == canonical(provider)
+                && m.model.id.eq_ignore_ascii_case(model_id)
+        }) {
             return found.clone();
         }
     }
 
-    available[0].clone()
+    candidates[0].clone()
 }
 
-pub fn resolve_api_key(auth: &AuthStorage, cli: &cli::Cli, entry: &ModelEntry) -> Result<String> {
-    auth.resolve_api_key(&entry.model.provider, cli.api_key.as_deref())
-        .or_else(|| entry.api_key.clone())
-        .ok_or_else(|| {
-            StartupError::MissingApiKey {
-                provider: entry.model.provider.clone(),
-            }
-            .into()
-        })
+pub fn resolve_api_key(
+    auth: &AuthStorage,
+    cli: &cli::Cli,
+    entry: &ModelEntry,
+) -> Result<Option<String>> {
+    let key = normalize_api_key_opt(cli.api_key.clone())
+        .or_else(|| normalize_api_key_opt(auth.resolve_api_key(&entry.model.provider, None)))
+        .or_else(|| normalize_api_key_opt(entry.api_key.clone()));
+
+    if model_requires_configured_credential(entry) && key.is_none() {
+        return Err(StartupError::MissingApiKey {
+            provider: entry.model.provider.clone(),
+        }
+        .into());
+    }
+
+    Ok(key)
 }
 
 pub fn build_stream_options(
     config: &Config,
-    api_key: String,
+    api_key: Option<String>,
     selection: &ModelSelection,
     session: &Session,
 ) -> StreamOptions {
     let mut options = StreamOptions {
-        api_key: Some(api_key),
+        api_key,
         headers: selection.model_entry.headers.clone(),
         session_id: Some(session.header.id.clone()),
         ..Default::default()
@@ -810,20 +1003,10 @@ fn parse_model_pattern(pattern: &str, available_models: &[ModelEntry]) -> Parsed
     result
 }
 
-fn split_provider_model_spec(model_spec: &str) -> Option<(&str, &str)> {
-    let (provider, model_id) = model_spec.split_once('/')?;
-    let provider = provider.trim();
-    let model_id = model_id.trim();
-    if provider.is_empty() || model_id.is_empty() {
-        return None;
-    }
-    Some((provider, model_id))
-}
-
 fn try_match_model(pattern: &str, available_models: &[ModelEntry]) -> Option<ModelEntry> {
     if let Some((provider, model_id)) = split_provider_model_spec(pattern) {
         if let Some(found) = available_models.iter().find(|m| {
-            m.model.provider.eq_ignore_ascii_case(provider)
+            provider_ids_match(&m.model.provider, provider)
                 && m.model.id.eq_ignore_ascii_case(model_id)
         }) {
             return Some(found.clone());
@@ -834,11 +1017,13 @@ fn try_match_model(pattern: &str, available_models: &[ModelEntry]) -> Option<Mod
         }
     }
 
-    if let Some(found) = available_models
+    let exact_matches: Vec<ModelEntry> = available_models
         .iter()
-        .find(|m| m.model.id.eq_ignore_ascii_case(pattern))
-    {
-        return Some(found.clone());
+        .filter(|m| m.model.id.eq_ignore_ascii_case(pattern))
+        .cloned()
+        .collect();
+    if let Some(found) = select_preferred_exact_id_match(&exact_matches) {
+        return Some(found);
     }
 
     let pattern_lower = pattern.to_lowercase();
@@ -880,15 +1065,41 @@ fn is_alias(model_id: &str) -> bool {
         return true;
     }
 
+    // Check for OpenAI style: YYYY-MM-DD
+    let parts: Vec<&str> = model_id.split('-').collect();
+    if parts.len() >= 3 {
+        let y = parts[parts.len() - 3];
+        let m = parts[parts.len() - 2];
+        let d = parts[parts.len() - 1];
+        if y.len() == 4
+            && m.len() == 2
+            && d.len() == 2
+            && y.chars().all(|c| c.is_ascii_digit())
+            && m.chars().all(|c| c.is_ascii_digit())
+            && d.chars().all(|c| c.is_ascii_digit())
+        {
+            return false;
+        }
+    }
+
     let Some((_, date_suffix)) = model_id.rsplit_once('-') else {
         return true;
     };
 
-    date_suffix.len() != 8 || !date_suffix.chars().all(|c| c.is_ascii_digit())
+    if date_suffix.len() == 8 && date_suffix.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+
+    if date_suffix.len() == 4 && date_suffix.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+
+    true
 }
 
 fn models_equal(left: &ModelEntry, right: &ModelEntry) -> bool {
-    left.model.provider == right.model.provider && left.model.id == right.model.id
+    provider_ids_match(&left.model.provider, &right.model.provider)
+        && left.model.id.eq_ignore_ascii_case(&right.model.id)
 }
 
 pub fn output_final_text(message: &AssistantMessage) {
@@ -908,8 +1119,10 @@ mod tests {
     use std::collections::HashMap;
 
     use clap::Parser;
+    use tempfile::tempdir;
 
     use super::*;
+    use crate::auth::AuthStorage;
     use crate::provider::{InputType, Model, ModelCost};
 
     fn test_model_entry(id: &str, provider: &str, reasoning: bool) -> ModelEntry {
@@ -940,12 +1153,108 @@ mod tests {
         }
     }
 
+    fn registry_with_entries(entries: Vec<ModelEntry>) -> ModelRegistry {
+        let dir = tempdir().expect("tempdir");
+        let auth = AuthStorage::load(dir.path().join("auth.json")).expect("load auth");
+        let mut registry = ModelRegistry::load(&auth, None);
+        registry.merge_entries(entries);
+        registry
+    }
+
     #[test]
     fn parse_models_arg_splits_and_trims() {
         assert_eq!(
             parse_models_arg("gpt-4*, claude* ,,"),
             vec!["gpt-4*".to_string(), "claude*".to_string()]
         );
+    }
+
+    #[test]
+    fn default_model_from_available_prefers_azure_legacy_default() {
+        let available = vec![
+            test_model_entry("gpt-4o-mini", "azure-openai-responses", true),
+            test_model_entry("gpt-5.2", "azure-openai-responses", true),
+        ];
+
+        let selected = default_model_from_available(&available);
+        assert_eq!(selected.model.provider, "azure-openai-responses");
+        assert_eq!(selected.model.id, "gpt-5.2");
+    }
+
+    #[test]
+    fn default_model_from_available_applies_vercel_gateway_alias_mapping() {
+        let available = vec![
+            test_model_entry("gpt-4o-mini", "vercel", true),
+            test_model_entry("anthropic/claude-opus-4.5", "vercel", true),
+        ];
+
+        let selected = default_model_from_available(&available);
+        assert_eq!(selected.model.provider, "vercel");
+        assert_eq!(selected.model.id, "anthropic/claude-opus-4.5");
+    }
+
+    #[test]
+    fn resolve_api_key_allows_keyless_model_when_credentials_not_required() {
+        let dir = tempdir().expect("tempdir");
+        let auth = AuthStorage::load(dir.path().join("auth.json")).expect("load auth");
+        let mut entry = test_model_entry("llama3.2", "ollama", false);
+        entry.api_key = None;
+        entry.auth_header = false;
+
+        let cli = cli::Cli::parse_from(["pi"]);
+        let resolved = resolve_api_key(&auth, &cli, &entry).expect("resolve keyless model");
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_api_key_still_requires_credentials_for_remote_provider() {
+        let dir = tempdir().expect("tempdir");
+        let auth = AuthStorage::load(dir.path().join("auth.json")).expect("load auth");
+        let mut entry = test_model_entry("gpt-4o-mini", "openai", true);
+        entry.api_key = None;
+        entry.auth_header = true;
+
+        let cli = cli::Cli::parse_from(["pi"]);
+        let err = resolve_api_key(&auth, &cli, &entry).unwrap_err();
+        let startup = err
+            .downcast_ref::<StartupError>()
+            .expect("missing key should map to startup error");
+        assert!(matches!(
+            startup,
+            StartupError::MissingApiKey { provider } if provider == "openai"
+        ));
+    }
+
+    #[test]
+    fn default_model_from_available_applies_kimi_coding_alias_mapping() {
+        let available = vec![
+            test_model_entry("kimi-k2-instruct", "kimi-for-coding", true),
+            test_model_entry("kimi-k2-thinking", "kimi-for-coding", true),
+        ];
+
+        let selected = default_model_from_available(&available);
+        assert_eq!(selected.model.provider, "kimi-for-coding");
+        assert_eq!(selected.model.id, "kimi-k2-thinking");
+    }
+
+    #[test]
+    fn default_model_from_available_prefers_latest_openai_codex_default() {
+        let available = vec![
+            test_model_entry("gpt-5.3-codex", "openai-codex", true),
+            test_model_entry("gpt-5.4", "openai-codex", true),
+        ];
+
+        let selected = default_model_from_available(&available);
+        assert_eq!(selected.model.provider, "openai-codex");
+        assert_eq!(selected.model.id, "gpt-5.4");
+    }
+
+    #[test]
+    fn default_model_from_available_matches_default_id_case_insensitively() {
+        let available = vec![test_model_entry("GPT-5.4", "openai-codex", true)];
+        let selected = default_model_from_available(&available);
+        assert_eq!(selected.model.provider, "openai-codex");
+        assert_eq!(selected.model.id, "GPT-5.4");
     }
 
     #[test]
@@ -1014,6 +1323,339 @@ mod tests {
     }
 
     #[test]
+    fn try_match_model_prefers_existing_entry_for_provider_alias() {
+        let mut openrouter = test_model_entry("openai/gpt-4o-mini", "openrouter", true);
+        openrouter
+            .headers
+            .insert("x-test".to_string(), "1".to_string());
+
+        let matched = try_match_model("open-router/openai/gpt-4o-mini", &[openrouter.clone()])
+            .expect("provider alias should match existing entry");
+
+        assert_eq!(matched.model.provider, "openrouter");
+        assert_eq!(matched.model.id, "openai/gpt-4o-mini");
+        assert_eq!(
+            matched.headers.get("x-test").map(String::as_str),
+            Some("1"),
+            "must preserve existing model metadata instead of falling back to ad-hoc"
+        );
+    }
+
+    #[test]
+    fn select_model_and_thinking_provider_only_accepts_provider_alias() {
+        let cli = cli::Cli::parse_from(["pi", "--provider", "open-router"]);
+        let config = Config::default();
+        let session = Session::in_memory();
+        let registry = registry_with_entries(vec![test_model_entry(
+            "openai/gpt-4o-mini",
+            "openrouter",
+            true,
+        )]);
+
+        let selection =
+            select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
+                .expect("provider alias should resolve");
+
+        assert!(provider_ids_match(
+            &selection.model_entry.model.provider,
+            "open-router"
+        ));
+        assert!(!selection.model_entry.model.id.is_empty());
+    }
+
+    #[test]
+    fn select_model_and_thinking_provider_only_prefers_ready_model() {
+        let cli = cli::Cli::parse_from(["pi", "--provider", "acme"]);
+        let config = Config::default();
+        let session = Session::in_memory();
+
+        let mut unready_remote = test_model_entry("cloud-model", "acme", true);
+        unready_remote.api_key = None;
+        unready_remote.auth_header = true;
+
+        let mut keyless_ready = test_model_entry("local-model", "acme", false);
+        keyless_ready.api_key = None;
+        keyless_ready.auth_header = false;
+
+        let registry = registry_with_entries(vec![unready_remote, keyless_ready]);
+        let selection =
+            select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
+                .expect("provider selection should prefer ready models");
+
+        assert_eq!(selection.model_entry.model.provider, "acme");
+        assert_eq!(selection.model_entry.model.id, "local-model");
+    }
+
+    #[test]
+    fn select_model_and_thinking_provider_only_prefers_provider_default_over_registry_order() {
+        let cli = cli::Cli::parse_from(["pi", "--provider", "openai"]);
+        let config = Config::default();
+        let session = Session::in_memory();
+        let registry = registry_with_entries(vec![
+            test_model_entry("gpt-4o", "openai", true),
+            test_model_entry("gpt-5.4", "openai", true),
+        ]);
+
+        let selection =
+            select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
+                .expect("provider-only selection should honor preferred defaults");
+
+        assert_eq!(selection.model_entry.model.provider, "openai");
+        assert_eq!(selection.model_entry.model.id, "gpt-5.4");
+    }
+
+    #[test]
+    fn select_model_and_thinking_provider_only_honors_configured_default_model() {
+        let cli = cli::Cli::parse_from(["pi", "--provider", "openai"]);
+        let config = Config {
+            default_model: Some("gpt-4o-mini".to_string()),
+            ..Config::default()
+        };
+        let session = Session::in_memory();
+        let registry = registry_with_entries(vec![
+            test_model_entry("gpt-5.4", "openai", true),
+            test_model_entry("gpt-4o-mini", "openai", true),
+        ]);
+
+        let selection =
+            select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
+                .expect("provider-only selection should honor configured default_model");
+
+        assert_eq!(selection.model_entry.model.provider, "openai");
+        assert_eq!(selection.model_entry.model.id, "gpt-4o-mini");
+    }
+
+    #[test]
+    fn select_model_and_thinking_provider_only_skips_unready_configured_default_model() {
+        let cli = cli::Cli::parse_from(["pi", "--provider", "acme"]);
+        let config = Config {
+            default_model: Some("cloud-model".to_string()),
+            ..Config::default()
+        };
+        let session = Session::in_memory();
+
+        let mut unready_remote = test_model_entry("cloud-model", "acme", true);
+        unready_remote.api_key = None;
+        unready_remote.auth_header = true;
+
+        let mut keyless_ready = test_model_entry("local-model", "acme", false);
+        keyless_ready.api_key = None;
+        keyless_ready.auth_header = false;
+
+        let registry = registry_with_entries(vec![unready_remote, keyless_ready]);
+        let selection =
+            select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
+                .expect("provider-only selection should still prefer a ready model");
+
+        assert_eq!(selection.model_entry.model.provider, "acme");
+        assert_eq!(selection.model_entry.model.id, "local-model");
+    }
+
+    #[test]
+    fn select_model_and_thinking_preserves_restore_warning_when_defaulting_for_setup() {
+        let cli = cli::Cli::parse_from(["pi"]);
+        let config = Config::default();
+        let mut session = Session::in_memory();
+        session.append_model_change("missing-provider".to_string(), "missing-model".to_string());
+
+        let mut setup_default = test_model_entry("gpt-5.4", "openai-codex", true);
+        setup_default.api_key = None;
+        setup_default.auth_header = true;
+
+        let registry = registry_with_entries(vec![setup_default]);
+        let selection =
+            select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
+                .expect("selection should fall back to a stable setup model");
+
+        assert_eq!(selection.model_entry.model.provider, "openai-codex");
+        assert_eq!(selection.model_entry.model.id, "gpt-5.4");
+        assert_eq!(
+            selection.fallback_message.as_deref(),
+            Some(
+                "Could not restore model missing-provider/missing-model (model no longer exists). Defaulting to openai-codex/gpt-5.4 for setup."
+            )
+        );
+    }
+
+    #[test]
+    fn select_model_and_thinking_preserves_restore_warning_when_using_config_default() {
+        let cli = cli::Cli::parse_from(["pi"]);
+        let config = Config {
+            default_provider: Some("openai-codex".to_string()),
+            default_model: Some("gpt-4o-mini".to_string()),
+            ..Config::default()
+        };
+        let mut session = Session::in_memory();
+        session.append_model_change("missing-provider".to_string(), "missing-model".to_string());
+
+        let registry =
+            registry_with_entries(vec![test_model_entry("gpt-4o-mini", "openai-codex", true)]);
+        let selection =
+            select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
+                .expect("selection should use the configured default model");
+
+        assert_eq!(selection.model_entry.model.provider, "openai-codex");
+        assert_eq!(selection.model_entry.model.id, "gpt-4o-mini");
+        assert_eq!(
+            selection.fallback_message.as_deref(),
+            Some(
+                "Could not restore model missing-provider/missing-model (model no longer exists). Using openai-codex/gpt-4o-mini."
+            )
+        );
+    }
+
+    #[test]
+    fn select_model_and_thinking_model_only_prefers_default_provider_alias() {
+        let model_id = "__test-openrouter-alias-model__";
+        let cli = cli::Cli::parse_from(["pi", "--model", model_id]);
+        let config = Config {
+            default_provider: Some("open-router".to_string()),
+            ..Config::default()
+        };
+        let session = Session::in_memory();
+        let registry = registry_with_entries(vec![
+            test_model_entry(model_id, "openai", true),
+            test_model_entry(model_id, "openrouter", true),
+        ]);
+
+        let selection =
+            select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
+                .expect("default provider alias should resolve in model-only selection");
+
+        assert_eq!(selection.model_entry.model.provider, "openrouter");
+        assert_eq!(selection.model_entry.model.id, model_id);
+    }
+
+    #[test]
+    fn select_model_and_thinking_model_only_matches_case_insensitively() {
+        let model_id = "__test-case-insensitive-model__";
+        let cli = cli::Cli::parse_from(["pi", "--model", "__TEST-CASE-INSENSITIVE-MODEL__"]);
+        let config = Config::default();
+        let session = Session::in_memory();
+        let registry = registry_with_entries(vec![test_model_entry(model_id, "openai", true)]);
+
+        let selection =
+            select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
+                .expect("model-only selection should be case-insensitive");
+
+        assert_eq!(selection.model_entry.model.provider, "openai");
+        assert_eq!(selection.model_entry.model.id, model_id);
+    }
+
+    #[test]
+    fn select_model_and_thinking_model_only_prefers_openai_codex_for_duplicate_latest_id() {
+        let cli = cli::Cli::parse_from(["pi", "--model", "gpt-5.4"]);
+        let config = Config::default();
+        let session = Session::in_memory();
+        let registry = registry_with_entries(vec![
+            test_model_entry("gpt-5.4", "openai", true),
+            test_model_entry("gpt-5.4", "openai-codex", true),
+        ]);
+
+        let selection =
+            select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
+                .expect("duplicate exact-id matches should honor preferred provider ordering");
+
+        assert_eq!(selection.model_entry.model.provider, "openai-codex");
+        assert_eq!(selection.model_entry.model.id, "gpt-5.4");
+    }
+
+    #[test]
+    fn select_model_and_thinking_model_only_prefers_ready_duplicate_exact_id_match() {
+        let model_id = "__test-ready-duplicate-model__";
+        let cli = cli::Cli::parse_from(["pi", "--model", model_id]);
+        let config = Config {
+            default_provider: None,
+            ..Config::default()
+        };
+        let session = Session::in_memory();
+        let mut codex = test_model_entry(model_id, "openai-codex", true);
+        codex.api_key = None;
+        codex.auth_header = true;
+        let registry =
+            registry_with_entries(vec![test_model_entry(model_id, "openai", true), codex]);
+
+        let selection =
+            select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
+                .expect("duplicate exact-id matches should still prefer ready entries");
+
+        assert_eq!(selection.model_entry.model.provider, "openai");
+        assert_eq!(selection.model_entry.model.id, model_id);
+    }
+
+    #[test]
+    fn select_model_and_thinking_scoped_models_prefers_default_provider_alias() {
+        let cli = cli::Cli::parse_from(["pi"]);
+        let config = Config {
+            default_provider: Some("open-router".to_string()),
+            default_model: Some("gpt-4o-mini".to_string()),
+            ..Config::default()
+        };
+        let session = Session::in_memory();
+        let registry = registry_with_entries(Vec::new());
+        let scoped_models = vec![
+            ScopedModel {
+                model: test_model_entry("gpt-4o-mini", "openai", true),
+                thinking_level: None,
+            },
+            ScopedModel {
+                model: test_model_entry("gpt-4o-mini", "openrouter", true),
+                thinking_level: Some(model::ThinkingLevel::High),
+            },
+        ];
+
+        let selection = select_model_and_thinking(
+            &cli,
+            &config,
+            &session,
+            &registry,
+            &scoped_models,
+            Path::new("/tmp"),
+        )
+        .expect("scoped models should honor default provider alias");
+
+        assert_eq!(selection.model_entry.model.provider, "openrouter");
+        assert_eq!(selection.model_entry.model.id, "gpt-4o-mini");
+        assert_eq!(selection.thinking_level, model::ThinkingLevel::High);
+    }
+
+    #[test]
+    fn select_model_and_thinking_scoped_models_matches_default_model_case_insensitively() {
+        let cli = cli::Cli::parse_from(["pi"]);
+        let config = Config {
+            default_provider: Some("open-router".to_string()),
+            default_model: Some("GPT-4O-MINI".to_string()),
+            ..Config::default()
+        };
+        let session = Session::in_memory();
+        let registry = registry_with_entries(Vec::new());
+        let scoped_models = vec![
+            ScopedModel {
+                model: test_model_entry("gpt-4o-mini", "openrouter", true),
+                thinking_level: Some(model::ThinkingLevel::Low),
+            },
+            ScopedModel {
+                model: test_model_entry("gpt-4o", "openrouter", true),
+                thinking_level: Some(model::ThinkingLevel::High),
+            },
+        ];
+
+        let selection = select_model_and_thinking(
+            &cli,
+            &config,
+            &session,
+            &registry,
+            &scoped_models,
+            Path::new("/tmp"),
+        )
+        .expect("scoped default model should match case-insensitively");
+
+        assert_eq!(selection.model_entry.model.provider, "openrouter");
+        assert_eq!(selection.model_entry.model.id, "gpt-4o-mini");
+        assert_eq!(selection.thinking_level, model::ThinkingLevel::Low);
+    }
+
+    #[test]
     fn parse_model_pattern_picks_latest_dated_when_no_alias_exists() {
         let available = vec![
             test_model_entry("gpt-5.1-codex-20250101", "openai", true),
@@ -1048,6 +1690,21 @@ mod tests {
         assert_eq!(matched.model.id, "google/gemini-2.5-pro");
         assert_eq!(matched.model.api, "openai-completions");
         assert_eq!(matched.model.base_url, "https://openrouter.ai/api/v1");
+    }
+
+    #[test]
+    fn try_match_model_prefers_openai_codex_for_duplicate_exact_id_matches() {
+        let matched = try_match_model(
+            "gpt-5.4",
+            &[
+                test_model_entry("gpt-5.4", "openai", true),
+                test_model_entry("gpt-5.4", "openai-codex", true),
+            ],
+        )
+        .expect("duplicate exact-id matches should honor preferred provider ordering");
+
+        assert_eq!(matched.model.provider, "openai-codex");
+        assert_eq!(matched.model.id, "gpt-5.4");
     }
 
     #[test]
@@ -1286,8 +1943,8 @@ mod tests {
             #[test]
             fn is_alias_non_eight_digit_suffix(prefix in "[a-z]{1,6}", suffix in "[a-z0-9]{1,7}") {
                 let id = format!("{prefix}-{suffix}");
-                // Only 8 pure-digit suffixes are non-alias
-                if suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_digit()) {
+                let is_pure_digits = suffix.chars().all(|c| c.is_ascii_digit());
+                if is_pure_digits && (suffix.len() == 8 || suffix.len() == 4) {
                     assert!(!is_alias(&id));
                 } else {
                     assert!(is_alias(&id));
@@ -1342,6 +1999,13 @@ mod tests {
                     assert!(!models_equal(&a, &b));
                 }
             }
+        }
+
+        #[test]
+        fn models_equal_normalizes_provider_aliases_and_model_case() {
+            let left = test_model_entry("openai/gpt-4o-mini", "openrouter", true);
+            let right = test_model_entry("OPENAI/GPT-4O-MINI", "open-router", false);
+            assert!(models_equal(&left, &right));
         }
     }
 }

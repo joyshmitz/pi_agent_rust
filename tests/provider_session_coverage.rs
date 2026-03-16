@@ -174,6 +174,9 @@ fn known_provider_from_str_custom() {
 #[test]
 fn normalize_openai_base_appends_endpoint() {
     let cases = [
+        // Empty or whitespace uses default OpenAI endpoint
+        ("", "https://api.openai.com/v1/chat/completions"),
+        ("   ", "https://api.openai.com/v1/chat/completions"),
         // Base with /v1 gets /chat/completions appended
         (
             "https://api.openai.com/v1/",
@@ -181,6 +184,15 @@ fn normalize_openai_base_appends_endpoint() {
         ),
         (
             "https://api.openai.com/v1",
+            "https://api.openai.com/v1/chat/completions",
+        ),
+        // Bare official OpenAI origin gets /v1/chat/completions appended
+        (
+            "https://api.openai.com",
+            "https://api.openai.com/v1/chat/completions",
+        ),
+        (
+            "https://api.openai.com/",
             "https://api.openai.com/v1/chat/completions",
         ),
         // Already has /chat/completions - kept as-is
@@ -212,6 +224,9 @@ fn normalize_openai_base_appends_endpoint() {
 #[test]
 fn normalize_openai_responses_base_appends_endpoint() {
     let cases = [
+        // Empty or whitespace uses default OpenAI endpoint
+        ("", "https://api.openai.com/v1/responses"),
+        ("  ", "https://api.openai.com/v1/responses"),
         // Already has /responses - kept as-is
         (
             "https://api.openai.com/v1/responses",
@@ -225,6 +240,15 @@ fn normalize_openai_responses_base_appends_endpoint() {
         // /v1 gets /responses appended
         (
             "https://api.openai.com/v1",
+            "https://api.openai.com/v1/responses",
+        ),
+        // Bare official OpenAI origin gets /v1/responses appended
+        (
+            "https://api.openai.com",
+            "https://api.openai.com/v1/responses",
+        ),
+        (
+            "https://api.openai.com/",
             "https://api.openai.com/v1/responses",
         ),
         // /chat/completions suffix stripped, then /responses appended
@@ -246,6 +270,9 @@ fn normalize_openai_responses_base_appends_endpoint() {
 #[test]
 fn normalize_cohere_base_appends_endpoint() {
     let cases = [
+        // Empty or whitespace uses default Cohere endpoint
+        ("", "https://api.cohere.com/v2/chat"),
+        (" \t ", "https://api.cohere.com/v2/chat"),
         // Already has /chat - kept as-is
         (
             "https://api.cohere.com/v2/chat",
@@ -256,10 +283,10 @@ fn normalize_cohere_base_appends_endpoint() {
             "https://api.cohere.com/v2",
             "https://api.cohere.com/v2/chat",
         ),
-        // Bare URL gets /chat appended
-        ("https://api.cohere.com", "https://api.cohere.com/chat"),
-        // Trailing slash stripped, then /chat appended
-        ("https://api.cohere.com/", "https://api.cohere.com/chat"),
+        // Bare official Cohere origin gets /v2/chat appended
+        ("https://api.cohere.com", "https://api.cohere.com/v2/chat"),
+        // Trailing slash stripped, then /v2/chat appended
+        ("https://api.cohere.com/", "https://api.cohere.com/v2/chat"),
     ];
     for (input, expected) in &cases {
         let result = normalize_cohere_base(input);

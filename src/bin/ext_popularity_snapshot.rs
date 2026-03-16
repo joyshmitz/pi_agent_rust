@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
@@ -239,7 +239,11 @@ fn resolve_github_token(env_name: &str) -> Option<String> {
         }
     }
 
-    let output = Command::new("gh").args(["auth", "token"]).output().ok()?;
+    let output = Command::new("gh")
+        .args(["auth", "token"])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -487,6 +491,7 @@ fn fetch_npm_registry_meta_via_curl(package: &str) -> Result<Option<NpmRegistryM
 
 fn fetch_url_via_curl(url: &str) -> Result<(u16, String)> {
     let output = Command::new("curl")
+        .stdin(Stdio::null())
         .arg("--silent")
         .arg("--show-error")
         .arg("--location")
@@ -568,6 +573,7 @@ fn fetch_github_repo_metrics_via_gh(
 ) -> Result<Option<GitHubRepoMetrics>> {
     let endpoint = format!("repos/{}/{}", repo.owner, repo.repo);
     let output = Command::new("gh")
+        .stdin(Stdio::null())
         .arg("api")
         .arg("--method")
         .arg("GET")

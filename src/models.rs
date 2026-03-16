@@ -7,8 +7,10 @@ use crate::provider_metadata::{
     ProviderRoutingDefaults, canonical_provider_id, provider_routing_defaults,
 };
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -28,7 +30,12 @@ impl ModelEntry {
     pub fn supports_xhigh(&self) -> bool {
         matches!(
             self.model.id.as_str(),
-            "gpt-5.1-codex-max" | "gpt-5.2" | "gpt-5.2-codex"
+            "gpt-5.1-codex-max"
+                | "gpt-5.2"
+                | "gpt-5.4"
+                | "gpt-5.2-codex"
+                | "gpt-5.3-codex"
+                | "gpt-5.3-codex-spark"
         )
     }
 
@@ -93,7 +100,7 @@ pub struct ModelConfig {
     pub compat: Option<CompatConfig>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompatConfig {
     // ── Capability flags ────────────────────────────────────────────────
@@ -135,7 +142,7 @@ pub struct ModelAutocompleteCandidate {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LegacyGeneratedModel {
     id: String,
@@ -171,6 +178,7 @@ const GOOGLE_ANTIGRAVITY_API_URL: &str = "https://daily-cloudcode-pa.sandbox.goo
 static LEGACY_GENERATED_MODELS_CACHE: OnceLock<Vec<LegacyGeneratedModel>> = OnceLock::new();
 static UPSTREAM_PROVIDER_MODEL_IDS_CACHE: OnceLock<HashMap<String, Vec<String>>> = OnceLock::new();
 static MODEL_AUTOCOMPLETE_CACHE: OnceLock<Vec<ModelAutocompleteCandidate>> = OnceLock::new();
+static MODEL_CATALOG_CACHE_FINGERPRINT: OnceLock<u64> = OnceLock::new();
 static SATISFIES_RE: OnceLock<Regex> = OnceLock::new();
 const INPUT_TEXT_ONLY: [InputType; 1] = [InputType::Text];
 const INPUT_TEXT_AND_IMAGE: [InputType; 2] = [InputType::Text, InputType::Image];
@@ -192,6 +200,16 @@ fn canonicalize_model_id_for_provider(provider: &str, model_id: &str) -> String 
         return canonicalize_openrouter_model_id(model_id);
     }
     model_id.trim().to_string()
+}
+
+fn normalized_registry_key(provider: &str, model_id: &str) -> (String, String) {
+    let provider = provider.trim();
+    let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
+    let canonical_model_id = canonicalize_model_id_for_provider(canonical_provider, model_id);
+    (
+        canonical_provider.to_ascii_lowercase(),
+        canonical_model_id.to_ascii_lowercase(),
+    )
 }
 
 fn openrouter_model_lookup_ids(model_id: &str) -> Vec<String> {
@@ -224,7 +242,56 @@ fn parse_input_types(input: &[String]) -> Vec<InputType> {
         .collect()
 }
 
+fn legacy_generated_models_cache_path() -> Option<PathBuf> {
+    let checksum = crc32c::crc32c(LEGACY_MODELS_GENERATED_TS.as_bytes());
+    dirs::cache_dir().map(|dir| {
+        dir.join("pi")
+            .join("models-cache")
+            .join(format!("legacy-generated-models-{checksum:08x}.json"))
+    })
+}
+
+fn load_legacy_generated_models_cache() -> Option<Vec<LegacyGeneratedModel>> {
+    let path = legacy_generated_models_cache_path()?;
+    let cache = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<Vec<LegacyGeneratedModel>>(&cache).ok()
+}
+
+fn persist_legacy_generated_models_cache(models: &[LegacyGeneratedModel]) {
+    let Some(path) = legacy_generated_models_cache_path() else {
+        return;
+    };
+    if path.exists() {
+        return;
+    }
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+
+    let temp_path = path.with_extension(format!("tmp-{}", std::process::id()));
+    let Ok(file) = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+    else {
+        return;
+    };
+    let mut writer = std::io::BufWriter::new(file);
+    if serde_json::to_writer(&mut writer, models).is_ok() && writer.flush().is_ok() {
+        let _ = fs::rename(&temp_path, path);
+    } else {
+        let _ = fs::remove_file(&temp_path);
+    }
+}
+
 fn parse_legacy_generated_models() -> Vec<LegacyGeneratedModel> {
+    if let Some(cached) = load_legacy_generated_models_cache() {
+        return cached;
+    }
+
     let Some(models_decl_start) = LEGACY_MODELS_GENERATED_TS.find("export const MODELS =") else {
         tracing::warn!("Legacy model catalog missing MODELS declaration");
         return Vec::new();
@@ -234,10 +301,12 @@ fn parse_legacy_generated_models() -> Vec<LegacyGeneratedModel> {
         return Vec::new();
     };
     let object_start = models_decl_start + object_start_rel;
-    let Some(end_marker) = LEGACY_MODELS_GENERATED_TS.rfind("} as const;") else {
+    let Some(end_marker_rel) = LEGACY_MODELS_GENERATED_TS[object_start..].rfind("} as const;")
+    else {
         tracing::warn!("Legacy model catalog missing end marker");
         return Vec::new();
     };
+    let end_marker = object_start + end_marker_rel;
 
     let mut object_source = LEGACY_MODELS_GENERATED_TS[object_start..=end_marker]
         .trim_end_matches(" as const;")
@@ -266,6 +335,7 @@ fn parse_legacy_generated_models() -> Vec<LegacyGeneratedModel> {
             .then_with(|| a.id.cmp(&b.id))
             .then_with(|| a.api.cmp(&b.api))
     });
+    persist_legacy_generated_models_cache(&models);
     models
 }
 
@@ -343,16 +413,73 @@ pub fn model_autocomplete_candidates() -> &'static [ModelAutocompleteCandidate] 
                 slug: "anthropic/claude-sonnet-4-6".to_string(),
                 description: Some("Claude Sonnet 4.6".to_string()),
             });
-            candidates.sort_by(|a, b| a.slug.cmp(&b.slug));
+            candidates.push(ModelAutocompleteCandidate {
+                slug: "openai/gpt-5.4".to_string(),
+                description: Some("GPT-5.4".to_string()),
+            });
+            candidates.push(ModelAutocompleteCandidate {
+                slug: "openai-codex/gpt-5.4".to_string(),
+                description: Some("GPT-5.4 Codex".to_string()),
+            });
+            candidates.sort_by_key(|candidate| candidate.slug.to_ascii_lowercase());
             candidates.dedup_by(|a, b| a.slug.eq_ignore_ascii_case(&b.slug));
             candidates
         })
         .as_slice()
 }
 
+pub fn model_catalog_cache_fingerprint() -> u64 {
+    *MODEL_CATALOG_CACHE_FINGERPRINT.get_or_init(|| {
+        let legacy = u64::from(crc32c::crc32c(LEGACY_MODELS_GENERATED_TS.as_bytes()));
+        let upstream = u64::from(crc32c::crc32c(UPSTREAM_PROVIDER_MODEL_IDS_JSON.as_bytes()));
+        (legacy << 32) | upstream
+    })
+}
+
+pub(crate) fn normalize_api_key_opt(api_key: Option<String>) -> Option<String> {
+    api_key.and_then(|key| {
+        let trimmed = key.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+}
+
+pub(crate) fn model_requires_configured_credential(entry: &ModelEntry) -> bool {
+    let provider = entry.model.provider.as_str();
+    entry.auth_header
+        || crate::provider_metadata::provider_metadata(provider)
+            .is_some_and(|meta| !meta.auth_env_keys.is_empty())
+        || entry.oauth_config.is_some()
+}
+
+pub(crate) fn model_entry_is_ready(entry: &ModelEntry) -> bool {
+    !model_requires_configured_credential(entry)
+        || entry
+            .api_key
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelRegistryLoadMode {
+    Full,
+    ListingLite,
+}
+
 impl ModelRegistry {
     pub fn load(auth: &AuthStorage, models_path: Option<PathBuf>) -> Self {
-        let mut models = built_in_models(auth);
+        Self::load_with_mode(auth, models_path, ModelRegistryLoadMode::Full)
+    }
+
+    pub fn load_for_listing(auth: &AuthStorage, models_path: Option<PathBuf>) -> Self {
+        Self::load_with_mode(auth, models_path, ModelRegistryLoadMode::ListingLite)
+    }
+
+    fn load_with_mode(
+        auth: &AuthStorage,
+        models_path: Option<PathBuf>,
+        mode: ModelRegistryLoadMode,
+    ) -> Self {
+        let mut models = built_in_models(auth, mode);
         let mut error = None;
 
         if let Some(path) = models_path {
@@ -362,7 +489,7 @@ impl ModelRegistry {
                     .and_then(|s| serde_json::from_str::<ModelsConfig>(&s).map_err(Error::from))
                 {
                     Ok(config) => {
-                        apply_custom_models(auth, &mut models, &config);
+                        apply_custom_models(auth, &mut models, &config, path.parent());
                     }
                     Err(e) => {
                         error = Some(format!("{e}\n\nFile: {}", path.display()));
@@ -382,22 +509,28 @@ impl ModelRegistry {
         self.error.as_deref()
     }
 
-    pub fn get_available(&self) -> Vec<ModelEntry> {
+    pub fn available_models(&self) -> Vec<&ModelEntry> {
         self.models
             .iter()
-            .filter(|&m| m.api_key.is_some())
-            .cloned()
+            .filter(|m| model_entry_is_ready(m))
             .collect()
+    }
+
+    pub fn get_available(&self) -> Vec<ModelEntry> {
+        self.available_models().into_iter().cloned().collect()
     }
 
     pub fn find(&self, provider: &str, id: &str) -> Option<ModelEntry> {
         let provider = provider.trim();
         let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
-        let lookup_ids = if canonical_provider.eq_ignore_ascii_case("openrouter") {
+        let is_openrouter = canonical_provider.eq_ignore_ascii_case("openrouter");
+        // Avoid Vec + String allocation for the common (non-OpenRouter) path.
+        let openrouter_ids = if is_openrouter {
             openrouter_model_lookup_ids(id)
         } else {
-            vec![id.trim().to_string()]
+            Vec::new()
         };
+        let trimmed_id = id.trim();
 
         self.models
             .iter()
@@ -410,32 +543,180 @@ impl ModelRegistry {
                     || model_provider_canonical.eq_ignore_ascii_case(provider)
                     || model_provider_canonical.eq_ignore_ascii_case(canonical_provider);
                 provider_matches
-                    && lookup_ids
-                        .iter()
-                        .any(|lookup_id| m.model.id.eq_ignore_ascii_case(lookup_id))
+                    && if is_openrouter {
+                        openrouter_ids
+                            .iter()
+                            .any(|lookup_id| m.model.id.eq_ignore_ascii_case(lookup_id))
+                    } else {
+                        m.model.id.eq_ignore_ascii_case(trimmed_id)
+                    }
             })
             .cloned()
     }
 
     /// Find a model by ID alone (ignoring provider), useful for extension models
     /// where the provider name may be custom.
+    ///
+    /// When multiple providers carry the same model ID, the canonical/primary
+    /// provider is preferred (e.g. `anthropic` for Claude models, `openai` for
+    /// GPT models). If no canonical match exists, the first alphabetical
+    /// provider wins, ensuring deterministic results regardless of insertion
+    /// order.
     pub fn find_by_id(&self, id: &str) -> Option<ModelEntry> {
-        self.models.iter().find(|m| m.model.id == id).cloned()
+        let id = id.trim();
+        let mut best: Option<&ModelEntry> = None;
+        for entry in &self.models {
+            if !entry.model.id.eq_ignore_ascii_case(id) {
+                continue;
+            }
+            let Some(current_best) = best else {
+                best = Some(entry);
+                continue;
+            };
+            let entry_canonical = is_canonical_provider_for_model(id, &entry.model.provider);
+            let best_canonical = is_canonical_provider_for_model(id, &current_best.model.provider);
+            if entry_canonical && !best_canonical {
+                best = Some(entry);
+            } else if entry_canonical == best_canonical
+                && entry.model.provider < current_best.model.provider
+            {
+                // Tie-break alphabetically for determinism.
+                best = Some(entry);
+            }
+        }
+        best.cloned()
     }
 
     /// Merge extension-provided model entries into the registry.
     pub fn merge_entries(&mut self, entries: Vec<ModelEntry>) {
         for entry in entries {
-            // Skip duplicates (same provider + id).
+            // Skip duplicates (canonical provider + canonical model id, case-insensitive).
+            let entry_key = normalized_registry_key(&entry.model.provider, &entry.model.id);
             let exists = self
                 .models
                 .iter()
-                .any(|m| m.model.provider == entry.model.provider && m.model.id == entry.model.id);
+                .any(|m| normalized_registry_key(&m.model.provider, &m.model.id) == entry_key);
             if !exists {
                 self.models.push(entry);
             }
         }
     }
+}
+
+/// Returns `true` when `provider` is the canonical/primary source for a model
+/// identified by `model_id`. Used by `find_by_id` to prefer the authoritative
+/// provider when the same model ID appears under multiple resellers.
+fn is_canonical_provider_for_model(model_id: &str, provider: &str) -> bool {
+    let id_lower = model_id.to_ascii_lowercase();
+    let prov_lower = provider.to_ascii_lowercase();
+    if id_lower.starts_with("claude") {
+        prov_lower == "anthropic"
+    } else if id_lower.starts_with("gpt-")
+        || id_lower.starts_with("o1")
+        || id_lower.starts_with("o3")
+        || id_lower.starts_with("o4")
+    {
+        prov_lower == "openai"
+    } else if id_lower.starts_with("gemini") {
+        prov_lower == "google"
+    } else if id_lower.starts_with("command") {
+        prov_lower == "cohere"
+    } else if id_lower.starts_with("mistral") || id_lower.starts_with("codestral") {
+        prov_lower == "mistral"
+    } else if id_lower.starts_with("deepseek") {
+        prov_lower == "deepseek"
+    } else {
+        false
+    }
+}
+
+/// Determine per-model reasoning capability. Returns `Some(true/false)` for
+/// known model ID patterns, `None` for unknown models (caller should fall back
+/// to the provider-level default).
+///
+/// This prevents non-reasoning models like `gpt-4o` from inheriting a
+/// provider-level `reasoning: true` flag from their provider (Issue #19).
+fn model_is_reasoning(model_id: &str) -> Option<bool> {
+    let id = model_id.to_ascii_lowercase();
+
+    // OpenAI: o1/o3/o4 series and gpt-5.x are reasoning.
+    // All gpt-4 variants (gpt-4o, gpt-4-turbo, gpt-4-0613, etc.) and gpt-3.5 are NOT.
+    if id.starts_with("o1") || id.starts_with("o3") || id.starts_with("o4") {
+        return Some(true);
+    }
+    if id.starts_with("gpt-5") {
+        return Some(true);
+    }
+    if id.starts_with("gpt-4") || id.starts_with("gpt-3.5") {
+        return Some(false);
+    }
+
+    // Anthropic: Claude 3.5 Sonnet and Claude 4+ support extended thinking.
+    // Claude 3 (Haiku/Sonnet/Opus) and Claude 3.5 Haiku do NOT.
+    if id.starts_with("claude-3-5-haiku")
+        || id.starts_with("claude-3-haiku")
+        || id.starts_with("claude-3-sonnet")
+        || id.starts_with("claude-3-opus")
+    {
+        return Some(false);
+    }
+    if id.starts_with("claude") {
+        // Claude 3.5 Sonnet, Claude 4.x, Claude Opus 4+, Claude Sonnet 4+ etc.
+        return Some(true);
+    }
+
+    // Google: gemini-2.5+ and gemini-2.0-flash-thinking are reasoning.
+    // All other gemini models (2.0-flash, 2.0-flash-lite, 1.x, etc.) are NOT.
+    if id.starts_with("gemini-2.5")
+        || id.starts_with("gemini-3")
+        || id.starts_with("gemini-2.0-flash-thinking")
+    {
+        return Some(true);
+    }
+    if id.starts_with("gemini") {
+        return Some(false);
+    }
+
+    // Cohere: command-a is reasoning; command-r is not.
+    if id.starts_with("command-a") {
+        return Some(true);
+    }
+    if id.starts_with("command-r") {
+        return Some(false);
+    }
+
+    // DeepSeek: deepseek-reasoner (R1) is reasoning; deepseek-chat (V3) and others are not.
+    if id.starts_with("deepseek-reasoner") || id.starts_with("deepseek-r") {
+        return Some(true);
+    }
+    if id.starts_with("deepseek") {
+        return Some(false);
+    }
+
+    // Qwen: qwq- series are reasoning.
+    if id.starts_with("qwq-") {
+        return Some(true);
+    }
+
+    // Mistral/Codestral: no reasoning support currently.
+    if id.starts_with("mistral") || id.starts_with("codestral") || id.starts_with("pixtral") {
+        return Some(false);
+    }
+
+    // Meta Llama: no reasoning support.
+    if id.starts_with("llama") {
+        return Some(false);
+    }
+
+    // Groq-hosted models: groq model IDs typically include the upstream model name
+    // (e.g., "llama-3.3-70b-versatile"), so the upstream checks above should catch them.
+    None
+}
+
+/// Resolve the effective reasoning flag for a model, preferring per-model
+/// detection over the provider-level default.
+fn effective_reasoning(model_id: &str, provider_default: bool) -> bool {
+    model_is_reasoning(model_id).unwrap_or(provider_default)
 }
 
 fn native_adapter_seed_defaults(provider: &str) -> Option<AdHocProviderDefaults> {
@@ -449,8 +730,17 @@ fn native_adapter_seed_defaults(provider: &str) -> Option<AdHocProviderDefaults>
             context_window: 128_000,
             max_tokens: 16_384,
         }),
-        "github-copilot" | "gitlab" | "sap-ai-core" => Some(AdHocProviderDefaults {
+        "github-copilot" | "sap-ai-core" => Some(AdHocProviderDefaults {
             api: "openai-completions",
+            base_url: "",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT_ONLY,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        "gitlab" => Some(AdHocProviderDefaults {
+            api: "gitlab-chat",
             base_url: "",
             auth_header: true,
             reasoning: true,
@@ -474,10 +764,35 @@ fn legacy_provider_ids() -> HashSet<String> {
         .collect()
 }
 
+fn resolve_provider_api_key_cached(
+    auth: &AuthStorage,
+    canonical_provider: &str,
+    provider: &str,
+    canonical_cache: &mut HashMap<String, Option<String>>,
+    provider_cache: &mut HashMap<String, Option<String>>,
+) -> Option<String> {
+    let canonical_key = canonical_provider.to_ascii_lowercase();
+    let canonical_result = canonical_cache
+        .entry(canonical_key)
+        .or_insert_with(|| auth.resolve_api_key(canonical_provider, None))
+        .clone();
+
+    if canonical_result.is_some() || canonical_provider.eq_ignore_ascii_case(provider) {
+        return canonical_result;
+    }
+
+    provider_cache
+        .entry(provider.to_ascii_lowercase())
+        .or_insert_with(|| auth.resolve_api_key(provider, None))
+        .clone()
+}
+
 fn append_upstream_nonlegacy_models(
     auth: &AuthStorage,
     models: &mut Vec<ModelEntry>,
     seen: &mut HashSet<String>,
+    canonical_api_key_cache: &mut HashMap<String, Option<String>>,
+    provider_api_key_cache: &mut HashMap<String, Option<String>>,
 ) {
     let legacy_providers = legacy_provider_ids();
     for (provider, ids) in upstream_provider_model_ids() {
@@ -496,13 +811,13 @@ fn append_upstream_nonlegacy_models(
             continue;
         };
 
-        let api_key = auth.resolve_api_key(canonical_provider, None).or_else(|| {
-            if canonical_provider.eq_ignore_ascii_case(provider) {
-                None
-            } else {
-                auth.resolve_api_key(provider, None)
-            }
-        });
+        let api_key = resolve_provider_api_key_cached(
+            auth,
+            canonical_provider,
+            provider,
+            canonical_api_key_cache,
+            provider_api_key_cache,
+        );
 
         for model_id in ids {
             let normalized_model_id =
@@ -519,14 +834,15 @@ fn append_upstream_nonlegacy_models(
                 continue;
             }
 
+            let reasoning = effective_reasoning(&normalized_model_id, defaults.reasoning);
             models.push(ModelEntry {
                 model: Model {
                     id: normalized_model_id.clone(),
-                    name: normalized_model_id,
+                    name: normalized_model_id.clone(),
                     api: defaults.api.to_string(),
                     provider: canonical_provider.to_string(),
                     base_url: defaults.base_url.to_string(),
-                    reasoning: defaults.reasoning,
+                    reasoning,
                     input: defaults.input.to_vec(),
                     cost: ModelCost {
                         input: 0.0,
@@ -549,9 +865,11 @@ fn append_upstream_nonlegacy_models(
 }
 
 #[allow(clippy::too_many_lines)]
-fn built_in_models(auth: &AuthStorage) -> Vec<ModelEntry> {
-    let mut models = Vec::new();
+fn built_in_models(auth: &AuthStorage, mode: ModelRegistryLoadMode) -> Vec<ModelEntry> {
+    let mut models = Vec::with_capacity(legacy_generated_models().len() + 8);
     let mut seen = HashSet::new();
+    let mut canonical_api_key_cache: HashMap<String, Option<String>> = HashMap::new();
+    let mut provider_api_key_cache: HashMap<String, Option<String>> = HashMap::new();
 
     for legacy in legacy_generated_models() {
         let provider = legacy.provider.trim();
@@ -574,19 +892,27 @@ fn built_in_models(auth: &AuthStorage) -> Vec<ModelEntry> {
         }
 
         let routing_defaults = provider_routing_defaults(provider);
-        let parsed_api: Api = legacy
-            .api
-            .parse()
-            .unwrap_or_else(|_| Api::Custom(legacy.api.clone()));
-        let api_string = parsed_api.to_string();
+        let api_string = if mode == ModelRegistryLoadMode::Full {
+            legacy
+                .api
+                .parse::<Api>()
+                .unwrap_or_else(|_| Api::Custom(legacy.api.clone()))
+                .to_string()
+        } else {
+            legacy.api.clone()
+        };
 
-        let base_url = if !legacy.base_url.trim().is_empty() {
-            legacy.base_url.trim().to_string()
-        } else if let Some(default_base) = routing_defaults
-            .map(|defaults| defaults.base_url)
-            .or_else(|| api_fallback_base_url(api_string.as_str()))
-        {
-            default_base.to_string()
+        let base_url = if mode == ModelRegistryLoadMode::Full {
+            if !legacy.base_url.trim().is_empty() {
+                legacy.base_url.trim().to_string()
+            } else if let Some(default_base) = routing_defaults
+                .map(|defaults| defaults.base_url)
+                .or_else(|| api_fallback_base_url(api_string.as_str()))
+            {
+                default_base.to_string()
+            } else {
+                String::new()
+            }
         } else {
             String::new()
         };
@@ -607,50 +933,77 @@ fn built_in_models(auth: &AuthStorage) -> Vec<ModelEntry> {
         };
 
         let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
-        let api_key = auth.resolve_api_key(canonical_provider, None).or_else(|| {
-            if canonical_provider.eq_ignore_ascii_case(provider) {
-                None
-            } else {
-                auth.resolve_api_key(provider, None)
-            }
-        });
+        let api_key = resolve_provider_api_key_cached(
+            auth,
+            canonical_provider,
+            provider,
+            &mut canonical_api_key_cache,
+            &mut provider_api_key_cache,
+        );
+
+        let default_cost = ModelCost {
+            input: 0.0,
+            output: 0.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+        };
+        let model_name = if mode == ModelRegistryLoadMode::Full && !legacy.name.trim().is_empty() {
+            legacy.name.clone()
+        } else {
+            normalized_model_id.clone()
+        };
+        let model_headers = if mode == ModelRegistryLoadMode::Full {
+            legacy.headers.clone()
+        } else {
+            HashMap::new()
+        };
+        let entry_headers = if mode == ModelRegistryLoadMode::Full {
+            legacy.headers.clone()
+        } else {
+            HashMap::new()
+        };
 
         models.push(ModelEntry {
             model: Model {
                 id: normalized_model_id.clone(),
-                name: if legacy.name.trim().is_empty() {
-                    normalized_model_id
-                } else {
-                    legacy.name.clone()
-                },
+                name: model_name,
                 api: api_string,
                 provider: provider.to_string(),
                 base_url,
-                reasoning: legacy.reasoning,
+                reasoning: effective_reasoning(&normalized_model_id, legacy.reasoning),
                 input,
-                cost: legacy.cost.clone().unwrap_or(ModelCost {
-                    input: 0.0,
-                    output: 0.0,
-                    cache_read: 0.0,
-                    cache_write: 0.0,
-                }),
+                cost: if mode == ModelRegistryLoadMode::Full {
+                    legacy.cost.clone().unwrap_or_else(|| default_cost.clone())
+                } else {
+                    default_cost
+                },
                 context_window: legacy.context_window.unwrap_or_else(|| {
                     routing_defaults.map_or(128_000, |defaults| defaults.context_window)
                 }),
                 max_tokens: legacy.max_tokens.unwrap_or_else(|| {
                     routing_defaults.map_or(16_384, |defaults| defaults.max_tokens)
                 }),
-                headers: legacy.headers.clone(),
+                headers: model_headers,
             },
             api_key,
-            headers: legacy.headers.clone(),
+            headers: entry_headers,
             auth_header,
-            compat: legacy.compat.clone(),
+            compat: if mode == ModelRegistryLoadMode::Full {
+                legacy.compat.clone()
+            } else {
+                None
+            },
             oauth_config: None,
         });
     }
 
-    append_upstream_nonlegacy_models(auth, &mut models, &mut seen);
+    append_upstream_nonlegacy_models(
+        auth,
+        &mut models,
+        &mut seen,
+        &mut canonical_api_key_cache,
+        &mut provider_api_key_cache,
+    );
 
     // Ensure the latest Sonnet alias is present in built-ins.
     if !models.iter().any(|entry| {
@@ -662,9 +1015,17 @@ fn built_in_models(auth: &AuthStorage) -> Vec<ModelEntry> {
             model: Model {
                 id: "claude-sonnet-4-6".to_string(),
                 name: "Claude Sonnet 4.6".to_string(),
-                api: Api::AnthropicMessages.to_string(),
+                api: if mode == ModelRegistryLoadMode::Full {
+                    Api::AnthropicMessages.to_string()
+                } else {
+                    "anthropic-messages".to_string()
+                },
                 provider: "anthropic".to_string(),
-                base_url: "https://api.anthropic.com/v1/messages".to_string(),
+                base_url: if mode == ModelRegistryLoadMode::Full {
+                    "https://api.anthropic.com/v1/messages".to_string()
+                } else {
+                    String::new()
+                },
                 reasoning: true,
                 input: vec![InputType::Text, InputType::Image],
                 cost: ModelCost {
@@ -677,7 +1038,13 @@ fn built_in_models(auth: &AuthStorage) -> Vec<ModelEntry> {
                 max_tokens: 128_000,
                 headers: HashMap::new(),
             },
-            api_key: auth.resolve_api_key("anthropic", None),
+            api_key: resolve_provider_api_key_cached(
+                auth,
+                "anthropic",
+                "anthropic",
+                &mut canonical_api_key_cache,
+                &mut provider_api_key_cache,
+            ),
             headers: HashMap::new(),
             auth_header: false,
             compat: None,
@@ -685,11 +1052,226 @@ fn built_in_models(auth: &AuthStorage) -> Vec<ModelEntry> {
         });
     }
 
+    // Ensure the latest GPT-5 default exists for OpenAI routing.
+    //
+    // The legacy catalog can lag behind upstream model IDs; we add a
+    // conservative seed so listing, lookup, and autocomplete stay current.
+    if !models
+        .iter()
+        .any(|entry| entry.model.provider == "openai" && entry.model.id == "gpt-5.4")
+    {
+        models.push(ModelEntry {
+            model: Model {
+                id: "gpt-5.4".to_string(),
+                name: "GPT-5.4".to_string(),
+                api: if mode == ModelRegistryLoadMode::Full {
+                    Api::OpenAIResponses.to_string()
+                } else {
+                    "openai-responses".to_string()
+                },
+                provider: "openai".to_string(),
+                base_url: if mode == ModelRegistryLoadMode::Full {
+                    "https://api.openai.com/v1".to_string()
+                } else {
+                    String::new()
+                },
+                reasoning: true,
+                input: vec![InputType::Text, InputType::Image],
+                cost: ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 400_000,
+                max_tokens: 128_000,
+                headers: HashMap::new(),
+            },
+            api_key: resolve_provider_api_key_cached(
+                auth,
+                "openai",
+                "openai",
+                &mut canonical_api_key_cache,
+                &mut provider_api_key_cache,
+            ),
+            headers: HashMap::new(),
+            auth_header: true,
+            compat: None,
+            oauth_config: None,
+        });
+    }
+
+    // Ensure the latest Codex default exists for OpenAI Codex (ChatGPT) routing.
+    //
+    // The legacy catalog can lag behind upstream model IDs; we use a conservative
+    // seed here to keep the default selection stable.
+    if !models
+        .iter()
+        .any(|entry| entry.model.provider == "openai-codex" && entry.model.id == "gpt-5.4")
+    {
+        models.push(ModelEntry {
+            model: Model {
+                id: "gpt-5.4".to_string(),
+                name: "GPT-5.4 Codex".to_string(),
+                api: if mode == ModelRegistryLoadMode::Full {
+                    Api::OpenAICodexResponses.to_string()
+                } else {
+                    "openai-codex-responses".to_string()
+                },
+                provider: "openai-codex".to_string(),
+                base_url: if mode == ModelRegistryLoadMode::Full {
+                    "https://chatgpt.com/backend-api".to_string()
+                } else {
+                    String::new()
+                },
+                reasoning: true,
+                input: vec![InputType::Text, InputType::Image],
+                cost: ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 272_000,
+                max_tokens: 128_000,
+                headers: HashMap::new(),
+            },
+            api_key: resolve_provider_api_key_cached(
+                auth,
+                "openai-codex",
+                "openai-codex",
+                &mut canonical_api_key_cache,
+                &mut provider_api_key_cache,
+            ),
+            headers: HashMap::new(),
+            auth_header: true,
+            compat: None,
+            oauth_config: None,
+        });
+    }
+
+    // Keep the prior Codex default available until the bundled legacy catalog catches up.
+    if !models
+        .iter()
+        .any(|entry| entry.model.provider == "openai-codex" && entry.model.id == "gpt-5.3-codex")
+    {
+        models.push(ModelEntry {
+            model: Model {
+                id: "gpt-5.3-codex".to_string(),
+                name: "GPT-5.3 Codex".to_string(),
+                api: if mode == ModelRegistryLoadMode::Full {
+                    Api::OpenAICodexResponses.to_string()
+                } else {
+                    "openai-codex-responses".to_string()
+                },
+                provider: "openai-codex".to_string(),
+                base_url: if mode == ModelRegistryLoadMode::Full {
+                    "https://chatgpt.com/backend-api".to_string()
+                } else {
+                    String::new()
+                },
+                reasoning: true,
+                input: vec![InputType::Text, InputType::Image],
+                cost: ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 272_000,
+                max_tokens: 128_000,
+                headers: HashMap::new(),
+            },
+            api_key: resolve_provider_api_key_cached(
+                auth,
+                "openai-codex",
+                "openai-codex",
+                &mut canonical_api_key_cache,
+                &mut provider_api_key_cache,
+            ),
+            headers: HashMap::new(),
+            auth_header: true,
+            compat: None,
+            oauth_config: None,
+        });
+    }
+
+    // Ensure the latest Codex Spark variant exists for OpenAI Codex routing.
+    if !models.iter().any(|entry| {
+        entry.model.provider == "openai-codex" && entry.model.id == "gpt-5.3-codex-spark"
+    }) {
+        models.push(ModelEntry {
+            model: Model {
+                id: "gpt-5.3-codex-spark".to_string(),
+                name: "GPT-5.3 Codex Spark".to_string(),
+                api: if mode == ModelRegistryLoadMode::Full {
+                    Api::OpenAICodexResponses.to_string()
+                } else {
+                    "openai-codex-responses".to_string()
+                },
+                provider: "openai-codex".to_string(),
+                base_url: if mode == ModelRegistryLoadMode::Full {
+                    "https://chatgpt.com/backend-api".to_string()
+                } else {
+                    String::new()
+                },
+                reasoning: true,
+                input: vec![InputType::Text, InputType::Image],
+                cost: ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 272_000,
+                max_tokens: 128_000,
+                headers: HashMap::new(),
+            },
+            api_key: resolve_provider_api_key_cached(
+                auth,
+                "openai-codex",
+                "openai-codex",
+                &mut canonical_api_key_cache,
+                &mut provider_api_key_cache,
+            ),
+            headers: HashMap::new(),
+            auth_header: true,
+            compat: None,
+            oauth_config: None,
+        });
+    }
+
+    // Sort for deterministic find_by_id: canonical providers first, then alphabetical.
+    models.sort_by(|a, b| {
+        let priority = |e: &ModelEntry| -> u8 {
+            let p = e.model.provider.as_str();
+            let id = e.model.id.as_str();
+            // Canonical provider gets priority 0
+            let is_canonical = (id.starts_with("claude") && p == "anthropic")
+                || (id.starts_with("gpt-") && p == "openai")
+                || (id.starts_with("o1") && p == "openai")
+                || (id.starts_with("o3") && p == "openai")
+                || (id.starts_with("o4") && p == "openai")
+                || (id.starts_with("gemini") && p == "google")
+                || (id.starts_with("command") && p == "cohere");
+            u8::from(!is_canonical)
+        };
+        priority(a)
+            .cmp(&priority(b))
+            .then_with(|| a.model.provider.cmp(&b.model.provider))
+            .then_with(|| a.model.id.cmp(&b.model.id))
+    });
+
     models
 }
 
 #[allow(clippy::too_many_lines)]
-fn apply_custom_models(auth: &AuthStorage, models: &mut Vec<ModelEntry>, config: &ModelsConfig) {
+fn apply_custom_models(
+    auth: &AuthStorage,
+    models: &mut Vec<ModelEntry>,
+    config: &ModelsConfig,
+    base_dir: Option<&Path>,
+) {
     for (provider_id, provider_cfg) in &config.providers {
         let provider_id_str = provider_id.as_str();
         let routing_defaults = provider_routing_defaults(provider_id);
@@ -706,7 +1288,7 @@ fn apply_custom_models(auth: &AuthStorage, models: &mut Vec<ModelEntry>, config:
             )
         });
 
-        let provider_headers = resolve_headers(provider_cfg.headers.as_ref());
+        let provider_headers = resolve_headers_with_base(provider_cfg.headers.as_ref(), base_dir);
         let canonical_provider = canonical_provider_id(provider_id).unwrap_or(provider_id_str);
         let provider_matches = |candidate_provider: &str| {
             let candidate_canonical =
@@ -719,7 +1301,7 @@ fn apply_custom_models(auth: &AuthStorage, models: &mut Vec<ModelEntry>, config:
         let provider_key = provider_cfg
             .api_key
             .as_deref()
-            .and_then(resolve_value)
+            .and_then(|value| resolve_value_with_base(value, base_dir))
             .or_else(|| auth.resolve_api_key(canonical_provider, None));
 
         let auth_header = provider_cfg
@@ -754,7 +1336,7 @@ fn apply_custom_models(auth: &AuthStorage, models: &mut Vec<ModelEntry>, config:
                 if provider_cfg.api.is_some() {
                     entry.model.api.clone_from(&provider_api_string);
                 }
-                if provider_cfg.headers.is_some() {
+                if should_apply_headers_override(provider_cfg.headers.as_ref(), &provider_headers) {
                     entry.headers.clone_from(&provider_headers);
                 }
                 if provider_key.is_some() {
@@ -803,7 +1385,7 @@ fn apply_custom_models(auth: &AuthStorage, models: &mut Vec<ModelEntry>, config:
                 .unwrap_or_else(|_| Api::Custom(model_api.to_string()));
             let model_headers = merge_headers(
                 &provider_headers,
-                resolve_headers(model_cfg.headers.as_ref()),
+                resolve_headers_with_base(model_cfg.headers.as_ref(), base_dir),
             );
             let default_input_types = routing_defaults
                 .map_or_else(|| vec![InputType::Text], |defaults| defaults.input.to_vec());
@@ -840,7 +1422,9 @@ fn apply_custom_models(auth: &AuthStorage, models: &mut Vec<ModelEntry>, config:
                 api: model_api_parsed.to_string(),
                 provider: provider_id.clone(),
                 base_url: provider_base.clone(),
-                reasoning: model_cfg.reasoning.unwrap_or(default_reasoning),
+                reasoning: model_cfg.reasoning.unwrap_or_else(|| {
+                    effective_reasoning(&normalized_model_id, default_reasoning)
+                }),
                 input: input_types,
                 cost: model_cfg.cost.clone().unwrap_or(ModelCost {
                     input: 0.0,
@@ -939,11 +1523,25 @@ fn merge_headers(
     merged
 }
 
+fn should_apply_headers_override(
+    configured_headers: Option<&HashMap<String, String>>,
+    resolved_headers: &HashMap<String, String>,
+) -> bool {
+    configured_headers.is_some_and(|headers| headers.is_empty() || !resolved_headers.is_empty())
+}
+
 fn resolve_headers(headers: Option<&HashMap<String, String>>) -> HashMap<String, String> {
+    resolve_headers_with_base(headers, None)
+}
+
+fn resolve_headers_with_base(
+    headers: Option<&HashMap<String, String>>,
+    base_dir: Option<&Path>,
+) -> HashMap<String, String> {
     let mut resolved = HashMap::new();
     if let Some(headers) = headers {
         for (k, v) in headers {
-            if let Some(val) = resolve_value(v) {
+            if let Some(val) = resolve_value_with_base(v, base_dir) {
                 resolved.insert(k.clone(), val);
             }
         }
@@ -952,6 +1550,10 @@ fn resolve_headers(headers: Option<&HashMap<String, String>>) -> HashMap<String,
 }
 
 fn resolve_value(value: &str) -> Option<String> {
+    resolve_value_with_base(value, None)
+}
+
+fn resolve_value_with_base(value: &str, base_dir: Option<&Path>) -> Option<String> {
     if let Some(rest) = value.strip_prefix('!') {
         return resolve_shell(rest);
     }
@@ -967,16 +1569,18 @@ fn resolve_value(value: &str) -> Option<String> {
         if file_path.is_empty() {
             return None;
         }
-        return std::fs::read_to_string(file_path)
+        let path = Path::new(file_path);
+        let resolved_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else if let Some(base_dir) = base_dir {
+            base_dir.join(path)
+        } else {
+            path.to_path_buf()
+        };
+        return std::fs::read_to_string(resolved_path)
             .ok()
             .map(|contents| contents.trim().to_string())
             .filter(|v| !v.is_empty());
-    }
-
-    if let Ok(env_val) = std::env::var(value) {
-        if !env_val.is_empty() {
-            return Some(env_val);
-        }
     }
 
     if value.is_empty() {
@@ -990,12 +1594,14 @@ fn resolve_shell(cmd: &str) -> Option<String> {
     let output = if cfg!(windows) {
         std::process::Command::new("cmd")
             .args(["/C", cmd])
+            .stdin(std::process::Stdio::null())
             .output()
             .ok()?
     } else {
         std::process::Command::new("sh")
             .arg("-c")
             .arg(cmd)
+            .stdin(std::process::Stdio::null())
             .output()
             .ok()?
     };
@@ -1076,7 +1682,7 @@ where
                 api: "openai-completions".to_string(),
                 provider: provider.to_string(),
                 base_url,
-                reasoning: true,
+                reasoning: effective_reasoning(model_id, true),
                 input: vec![InputType::Text],
                 cost: ModelCost {
                     input: 0.0,
@@ -1101,6 +1707,7 @@ where
     if normalized_model_id.is_empty() {
         return None;
     }
+    let reasoning = effective_reasoning(&normalized_model_id, defaults.reasoning);
     Some(ModelEntry {
         model: Model {
             id: normalized_model_id.clone(),
@@ -1108,7 +1715,7 @@ where
             api: defaults.api.to_string(),
             provider: provider.to_string(),
             base_url: defaults.base_url.to_string(),
-            reasoning: defaults.reasoning,
+            reasoning,
             input: defaults.input.to_vec(),
             cost: ModelCost {
                 input: 0.0,
@@ -1192,9 +1799,109 @@ mod tests {
     }
 
     #[test]
+    fn parse_legacy_generated_models_extracts_known_legacy_only_providers() {
+        let parsed = parse_legacy_generated_models();
+        assert!(
+            !parsed.is_empty(),
+            "legacy generated model catalog should parse into entries"
+        );
+
+        assert!(
+            parsed
+                .iter()
+                .any(|m| m.provider == "azure-openai-responses")
+        );
+        assert!(parsed.iter().any(|m| m.provider == "vercel-ai-gateway"));
+        assert!(parsed.iter().any(|m| m.provider == "kimi-coding"));
+    }
+
+    #[test]
+    fn built_in_models_include_all_legacy_provider_model_pairs() {
+        let (_dir, auth) = test_auth_storage();
+        let built = built_in_models(&auth, ModelRegistryLoadMode::Full);
+
+        let built_keys: HashSet<(String, String)> = built
+            .iter()
+            .map(|entry| {
+                (
+                    entry.model.provider.to_ascii_lowercase(),
+                    entry.model.id.to_ascii_lowercase(),
+                )
+            })
+            .collect();
+
+        let mut missing = Vec::new();
+        for legacy in legacy_generated_models() {
+            let normalized_id = canonicalize_model_id_for_provider(&legacy.provider, &legacy.id);
+            if normalized_id.is_empty() {
+                continue;
+            }
+            let key = (
+                legacy.provider.to_ascii_lowercase(),
+                normalized_id.to_ascii_lowercase(),
+            );
+            if !built_keys.contains(&key) {
+                missing.push(format!("{}/{}", legacy.provider, legacy.id));
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "missing legacy provider/model entries in built-in registry: {}",
+            missing.join(", ")
+        );
+    }
+
+    #[test]
+    fn built_in_models_preserve_legacy_model_display_names() {
+        let (_dir, auth) = test_auth_storage();
+        let built = built_in_models(&auth, ModelRegistryLoadMode::Full);
+
+        let name_by_key: HashMap<(String, String), String> = built
+            .iter()
+            .map(|entry| {
+                (
+                    (
+                        entry.model.provider.to_ascii_lowercase(),
+                        entry.model.id.to_ascii_lowercase(),
+                    ),
+                    entry.model.name.clone(),
+                )
+            })
+            .collect();
+
+        let mut mismatches = Vec::new();
+        for legacy in legacy_generated_models() {
+            let normalized_id = canonicalize_model_id_for_provider(&legacy.provider, &legacy.id);
+            if normalized_id.is_empty() {
+                continue;
+            }
+            let key = (
+                legacy.provider.to_ascii_lowercase(),
+                normalized_id.to_ascii_lowercase(),
+            );
+            let Some(built_name) = name_by_key.get(&key) else {
+                continue;
+            };
+            if !legacy.name.trim().is_empty() && built_name != &legacy.name {
+                mismatches.push(format!(
+                    "{}/{} => expected {:?}, got {:?}",
+                    legacy.provider, legacy.id, legacy.name, built_name
+                ));
+            }
+        }
+
+        assert!(
+            mismatches.is_empty(),
+            "legacy model display name mismatches: {}",
+            mismatches.join("; ")
+        );
+    }
+
+    #[test]
     fn built_in_models_include_core_provider_entries() {
         let (_dir, auth) = test_auth_storage();
-        let models = built_in_models(&auth);
+        let models = built_in_models(&auth, ModelRegistryLoadMode::Full);
 
         assert!(
             models.iter().any(
@@ -1205,6 +1912,11 @@ mod tests {
             models
                 .iter()
                 .any(|m| m.model.provider == "openai" && m.model.id == "gpt-4o")
+        );
+        assert!(
+            models
+                .iter()
+                .any(|m| m.model.provider == "openai" && m.model.id == "gpt-5.4")
         );
         assert!(
             models
@@ -1240,10 +1952,15 @@ mod tests {
     }
 
     #[test]
-    fn built_in_models_include_legacy_oauth_provider_entries() {
+    fn built_in_models_include_oauth_provider_entries() {
         let (_dir, auth) = test_auth_storage();
-        let models = built_in_models(&auth);
+        let models = built_in_models(&auth, ModelRegistryLoadMode::Full);
 
+        assert!(models.iter().any(|m| {
+            m.model.provider == "openai-codex"
+                && m.model.api == "openai-codex-responses"
+                && m.model.id == "gpt-5.4"
+        }));
         assert!(models.iter().any(|m| {
             m.model.provider == "openai-codex"
                 && m.model.api == "openai-codex-responses"
@@ -1264,7 +1981,7 @@ mod tests {
     #[test]
     fn built_in_models_include_non_legacy_provider_model_strings_from_snapshot() {
         let (_dir, auth) = test_auth_storage();
-        let models = built_in_models(&auth);
+        let models = built_in_models(&auth, ModelRegistryLoadMode::Full);
 
         assert!(
             models
@@ -1276,19 +1993,32 @@ mod tests {
                 .iter()
                 .any(|m| { m.model.provider == "zhipuai" && m.model.id == "glm-4.6" })
         );
-        assert!(
-            models
-                .iter()
-                .any(|m| { m.model.provider == "azure-openai" && m.model.id == "claude-opus-4-6" })
-        );
         assert!(models.iter().any(|m| {
-            m.model.provider == "openrouter" && m.model.id == "anthropic/claude-sonnet-4.6"
+            m.model.provider == "openrouter" && m.model.id == "anthropic/claude-sonnet-4"
         }));
+    }
+
+    #[test]
+    fn built_in_models_seed_gitlab_upstream_entries_with_gitlab_chat_api() {
+        let (_dir, auth) = test_auth_storage();
+        let models = built_in_models(&auth, ModelRegistryLoadMode::Full);
+
+        let gitlab = models
+            .iter()
+            .find(|m| m.model.provider == "gitlab" && m.model.id == "duo-chat-gpt-5-1")
+            .expect("gitlab upstream model");
+        assert_eq!(gitlab.model.api, "gitlab-chat");
+        assert!(gitlab.auth_header);
     }
 
     #[test]
     fn autocomplete_candidates_include_legacy_and_latest_entries() {
         let candidates = model_autocomplete_candidates();
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.slug == "openai-codex/gpt-5.4")
+        );
         assert!(
             candidates
                 .iter()
@@ -1298,6 +2028,11 @@ mod tests {
             candidates
                 .iter()
                 .any(|candidate| candidate.slug == "google-gemini-cli/gemini-2.5-pro")
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.slug == "openai/gpt-5.4")
         );
         assert!(
             candidates
@@ -1317,9 +2052,23 @@ mod tests {
     }
 
     #[test]
+    fn autocomplete_candidates_are_case_insensitively_unique() {
+        let candidates = model_autocomplete_candidates();
+        let mut seen = HashSet::new();
+        for candidate in candidates {
+            let key = candidate.slug.to_ascii_lowercase();
+            assert!(
+                seen.insert(key),
+                "duplicate autocomplete slug (case-insensitive): {}",
+                candidate.slug
+            );
+        }
+    }
+
+    #[test]
     fn apply_custom_models_overrides_provider_fields() {
         let (_dir, auth) = test_auth_storage();
-        let mut models = built_in_models(&auth);
+        let mut models = built_in_models(&auth, ModelRegistryLoadMode::Full);
         let (env_key, env_val) = expected_env_pair();
         let mut provider_headers = HashMap::new();
         provider_headers.insert("x-provider".to_string(), "provider-header".to_string());
@@ -1342,7 +2091,7 @@ mod tests {
             )]),
         };
 
-        apply_custom_models(&auth, &mut models, &config);
+        apply_custom_models(&auth, &mut models, &config, None);
 
         for entry in models.iter().filter(|m| m.model.provider == "anthropic") {
             assert_eq!(entry.model.base_url, "https://proxy.example/v1/messages");
@@ -1364,6 +2113,107 @@ mod tests {
     }
 
     #[test]
+    fn apply_custom_models_preserves_existing_headers_when_provider_header_values_unresolved() {
+        let (dir, auth) = test_auth_storage();
+        let mut models = vec![ModelEntry {
+            model: Model {
+                id: "claude-test".to_string(),
+                name: "Claude Test".to_string(),
+                api: "anthropic-messages".to_string(),
+                provider: "anthropic".to_string(),
+                base_url: "https://api.anthropic.com/v1/messages".to_string(),
+                reasoning: false,
+                input: vec![InputType::Text],
+                cost: ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 200_000,
+                max_tokens: 8_192,
+                headers: HashMap::new(),
+            },
+            api_key: None,
+            headers: HashMap::from([("x-built-in".to_string(), "keep-me".to_string())]),
+            auth_header: false,
+            compat: None,
+            oauth_config: None,
+        }];
+
+        let config = ModelsConfig {
+            providers: HashMap::from([(
+                "anthropic".to_string(),
+                ProviderConfig {
+                    headers: Some(HashMap::from([(
+                        "x-provider".to_string(),
+                        "file:missing-header.txt".to_string(),
+                    )])),
+                    ..ProviderConfig::default()
+                },
+            )]),
+        };
+
+        apply_custom_models(&auth, &mut models, &config, Some(dir.path()));
+
+        assert_eq!(
+            models[0].headers.get("x-built-in").map(String::as_str),
+            Some("keep-me")
+        );
+        assert!(
+            !models[0].headers.contains_key("x-provider"),
+            "unresolved provider header values should not inject empty overrides"
+        );
+    }
+
+    #[test]
+    fn apply_custom_models_empty_provider_header_map_clears_existing_headers() {
+        let (_dir, auth) = test_auth_storage();
+        let mut models = vec![ModelEntry {
+            model: Model {
+                id: "claude-test".to_string(),
+                name: "Claude Test".to_string(),
+                api: "anthropic-messages".to_string(),
+                provider: "anthropic".to_string(),
+                base_url: "https://api.anthropic.com/v1/messages".to_string(),
+                reasoning: false,
+                input: vec![InputType::Text],
+                cost: ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 200_000,
+                max_tokens: 8_192,
+                headers: HashMap::new(),
+            },
+            api_key: None,
+            headers: HashMap::from([("x-built-in".to_string(), "remove-me".to_string())]),
+            auth_header: false,
+            compat: None,
+            oauth_config: None,
+        }];
+
+        let config = ModelsConfig {
+            providers: HashMap::from([(
+                "anthropic".to_string(),
+                ProviderConfig {
+                    headers: Some(HashMap::new()),
+                    ..ProviderConfig::default()
+                },
+            )]),
+        };
+
+        apply_custom_models(&auth, &mut models, &config, None);
+
+        assert!(
+            models[0].headers.is_empty(),
+            "an explicit empty header map should still clear inherited headers"
+        );
+    }
+
+    #[test]
     fn apply_custom_models_uses_schema_defaults_for_provider_models() {
         let (_dir, auth) = test_auth_storage();
         let mut models = Vec::new();
@@ -1380,7 +2230,7 @@ mod tests {
             )]),
         };
 
-        apply_custom_models(&auth, &mut models, &config);
+        apply_custom_models(&auth, &mut models, &config, None);
 
         let cohere = models
             .iter()
@@ -1388,7 +2238,10 @@ mod tests {
             .expect("cohere model should be added");
         assert_eq!(cohere.model.api, "cohere-chat");
         assert_eq!(cohere.model.base_url, "https://api.cohere.com/v2");
-        assert!(cohere.model.reasoning);
+        assert!(
+            !cohere.model.reasoning,
+            "command-r-plus is non-reasoning; command-a is the reasoning line"
+        );
         assert_eq!(cohere.model.input, vec![InputType::Text]);
         assert_eq!(cohere.model.context_window, 128_000);
         assert_eq!(cohere.model.max_tokens, 8192);
@@ -1433,7 +2286,7 @@ mod tests {
             )]),
         };
 
-        apply_custom_models(&auth, &mut models, &config);
+        apply_custom_models(&auth, &mut models, &config, None);
 
         let entry = models
             .iter()
@@ -1482,7 +2335,7 @@ mod tests {
             )]),
         };
 
-        apply_custom_models(&auth, &mut models, &config);
+        apply_custom_models(&auth, &mut models, &config, None);
 
         let anthropic = models
             .iter()
@@ -1527,7 +2380,7 @@ mod tests {
             )]),
         };
 
-        apply_custom_models(&auth, &mut models, &config);
+        apply_custom_models(&auth, &mut models, &config, None);
 
         let kimi = models
             .iter()
@@ -1551,13 +2404,36 @@ mod tests {
         assert_eq!(by_provider_and_id.model.id, "gpt-4o");
 
         let by_id = registry
-            .find_by_id("gemini-2.5-pro")
-            .expect("gemini-2.5-pro should exist");
-        assert_eq!(by_id.model.provider, "google");
-        assert_eq!(by_id.model.id, "gemini-2.5-pro");
+            .find_by_id("claude-opus-4-5")
+            .expect("claude-opus-4-5 should exist");
+        assert_eq!(by_id.model.provider, "anthropic");
+        assert_eq!(by_id.model.id, "claude-opus-4-5");
 
         assert!(registry.find("openai", "does-not-exist").is_none());
         assert!(registry.find_by_id("does-not-exist").is_none());
+    }
+
+    #[test]
+    fn model_registry_find_by_id_is_case_insensitive() {
+        let (_dir, auth) = test_auth_storage();
+        let registry = ModelRegistry::load(&auth, None);
+
+        let by_id = registry
+            .find_by_id("GPT-5.2-CODEX")
+            .expect("gpt-5.2-codex should resolve case-insensitively");
+        assert_eq!(by_id.model.id, "gpt-5.2-codex");
+    }
+
+    #[test]
+    fn model_registry_finds_latest_openai_codex_seed() {
+        let (_dir, auth) = test_auth_storage();
+        let registry = ModelRegistry::load(&auth, None);
+
+        let by_provider = registry
+            .find("openai-codex", "GPT-5.4")
+            .expect("gpt-5.4 codex should resolve case-insensitively");
+        assert_eq!(by_provider.model.provider, "openai-codex");
+        assert_eq!(by_provider.model.id, "gpt-5.4");
     }
 
     #[test]
@@ -1634,6 +2510,25 @@ mod tests {
     }
 
     #[test]
+    fn model_registry_merge_entries_deduplicates_alias_and_case_variants() {
+        let (_dir, auth) = test_auth_storage();
+        let mut registry = ModelRegistry::load(&auth, None);
+        let before = registry.models().len();
+
+        let source = registry
+            .find("openrouter", "gpt-4o-mini")
+            .or_else(|| registry.find("openrouter", "openai/gpt-4o-mini"))
+            .expect("expected built-in openrouter gpt-4o-mini model");
+
+        let mut alias_case_variant = source.clone();
+        alias_case_variant.model.provider = "open-router".to_string();
+        alias_case_variant.model.id = source.model.id.to_ascii_uppercase();
+
+        registry.merge_entries(vec![alias_case_variant]);
+        assert_eq!(registry.models().len(), before);
+    }
+
+    #[test]
     fn apply_custom_models_dedupes_openrouter_alias_conflicts() {
         let (_dir, auth) = test_auth_storage();
         let mut models = Vec::new();
@@ -1660,7 +2555,7 @@ mod tests {
             )]),
         };
 
-        apply_custom_models(&auth, &mut models, &config);
+        apply_custom_models(&auth, &mut models, &config, None);
 
         let openrouter_models: Vec<&ModelEntry> = models
             .iter()
@@ -1686,7 +2581,6 @@ mod tests {
             resolve_value(&format!("env:{env_key}")).as_deref(),
             Some(env_val.as_str())
         );
-        assert_eq!(resolve_value(&env_key).as_deref(), Some(env_val.as_str()));
 
         let dir = tempdir().expect("tempdir");
         let key_path = dir.path().join("api_key.txt");
@@ -1761,6 +2655,65 @@ mod tests {
         assert_eq!(acme.model.input, vec![InputType::Text, InputType::Image]);
     }
 
+    #[test]
+    fn model_registry_load_resolves_relative_file_values_against_models_json_dir() {
+        let (dir, auth) = test_auth_storage();
+        let models_dir = dir.path().join("config");
+        std::fs::create_dir_all(&models_dir).expect("create models dir");
+        let models_path = models_dir.join("models.json");
+        std::fs::write(models_dir.join("relative_key.txt"), "relative-api-key\n")
+            .expect("write relative key");
+        std::fs::write(
+            models_dir.join("provider_header.txt"),
+            "provider-from-file\n",
+        )
+        .expect("write provider header");
+        std::fs::write(models_dir.join("model_header.txt"), "model-from-file\n")
+            .expect("write model header");
+
+        let models_json = serde_json::json!({
+            "providers": {
+                "acme-relative": {
+                    "baseUrl": "https://acme.example/v1",
+                    "api": "openai-completions",
+                    "apiKey": "file:relative_key.txt",
+                    "headers": {
+                        "x-provider-file": "file:provider_header.txt"
+                    },
+                    "models": [
+                        {
+                            "id": "acme-relative-chat",
+                            "headers": {
+                                "x-model-file": "file:model_header.txt"
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+
+        std::fs::write(
+            &models_path,
+            serde_json::to_string_pretty(&models_json).expect("serialize models json"),
+        )
+        .expect("write models.json");
+
+        let registry = ModelRegistry::load(&auth, Some(models_path));
+        let acme = registry
+            .find("acme-relative", "acme-relative-chat")
+            .expect("custom model should load with relative file-backed values");
+
+        assert_eq!(acme.api_key.as_deref(), Some("relative-api-key"));
+        assert_eq!(
+            acme.headers.get("x-provider-file").map(String::as_str),
+            Some("provider-from-file")
+        );
+        assert_eq!(
+            acme.headers.get("x-model-file").map(String::as_str),
+            Some("model-from-file")
+        );
+    }
+
     // ─── supports_xhigh ──────────────────────────────────────────────
 
     fn make_model_entry(id: &str, reasoning: bool) -> ModelEntry {
@@ -1795,7 +2748,10 @@ mod tests {
     fn supports_xhigh_for_known_models() {
         assert!(make_model_entry("gpt-5.1-codex-max", true).supports_xhigh());
         assert!(make_model_entry("gpt-5.2", true).supports_xhigh());
+        assert!(make_model_entry("gpt-5.4", true).supports_xhigh());
         assert!(make_model_entry("gpt-5.2-codex", true).supports_xhigh());
+        assert!(make_model_entry("gpt-5.3-codex", true).supports_xhigh());
+        assert!(make_model_entry("gpt-5.3-codex-spark", true).supports_xhigh());
     }
 
     #[test]
@@ -1908,7 +2864,7 @@ mod tests {
     fn ad_hoc_alibaba_aliases() {
         for alias in ["alibaba", "dashscope", "qwen"] {
             let defaults = ad_hoc_provider_defaults(alias)
-                .unwrap_or_else(|| panic!("expected defaults for '{alias}'"));
+                .unwrap_or_else(|| unreachable!("expected defaults for '{alias}'"));
             assert!(defaults.base_url.contains("dashscope"));
         }
     }
@@ -1917,7 +2873,7 @@ mod tests {
     fn ad_hoc_moonshot_aliases() {
         for alias in ["moonshotai", "moonshot", "kimi"] {
             let defaults = ad_hoc_provider_defaults(alias)
-                .unwrap_or_else(|| panic!("expected defaults for '{alias}'"));
+                .unwrap_or_else(|| unreachable!("expected defaults for '{alias}'"));
             assert!(defaults.base_url.contains("moonshot"));
         }
     }
@@ -1942,8 +2898,8 @@ mod tests {
             "minimax-coding-plan",
             "minimax-cn-coding-plan",
         ] {
-            let defaults =
-                ad_hoc_provider_defaults(provider).unwrap_or_else(|| panic!("defaults {provider}"));
+            let defaults = ad_hoc_provider_defaults(provider)
+                .unwrap_or_else(|| unreachable!("expected defaults for '{provider}'"));
             assert_eq!(defaults.api, "anthropic-messages");
             assert!(!defaults.auth_header);
             assert!(defaults.base_url.contains("api.minimax"));
@@ -1963,8 +2919,8 @@ mod tests {
             ("scaleway", "https://api.scaleway.ai/v1"),
         ];
         for (provider, expected_base_url) in &cases {
-            let defaults =
-                ad_hoc_provider_defaults(provider).unwrap_or_else(|| panic!("defaults {provider}"));
+            let defaults = ad_hoc_provider_defaults(provider)
+                .unwrap_or_else(|| unreachable!("expected defaults for '{provider}'"));
             assert_eq!(defaults.api, "openai-completions");
             assert!(defaults.auth_header);
             assert_eq!(defaults.base_url, *expected_base_url);
@@ -1987,8 +2943,8 @@ mod tests {
             ),
         ];
         for (provider, expected_base_url) in &cases {
-            let defaults =
-                ad_hoc_provider_defaults(provider).unwrap_or_else(|| panic!("defaults {provider}"));
+            let defaults = ad_hoc_provider_defaults(provider)
+                .unwrap_or_else(|| unreachable!("expected defaults for '{provider}'"));
             assert_eq!(defaults.api, "openai-completions");
             assert!(defaults.auth_header);
             assert_eq!(defaults.base_url, *expected_base_url);
@@ -2040,8 +2996,8 @@ mod tests {
             ("ollama-cloud", "https://ollama.com/v1"),
         ];
         for (provider, expected_base_url) in &cases {
-            let defaults =
-                ad_hoc_provider_defaults(provider).unwrap_or_else(|| panic!("defaults {provider}"));
+            let defaults = ad_hoc_provider_defaults(provider)
+                .unwrap_or_else(|| unreachable!("expected defaults for '{provider}'"));
             assert_eq!(defaults.api, "openai-completions");
             assert!(defaults.auth_header);
             assert_eq!(defaults.base_url, *expected_base_url);
@@ -2126,6 +3082,16 @@ mod tests {
         assert!(!defaults.auth_header);
     }
 
+    #[test]
+    fn native_adapter_seed_defaults_gitlab_use_gitlab_chat_api() {
+        let defaults = native_adapter_seed_defaults("gitlab").expect("gitlab seed defaults");
+        assert_eq!(defaults.api, "gitlab-chat");
+        assert_eq!(defaults.base_url, "");
+        assert!(defaults.auth_header);
+        assert!(defaults.reasoning);
+        assert_eq!(defaults.input, &INPUT_TEXT_ONLY);
+    }
+
     // ─── ad_hoc_model_entry ──────────────────────────────────────────
 
     #[test]
@@ -2205,6 +3171,30 @@ mod tests {
         assert!(ad_hoc_model_entry_with_sap_resolver("sap-ai-core", "dep-123", || None).is_none());
     }
 
+    #[test]
+    fn ad_hoc_model_entry_sap_uses_effective_reasoning() {
+        let sap_creds = || {
+            Some(SapResolvedCredentials {
+                client_id: "id".to_string(),
+                client_secret: "secret".to_string(),
+                token_url: "https://auth.sap.example.com/oauth/token".to_string(),
+                service_url: "https://api.ai.sap.example.com".to_string(),
+            })
+        };
+
+        // A reasoning model (gpt-5.2) should have reasoning = true.
+        let reasoning_entry =
+            ad_hoc_model_entry_with_sap_resolver("sap-ai-core", "gpt-5.2", sap_creds)
+                .expect("reasoning sap entry");
+        assert!(reasoning_entry.model.reasoning);
+
+        // A non-reasoning model (gpt-4o) should have reasoning = false.
+        let non_reasoning_entry =
+            ad_hoc_model_entry_with_sap_resolver("sap-ai-core", "gpt-4o", sap_creds)
+                .expect("non-reasoning sap entry");
+        assert!(!non_reasoning_entry.model.reasoning);
+    }
+
     // ─── merge_headers ───────────────────────────────────────────────
 
     #[test]
@@ -2268,6 +3258,20 @@ mod tests {
     }
 
     #[test]
+    fn resolve_value_file_relative_to_base_dir() {
+        let dir = tempdir().expect("tempdir");
+        let nested = dir.path().join("config");
+        std::fs::create_dir_all(&nested).expect("create nested dir");
+        let key_path = nested.join("relative-key.txt");
+        std::fs::write(&key_path, "relative-value\n").expect("write relative key");
+
+        assert_eq!(
+            resolve_value_with_base("file:relative-key.txt", Some(&nested)).as_deref(),
+            Some("relative-value")
+        );
+    }
+
+    #[test]
     fn resolve_value_shell_echo() {
         let result = resolve_value("!echo hello");
         assert_eq!(result.as_deref(), Some("hello"));
@@ -2296,17 +3300,50 @@ mod tests {
     // ─── ModelRegistry ───────────────────────────────────────────────
 
     #[test]
-    fn model_registry_get_available_filters_by_api_key() {
+    fn model_registry_get_available_returns_only_ready_models() {
         let (_dir, auth) = test_auth_storage();
         let registry = ModelRegistry::load(&auth, None);
         let available = registry.get_available();
         assert!(!available.is_empty());
         for entry in &available {
             assert!(
-                entry.api_key.is_some(),
-                "all available models should have api_key"
+                model_entry_is_ready(entry),
+                "all available models should be ready for use"
             );
         }
+    }
+
+    #[test]
+    fn model_registry_get_available_includes_keyless_models() {
+        let dir = tempdir().expect("tempdir");
+        let auth = AuthStorage::load(dir.path().join("auth.json")).expect("auth");
+        let models_path = dir.path().join("models.json");
+        let config = serde_json::json!({
+            "providers": {
+                "acme-local": {
+                    "baseUrl": "http://127.0.0.1:11434/v1",
+                    "api": "openai-completions",
+                    "authHeader": false,
+                    "models": [
+                        { "id": "dev-model", "name": "Dev Model", "reasoning": false }
+                    ]
+                }
+            }
+        });
+        std::fs::write(
+            &models_path,
+            serde_json::to_string(&config).expect("serialize models"),
+        )
+        .expect("write models.json");
+
+        let registry = ModelRegistry::load(&auth, Some(models_path));
+        let available = registry.get_available();
+        assert!(
+            available
+                .iter()
+                .any(|entry| entry.model.provider == "acme-local" && entry.model.id == "dev-model"),
+            "keyless models should be considered available"
+        );
     }
 
     #[test]
@@ -2454,7 +3491,7 @@ mod tests {
     #[test]
     fn apply_custom_models_replaces_built_in_when_models_specified() {
         let (_dir, auth) = test_auth_storage();
-        let mut models = built_in_models(&auth);
+        let mut models = built_in_models(&auth, ModelRegistryLoadMode::Full);
         let anthropic_before = models
             .iter()
             .filter(|m| m.model.provider == "anthropic")
@@ -2477,7 +3514,7 @@ mod tests {
             )]),
         };
 
-        apply_custom_models(&auth, &mut models, &config);
+        apply_custom_models(&auth, &mut models, &config, None);
 
         // Built-in anthropic models should be replaced
         let anthropic_after: Vec<_> = models
@@ -2491,7 +3528,7 @@ mod tests {
     #[test]
     fn apply_custom_models_alias_replaces_canonical_built_ins_when_models_specified() {
         let (_dir, auth) = test_auth_storage();
-        let mut models = built_in_models(&auth);
+        let mut models = built_in_models(&auth, ModelRegistryLoadMode::Full);
         let google_before = models
             .iter()
             .filter(|m| m.model.provider == "google")
@@ -2512,7 +3549,7 @@ mod tests {
             )]),
         };
 
-        apply_custom_models(&auth, &mut models, &config);
+        apply_custom_models(&auth, &mut models, &config, None);
 
         assert!(
             !models.iter().any(|m| m.model.provider == "google"),
@@ -2529,7 +3566,7 @@ mod tests {
     #[test]
     fn apply_custom_models_alias_override_without_models_updates_canonical_provider_models() {
         let (_dir, auth) = test_auth_storage();
-        let mut models = built_in_models(&auth);
+        let mut models = built_in_models(&auth, ModelRegistryLoadMode::Full);
         let google_before = models
             .iter()
             .filter(|m| m.model.provider == "google")
@@ -2548,7 +3585,7 @@ mod tests {
             )]),
         };
 
-        apply_custom_models(&auth, &mut models, &config);
+        apply_custom_models(&auth, &mut models, &config, None);
 
         let google_after: Vec<_> = models
             .iter()
@@ -2585,7 +3622,7 @@ mod tests {
             )]),
         };
 
-        apply_custom_models(&auth, &mut models, &config);
+        apply_custom_models(&auth, &mut models, &config, None);
         let registry = ModelRegistry {
             models,
             error: None,
@@ -2622,18 +3659,22 @@ mod tests {
     #[test]
     fn built_in_anthropic_models_use_correct_api() {
         let (_dir, auth) = test_auth_storage();
-        let models = built_in_models(&auth);
+        let models = built_in_models(&auth, ModelRegistryLoadMode::Full);
         for m in models.iter().filter(|m| m.model.provider == "anthropic") {
             assert_eq!(m.model.api, "anthropic-messages");
             assert!(!m.auth_header, "anthropic uses x-api-key, not auth header");
-            assert_eq!(m.model.context_window, 200_000);
+            assert!(
+                m.model.context_window >= 200_000,
+                "anthropic model {} should expose a modern context window",
+                m.model.id
+            );
         }
     }
 
     #[test]
     fn built_in_openai_models_use_auth_header() {
         let (_dir, auth) = test_auth_storage();
-        let models = built_in_models(&auth);
+        let models = built_in_models(&auth, ModelRegistryLoadMode::Full);
         for m in models.iter().filter(|m| m.model.provider == "openai") {
             assert!(m.auth_header, "openai uses Authorization header");
             assert_eq!(m.model.api, "openai-responses");
@@ -2643,7 +3684,7 @@ mod tests {
     #[test]
     fn built_in_google_models_no_auth_header() {
         let (_dir, auth) = test_auth_storage();
-        let models = built_in_models(&auth);
+        let models = built_in_models(&auth, ModelRegistryLoadMode::Full);
         for m in models.iter().filter(|m| m.model.provider == "google") {
             assert!(!m.auth_header, "google uses api key in URL, not header");
             assert_eq!(m.model.api, "google-generative-ai");
@@ -2653,23 +3694,98 @@ mod tests {
     #[test]
     fn built_in_reasoning_models_marked_correctly() {
         let (_dir, auth) = test_auth_storage();
-        let models = built_in_models(&auth);
-        // Haiku models are non-reasoning
-        for m in models.iter().filter(|m| m.model.id.contains("haiku")) {
-            assert!(
-                !m.model.reasoning || m.model.id.contains("3-5-haiku"),
-                "haiku 3.5 is non-reasoning, but {}: reasoning={}",
-                m.model.id,
-                m.model.reasoning
-            );
-        }
-        // Opus/Sonnet models are reasoning
+        let models = built_in_models(&auth, ModelRegistryLoadMode::Full);
+        // Legacy Haiku 3.5 should remain non-reasoning.
         for m in models
             .iter()
-            .filter(|m| m.model.id.contains("opus") || m.model.id.contains("sonnet"))
+            .filter(|m| m.model.id.contains("3-5-haiku-20241022"))
+        {
+            assert!(!m.model.reasoning, "{} should be non-reasoning", m.model.id);
+        }
+        let anthropic_opus_sonnet = models
+            .iter()
+            .filter(|m| {
+                m.model.provider == "anthropic"
+                    && (m.model.id.contains("opus") || m.model.id.contains("sonnet"))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !anthropic_opus_sonnet.is_empty(),
+            "expected anthropic opus/sonnet models in built-ins"
+        );
+        assert!(
+            anthropic_opus_sonnet.iter().any(|m| m.model.reasoning),
+            "expected at least one reasoning anthropic opus/sonnet model"
+        );
+
+        // Modern Opus/Sonnet 4 family should be reasoning-enabled.
+        for m in anthropic_opus_sonnet
+            .iter()
+            .filter(|m| m.model.id.contains("opus-4") || m.model.id.contains("sonnet-4"))
         {
             assert!(m.model.reasoning, "{} should be reasoning", m.model.id);
         }
+    }
+
+    #[test]
+    fn model_is_reasoning_known_families() {
+        // OpenAI
+        assert_eq!(model_is_reasoning("o1-preview"), Some(true));
+        assert_eq!(model_is_reasoning("o3-mini"), Some(true));
+        assert_eq!(model_is_reasoning("o4-mini"), Some(true));
+        assert_eq!(model_is_reasoning("gpt-5"), Some(true));
+        assert_eq!(model_is_reasoning("gpt-4o"), Some(false));
+        assert_eq!(model_is_reasoning("gpt-4-turbo"), Some(false));
+        assert_eq!(model_is_reasoning("gpt-3.5-turbo"), Some(false));
+
+        // Anthropic
+        assert_eq!(model_is_reasoning("claude-sonnet-4-20250514"), Some(true));
+        assert_eq!(model_is_reasoning("claude-opus-4-20250514"), Some(true));
+        assert_eq!(model_is_reasoning("claude-3-5-sonnet-20241022"), Some(true));
+        assert_eq!(model_is_reasoning("claude-3-5-haiku-20241022"), Some(false));
+        assert_eq!(model_is_reasoning("claude-3-haiku-20240307"), Some(false));
+        assert_eq!(model_is_reasoning("claude-3-opus-20240229"), Some(false));
+        assert_eq!(model_is_reasoning("claude-3-sonnet-20240229"), Some(false));
+
+        // Google
+        assert_eq!(model_is_reasoning("gemini-2.5-pro"), Some(true));
+        assert_eq!(model_is_reasoning("gemini-2.5-flash"), Some(true));
+        assert_eq!(
+            model_is_reasoning("gemini-2.0-flash-thinking-exp"),
+            Some(true)
+        );
+        assert_eq!(model_is_reasoning("gemini-2.0-flash"), Some(false));
+        assert_eq!(model_is_reasoning("gemini-2.0-flash-lite"), Some(false));
+        assert_eq!(model_is_reasoning("gemini-1.5-pro"), Some(false));
+
+        // Cohere
+        assert_eq!(model_is_reasoning("command-a-03-2025"), Some(true));
+        assert_eq!(model_is_reasoning("command-r-plus"), Some(false));
+        assert_eq!(model_is_reasoning("command-r"), Some(false));
+
+        // DeepSeek
+        assert_eq!(model_is_reasoning("deepseek-reasoner"), Some(true));
+        assert_eq!(model_is_reasoning("deepseek-r1"), Some(true));
+        assert_eq!(model_is_reasoning("deepseek-chat"), Some(false));
+        assert_eq!(model_is_reasoning("deepseek-coder"), Some(false));
+
+        // Qwen
+        assert_eq!(model_is_reasoning("qwq-32b"), Some(true));
+        assert_eq!(model_is_reasoning("qwq-1b"), Some(true));
+
+        // Mistral
+        assert_eq!(model_is_reasoning("mistral-large-latest"), Some(false));
+        assert_eq!(model_is_reasoning("mistral-small-latest"), Some(false));
+        assert_eq!(model_is_reasoning("codestral-latest"), Some(false));
+        assert_eq!(model_is_reasoning("pixtral-large-latest"), Some(false));
+
+        // Meta Llama
+        assert_eq!(model_is_reasoning("llama-3.3-70b-versatile"), Some(false));
+        assert_eq!(model_is_reasoning("llama-4-scout"), Some(false));
+
+        // Unknown models return None (fall back to provider default)
+        assert_eq!(model_is_reasoning("some-custom-model"), None);
+        assert_eq!(model_is_reasoning("my-fine-tune"), None);
     }
 
     mod proptest_models {
@@ -2748,7 +3864,12 @@ mod tests {
                 let entry = dummy_model(&id, true);
                 let expected = matches!(
                     id.as_str(),
-                    "gpt-5.1-codex-max" | "gpt-5.2" | "gpt-5.2-codex"
+                    "gpt-5.1-codex-max"
+                        | "gpt-5.2"
+                        | "gpt-5.4"
+                        | "gpt-5.2-codex"
+                        | "gpt-5.3-codex"
+                        | "gpt-5.3-codex-spark"
                 );
                 assert_eq!(entry.supports_xhigh(), expected);
             }

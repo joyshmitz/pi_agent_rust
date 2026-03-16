@@ -263,6 +263,8 @@ fn rpc_get_state_fresh_session() {
             "sessionId",
             "sessionName",
             "model",
+            "autoCompactionEnabled",
+            "autoRetryEnabled",
             "messageCount",
             "pendingMessageCount",
             "durabilityMode",
@@ -281,6 +283,44 @@ fn rpc_get_state_fresh_session() {
 
         // In-memory session has null sessionFile.
         assert!(resp["data"]["sessionFile"].is_null());
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "server error: {result:?}");
+    });
+}
+
+#[test]
+fn rpc_set_auto_retry_updates_get_state() {
+    let _harness = TestHarness::new("rpc_set_auto_retry_updates_get_state");
+
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let (in_tx, out_rx, server) = setup_rpc(Session::in_memory(), &handle);
+
+        let resp = send_recv(
+            &in_tx,
+            &out_rx,
+            r#"{"id":"1","type":"set_auto_retry","enabled":false}"#,
+            "set_auto_retry",
+        )
+        .await;
+        assert_eq!(resp["success"], true);
+        assert_eq!(resp["command"], "set_auto_retry");
+
+        let state = send_recv(
+            &in_tx,
+            &out_rx,
+            r#"{"id":"2","type":"get_state"}"#,
+            "get_state after set_auto_retry",
+        )
+        .await;
+        assert_eq!(state["success"], true);
+        assert_eq!(state["data"]["autoRetryEnabled"], false);
 
         drop(in_tx);
         let result = server.await;

@@ -16,11 +16,12 @@ use asupersync::channel::mpsc;
 use asupersync::runtime::RuntimeHandle;
 use asupersync::sync::Mutex;
 use async_trait::async_trait;
-use bubbles::spinner::{SpinnerModel, spinners};
+use bubbles::spinner::{SpinnerModel, TickMsg as SpinnerTickMsg, spinners};
 use bubbles::textarea::TextArea;
 use bubbles::viewport::Viewport;
 use bubbletea::{
-    Cmd, KeyMsg, KeyType, Message, Model as BubbleteaModel, Program, WindowSizeMsg, batch, quit,
+    Cmd, KeyMsg, KeyType, Message, Model as BubbleteaModel, MouseButton, MouseMsg, Program,
+    WindowSizeMsg, batch, quit, sequence,
 };
 use chrono::Utc;
 use crossterm::{cursor, terminal};
@@ -38,7 +39,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::agent::{AbortHandle, Agent, AgentEvent, QueueMode};
 use crate::autocomplete::{AutocompleteCatalog, AutocompleteItem, AutocompleteItemKind};
-use crate::config::{Config, SettingsScope, parse_queue_mode_or_default};
+use crate::config::{Config, ExtensionPolicyConfig, SettingsScope, parse_queue_mode_or_default};
 use crate::extension_events::{InputEventOutcome, apply_input_event_response};
 use crate::extensions::{
     EXTENSION_EVENT_TIMEOUT_MS, ExtensionDeliverAs, ExtensionEventName, ExtensionHostActions,
@@ -113,10 +114,11 @@ use self::perf::{
 use self::state::TOOL_AUTO_COLLAPSE_THRESHOLD;
 pub use self::state::{AgentState, InputMode, PendingInput};
 use self::state::{
-    AutocompleteState, BranchPickerOverlay, CapabilityAction, CapabilityPromptOverlay, HistoryList,
-    InjectedMessageQueue, InteractiveMessageQueue, PendingLoginKind, PendingOAuth,
-    QueuedMessageKind, SessionPickerOverlay, SettingsUiEntry, SettingsUiState,
-    TOOL_COLLAPSE_PREVIEW_LINES, ThemePickerItem, ThemePickerOverlay, ToolProgress, format_count,
+    AutocompleteState, BranchPickerOverlay, CapabilityAction, CapabilityPromptOverlay,
+    ExtensionCustomOverlay, HistoryList, InjectedMessageQueue, InteractiveMessageQueue,
+    PendingLoginKind, PendingOAuth, QueuedMessageKind, SessionPickerOverlay, SettingsUiEntry,
+    SettingsUiState, TOOL_COLLAPSE_PREVIEW_LINES, ThemePickerItem, ThemePickerOverlay,
+    ToolProgress, format_count,
 };
 pub use self::state::{ConversationMessage, MessageRole};
 #[cfg(test)]
@@ -130,6 +132,265 @@ use self::tree::{
     TreeSummaryPromptState, TreeUiState, collect_tree_branch_entries,
     resolve_tree_selector_initial_id, view_tree_ui,
 };
+
+// ============================================================================
+// Tmux wheel scroll guard
+// ============================================================================
+
+/// RAII guard that overrides tmux WheelUp/WheelDown bindings for the current
+/// pane so that mouse wheel events are forwarded to the application instead of
+/// triggering tmux copy-mode.  When dropped (including on panic), the original
+/// bindings are restored.
+///
+/// The override is pane-scoped: other panes in the same tmux session are not
+/// affected.  If `PI_TMUX_WHEEL_OVERRIDE=0` is set, no override is installed.
+struct TmuxWheelGuard {
+    /// Original WheelUp binding (None if there was no binding).
+    saved_wheel_up: Option<String>,
+    /// Original WheelDown binding (None if there was no binding).
+    saved_wheel_down: Option<String>,
+}
+
+impl TmuxWheelGuard {
+    /// Attempt to install pane-scoped tmux wheel overrides.
+    ///
+    /// Returns `None` if:
+    /// - Not running inside tmux (`$TMUX` unset)
+    /// - `PI_TMUX_WHEEL_OVERRIDE=0` env is set
+    /// - `tmux` binary is not available or returns errors
+    fn install() -> Option<Self> {
+        // Respect opt-out env var.
+        if std::env::var("PI_TMUX_WHEEL_OVERRIDE")
+            .ok()
+            .is_some_and(|v| v == "0")
+        {
+            return None;
+        }
+
+        // Check if we're in tmux.
+        std::env::var_os("TMUX")?;
+
+        // Get the current pane ID.
+        let pane = std::process::Command::new("tmux")
+            .args(["display-message", "-p", "#{pane_id}"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    String::from_utf8(o.stdout)
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                } else {
+                    None
+                }
+            })?;
+
+        if pane.is_empty() {
+            return None;
+        }
+
+        // Save existing WheelUpPane/WheelDownPane bindings so we can restore them.
+        let saved_wheel_up = Self::get_binding("WheelUpPane");
+        let saved_wheel_down = Self::get_binding("WheelDownPane");
+
+        // `bind-key -T root` is global, so make the binding conditional on the
+        // current pane and delegate to the original command for all other panes.
+        Self::install_binding_for_pane(&pane, "WheelUpPane", saved_wheel_up.as_deref());
+        Self::install_binding_for_pane(&pane, "WheelDownPane", saved_wheel_down.as_deref());
+
+        Some(Self {
+            saved_wheel_up,
+            saved_wheel_down,
+        })
+    }
+
+    /// Query the current tmux binding for a key in the root table.
+    fn get_binding(key: &str) -> Option<String> {
+        let output = std::process::Command::new("tmux")
+            .args(["list-keys", "-T", "root"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Each line looks like: bind-key    -T root    WheelUpPane    if-shell -F ...
+        for line in stdout.lines() {
+            if Self::binding_key_and_command(line).is_some_and(|(bound_key, _)| bound_key == key) {
+                return Some(line.trim().to_string());
+            }
+        }
+        None
+    }
+
+    /// Extract the bound command payload from a `list-keys` line.
+    fn binding_command(saved_line: &str, key_name: &str) -> Option<String> {
+        let (bound_key, command) = Self::binding_key_and_command(saved_line)?;
+        (bound_key == key_name && !command.is_empty()).then(|| command.to_string())
+    }
+
+    fn binding_key_and_command(saved_line: &str) -> Option<(&str, &str)> {
+        let (_, bind_end) = Self::next_shell_token_bounds(saved_line, 0)?;
+        if saved_line.get(..bind_end)? != "bind-key" {
+            return None;
+        }
+
+        let mut cursor = bind_end;
+        loop {
+            let (token_start, token_end) = Self::next_shell_token_bounds(saved_line, cursor)?;
+            let token = saved_line.get(token_start..token_end)?;
+            cursor = token_end;
+
+            match token {
+                "-T" | "-N" => {
+                    let (_, value_end) = Self::next_shell_token_bounds(saved_line, cursor)?;
+                    cursor = value_end;
+                }
+                _ if token.starts_with('-') => {}
+                _ => {
+                    let command = saved_line.get(cursor..)?.trim_start();
+                    return Some((token, command));
+                }
+            }
+        }
+    }
+
+    fn next_shell_token_bounds(input: &str, from: usize) -> Option<(usize, usize)> {
+        let bytes = input.as_bytes();
+        let mut idx = from;
+        while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+        }
+        if idx >= bytes.len() {
+            return None;
+        }
+
+        let start = idx;
+        let mut in_single = false;
+        let mut in_double = false;
+        while idx < bytes.len() {
+            let byte = bytes[idx];
+            if in_single {
+                if byte == b'\'' {
+                    in_single = false;
+                }
+                idx += 1;
+                continue;
+            }
+            if in_double {
+                if byte == b'\\' && idx + 1 < bytes.len() {
+                    idx += 2;
+                    continue;
+                }
+                if byte == b'"' {
+                    in_double = false;
+                }
+                idx += 1;
+                continue;
+            }
+
+            match byte {
+                b'\'' => {
+                    in_single = true;
+                    idx += 1;
+                }
+                b'"' => {
+                    in_double = true;
+                    idx += 1;
+                }
+                b'\\' if idx + 1 < bytes.len() => {
+                    idx += 2;
+                }
+                _ if byte.is_ascii_whitespace() => break,
+                _ => {
+                    idx += 1;
+                }
+            }
+        }
+
+        Some((start, idx))
+    }
+
+    /// Install a tmux mouse-wheel override that only applies to `pane`.
+    fn install_binding_for_pane(pane: &str, key_name: &str, saved_line: Option<&str>) {
+        let fallback = saved_line
+            .and_then(|line| Self::binding_command(line, key_name))
+            .unwrap_or_default();
+        let args = Self::pane_scoped_binding_args(pane, key_name, fallback);
+        let _ = std::process::Command::new("tmux").args(&args).status();
+    }
+
+    fn pane_scoped_binding_args(pane: &str, key_name: &str, fallback: String) -> Vec<String> {
+        let condition = format!("#{{==:#{{pane_id}},{pane}}}");
+        vec![
+            "bind-key".to_string(),
+            "-T".to_string(),
+            "root".to_string(),
+            key_name.to_string(),
+            "if-shell".to_string(),
+            "-F".to_string(),
+            condition,
+            "send-keys -M".to_string(),
+            fallback,
+        ]
+    }
+
+    /// Restore the original binding for a wheel direction, or unbind if there
+    /// was no previous binding.
+    fn restore_binding(saved: Option<&str>, key_name: &str) {
+        if let Some(line) = saved {
+            // Restore the exact serialized bind-key command that tmux gave us.
+            Self::run_tmux_command_line(line);
+        } else {
+            // No previous binding — unbind to revert to tmux default behavior.
+            let _ = std::process::Command::new("tmux")
+                .args(["unbind-key", "-T", "root", key_name])
+                .status();
+        }
+    }
+
+    fn run_tmux_command_line(command: &str) {
+        use std::io::Write as _;
+
+        let Ok(mut child) = std::process::Command::new("tmux")
+            .args(["source-file", "-"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        else {
+            return;
+        };
+
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(command.as_bytes());
+            let _ = stdin.write_all(b"\n");
+        }
+
+        let _ = child.wait();
+    }
+}
+
+impl Drop for TmuxWheelGuard {
+    fn drop(&mut self) {
+        Self::restore_binding(self.saved_wheel_up.as_deref(), "WheelUpPane");
+        Self::restore_binding(self.saved_wheel_down.as_deref(), "WheelDownPane");
+    }
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Compute the maximum visible items for overlay pickers (model selector,
+/// session picker, settings, branch picker, etc.) based on the terminal height.
+///
+/// The overlay typically needs ~8 rows of chrome: title, search field, divider,
+/// pagination hint, detail line, help footer, and margins.  We reserve that
+/// overhead and clamp the result to `[3, 30]` so the UI stays usable on very
+/// small terminals while allowing taller lists on large ones.
+fn overlay_max_visible(term_height: usize) -> usize {
+    const OVERLAY_CHROME_ROWS: usize = 8;
+    term_height.saturating_sub(OVERLAY_CHROME_ROWS).clamp(3, 30)
+}
 
 // ============================================================================
 // Slash Commands
@@ -160,14 +421,28 @@ impl PiApp {
             None
         };
 
+        // When the user has scrolled away (follow_tail == false), preserve
+        // the absolute y_offset so new content appended at the bottom does
+        // not shift the lines the user is reading.
+        let saved_offset = if follow_tail {
+            None
+        } else {
+            Some(self.conversation_viewport.y_offset())
+        };
+
         let content = self.build_conversation_content();
         let trimmed = content.trim_end();
         let effective = self.view_effective_conversation_height().max(1);
         self.conversation_viewport.height = effective;
         self.conversation_viewport.set_content(trimmed);
+
         if follow_tail {
             self.conversation_viewport.goto_bottom();
             self.follow_stream_tail = true;
+        } else if let Some(offset) = saved_offset {
+            // Restore the exact scroll position. set_y_offset() clamps to
+            // max_y_offset internally, so this is safe even if content shrank.
+            self.conversation_viewport.set_y_offset(offset);
         }
 
         if let Some(start) = vp_start {
@@ -202,6 +477,87 @@ impl PiApp {
             self.conversation_viewport.goto_bottom();
             self.follow_stream_tail = true;
         }
+    }
+
+    /// Handle a mouse wheel event, routing it to the appropriate overlay or
+    /// the conversation viewport.  Returns `None` (no command needed).
+    fn handle_mouse_wheel(&mut self, is_up: bool) -> Option<Cmd> {
+        // Priority 1: tree UI captures everything.
+        if self.tree_ui.is_some() {
+            // Tree UI has its own scroll; we don't intercept here.
+            return None;
+        }
+
+        // Priority 2: model selector overlay.
+        if let Some(ref mut selector) = self.model_selector {
+            if is_up {
+                selector.select_prev();
+            } else {
+                selector.select_next();
+            }
+            return None;
+        }
+
+        // Priority 3: session picker overlay.
+        if let Some(ref mut picker) = self.session_picker {
+            if is_up {
+                picker.select_prev();
+            } else {
+                picker.select_next();
+            }
+            return None;
+        }
+
+        // Priority 4: settings UI overlay.
+        if let Some(ref mut settings) = self.settings_ui {
+            if is_up {
+                settings.select_prev();
+            } else {
+                settings.select_next();
+            }
+            return None;
+        }
+
+        // Priority 5: theme picker overlay.
+        if let Some(ref mut picker) = self.theme_picker {
+            if is_up {
+                picker.select_prev();
+            } else {
+                picker.select_next();
+            }
+            return None;
+        }
+
+        // Priority 6: branch picker overlay.
+        if let Some(ref mut picker) = self.branch_picker {
+            if is_up {
+                picker.select_prev();
+            } else {
+                picker.select_next();
+            }
+            return None;
+        }
+
+        // No overlay open: scroll the conversation viewport.
+        // Sync content before scrolling (same pattern as PageUp/PageDown).
+        let saved_offset = self.conversation_viewport.y_offset();
+        let content = self.build_conversation_content();
+        let effective = self.view_effective_conversation_height().max(1);
+        self.conversation_viewport.height = effective;
+        self.conversation_viewport.set_content(content.trim_end());
+        self.conversation_viewport.set_y_offset(saved_offset);
+
+        if is_up {
+            self.conversation_viewport.scroll_up(1);
+            self.follow_stream_tail = false;
+        } else {
+            self.conversation_viewport.scroll_down(1);
+            // Re-enable auto-follow if scrolled back to the bottom.
+            if self.is_at_bottom() {
+                self.follow_stream_tail = true;
+            }
+        }
+        None
     }
 
     fn apply_theme(&mut self, theme: Theme) {
@@ -254,6 +610,9 @@ impl PiApp {
         if let Ok(mut queue) = self.message_queue.lock() {
             queue.set_modes(steering_mode, follow_up_mode);
         }
+        if let Ok(mut queue) = self.injected_queue.lock() {
+            queue.set_modes(steering_mode, follow_up_mode);
+        }
 
         if let Ok(mut agent_guard) = self.agent.try_lock() {
             agent_guard.set_queue_modes(steering_mode, follow_up_mode);
@@ -262,9 +621,10 @@ impl PiApp {
 
         let agent = Arc::clone(&self.agent);
         let runtime_handle = self.runtime_handle.clone();
+        let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
         runtime_handle.spawn(async move {
-            let cx = Cx::for_request();
-            if let Ok(mut agent_guard) = agent.lock(&cx).await {
+            let _current = Cx::set_current(Some(task_cx.clone()));
+            if let Ok(mut agent_guard) = agent.lock(&task_cx).await {
                 agent_guard.set_queue_modes(steering_mode, follow_up_mode);
             }
         });
@@ -331,6 +691,35 @@ impl PiApp {
         })
     }
 
+    fn effective_default_permissive(&self) -> bool {
+        self.config
+            .extension_policy
+            .as_ref()
+            .and_then(|policy| policy.default_permissive)
+            .unwrap_or(true)
+    }
+
+    fn has_loaded_extensions(&self) -> bool {
+        self.extensions
+            .as_ref()
+            .is_some_and(ExtensionManager::has_loaded_extensions)
+    }
+
+    fn default_permissive_changes_require_extension_restart(&self) -> bool {
+        self.has_loaded_extensions()
+    }
+
+    fn default_permissive_update_status(&self, next: bool) -> String {
+        let mut status = format!(
+            "Updated extensionPolicy.defaultPermissive: {}",
+            bool_label(next)
+        );
+        if self.default_permissive_changes_require_extension_restart() {
+            status.push_str(" (restart active extensions/session to apply)");
+        }
+        status
+    }
+
     fn apply_hardware_cursor(show: bool) {
         let mut stdout = std::io::stdout();
         if show {
@@ -345,6 +734,20 @@ impl PiApp {
         match entry {
             SettingsUiEntry::SteeringMode | SettingsUiEntry::FollowUpMode => {
                 self.toggle_queue_mode_setting(entry);
+            }
+            SettingsUiEntry::DefaultPermissive => {
+                let next = !self.effective_default_permissive();
+                if self.persist_project_settings_patch(
+                    "extensionPolicy.defaultPermissive",
+                    json!({ "extensionPolicy": { "defaultPermissive": next } }),
+                ) {
+                    let policy = self
+                        .config
+                        .extension_policy
+                        .get_or_insert_with(ExtensionPolicyConfig::default);
+                    policy.default_permissive = Some(next);
+                    self.status_message = Some(self.default_permissive_update_status(next));
+                }
             }
             SettingsUiEntry::QuietStartup => {
                 let next = !self.config.quiet_startup.unwrap_or(false);
@@ -428,7 +831,7 @@ impl PiApp {
                     self.config.editor_padding_x = u32::try_from(next).ok();
                     self.editor_padding_x = next;
                     self.input
-                        .set_width(self.term_width.saturating_sub(4 + self.editor_padding_x));
+                        .set_width(self.term_width.saturating_sub(5 + self.editor_padding_x));
                     self.scroll_to_bottom();
                     self.status_message = Some(format!("Updated editorPaddingX: {next}"));
                 }
@@ -451,7 +854,9 @@ impl PiApp {
             }
             SettingsUiEntry::Theme => {
                 self.settings_ui = None;
-                self.theme_picker = Some(ThemePickerOverlay::new(&self.cwd));
+                let mut picker = ThemePickerOverlay::new(&self.cwd);
+                picker.max_visible = overlay_max_visible(self.term_height);
+                self.theme_picker = Some(picker);
             }
             SettingsUiEntry::Summary => {}
         }
@@ -543,6 +948,7 @@ impl PiApp {
         let keep_recent = self.config.compaction_keep_recent_tokens();
         let steering = self.config.steering_queue_mode();
         let follow_up = self.config.follow_up_queue_mode();
+        let default_permissive = self.effective_default_permissive();
         let quiet_startup = self.config.quiet_startup.unwrap_or(false);
         let collapse_changelog = self.config.collapse_changelog.unwrap_or(false);
         let hide_thinking_block = self.config.hide_thinking_block.unwrap_or(false);
@@ -567,6 +973,16 @@ impl PiApp {
         );
         let _ = writeln!(output, "  steeringMode: {}", steering.as_str());
         let _ = writeln!(output, "  followUpMode: {}", follow_up.as_str());
+        let _ = writeln!(
+            output,
+            "  extensionPolicy.defaultPermissive: {}{}",
+            bool_label(default_permissive),
+            if self.default_permissive_changes_require_extension_restart() {
+                " (future changes apply after extension restart)"
+            } else {
+                ""
+            }
+        );
         let _ = writeln!(output, "  quietStartup: {}", bool_label(quiet_startup));
         let _ = writeln!(
             output,
@@ -651,27 +1067,36 @@ impl PiApp {
         let session = Arc::clone(&self.session);
         let event_tx = self.event_tx.clone();
         let runtime_handle = self.runtime_handle.clone();
+        let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
         runtime_handle.spawn(async move {
-            let cx = Cx::for_request();
+            let _current = Cx::set_current(Some(task_cx.clone()));
 
-            let mut session_guard = match session.lock(&cx).await {
+            let mut session_guard = match session.lock(&task_cx).await {
                 Ok(guard) => guard,
                 Err(err) => {
-                    let _ = event_tx
-                        .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &Cx::for_request(),
+                        PiMsg::AgentError(format!("Failed to lock session: {err}")),
+                    )
+                    .await;
                     return;
                 }
             };
 
             if let Err(err) = session_guard.save().await {
-                let _ =
-                    event_tx.try_send(PiMsg::AgentError(format!("Failed to save session: {err}")));
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &Cx::for_request(),
+                    PiMsg::AgentError(format!("Failed to save session: {err}")),
+                )
+                .await;
             }
         });
     }
 
     fn maybe_trigger_autocomplete(&mut self) {
-        if self.agent_state != AgentState::Idle
+        if !matches!(self.agent_state, AgentState::Idle)
             || self.session_picker.is_some()
             || self.settings_ui.is_some()
         {
@@ -704,12 +1129,87 @@ impl PiApp {
         self.maybe_trigger_autocomplete();
     }
 
-    /// Compute the conversation viewport height based on the current input area height.
-    /// Layout budget: header (2 rows) + input decoration (2 rows) + input lines + footer (2 rows).
+    /// Compute the conversation viewport height based on the current UI chrome.
+    ///
+    /// This delegates to [`view_effective_conversation_height`] so viewport
+    /// scroll math stays aligned with the rows actually rendered in `view()`.
     fn conversation_viewport_height(&self) -> usize {
-        let chrome = 2 + 2 + 2; // header + input_decoration + footer
-        self.term_height
-            .saturating_sub(chrome + self.input.height())
+        self.view_effective_conversation_height()
+    }
+
+    /// Return whether the generic "Processing..." spinner row should be shown.
+    ///
+    /// Once provider text/thinking deltas are streaming, that output already
+    /// acts as progress feedback; suppressing the extra animated status row
+    /// reduces redraw churn and visible flicker.
+    fn show_processing_status_spinner(&self) -> bool {
+        if matches!(self.agent_state, AgentState::Idle) || self.current_tool.is_some() {
+            return false;
+        }
+
+        let has_visible_stream_progress = !self.current_response.is_empty()
+            || (self.thinking_visible && !self.current_thinking.is_empty());
+        !has_visible_stream_progress
+    }
+
+    /// Return whether any spinner row is currently visible in `view()`.
+    ///
+    /// The spinner is rendered either for tool execution progress, or for the
+    /// generic processing state before visible stream output appears.
+    fn spinner_visible(&self) -> bool {
+        if matches!(self.agent_state, AgentState::Idle) {
+            return false;
+        }
+        self.current_tool.is_some() || self.show_processing_status_spinner()
+    }
+
+    /// Return whether the normal editor input area should be visible.
+    ///
+    /// Keeping this in one place prevents overlay/input drift between
+    /// rendering, viewport sizing, and keyboard dispatch.
+    const fn editor_input_is_available(&self) -> bool {
+        matches!(self.agent_state, AgentState::Idle)
+            && self.tree_ui.is_none()
+            && self.session_picker.is_none()
+            && self.settings_ui.is_none()
+            && self.theme_picker.is_none()
+            && self.capability_prompt.is_none()
+            && self.extension_custom_overlay.is_none()
+            && self.branch_picker.is_none()
+            && self.model_selector.is_none()
+    }
+
+    /// Return whether a custom extension overlay should currently receive
+    /// keyboard input.
+    ///
+    /// Higher-priority modal overlays must win when they are present;
+    /// otherwise the prompt renders but can never be answered.
+    const fn custom_overlay_input_is_available(&self) -> bool {
+        self.extension_custom_active
+            && self.tree_ui.is_none()
+            && self.session_picker.is_none()
+            && self.settings_ui.is_none()
+            && self.theme_picker.is_none()
+            && self.capability_prompt.is_none()
+            && self.branch_picker.is_none()
+            && self.model_selector.is_none()
+    }
+
+    /// Approximate how many rows the custom extension overlay renders.
+    ///
+    /// `render_extension_custom_overlay()` emits:
+    /// - a leading blank spacer row plus the title row
+    /// - the source row
+    /// - either the waiting line or the visible frame tail
+    /// - the help row
+    fn extension_custom_overlay_rows(&self) -> usize {
+        let Some(overlay) = self.extension_custom_overlay.as_ref() else {
+            return 0;
+        };
+
+        let max_lines = self.term_height.saturating_sub(12).max(4);
+        let visible_lines = overlay.lines.len().min(max_lines).max(1);
+        4 + visible_lines
     }
 
     /// Compute the effective conversation viewport height for the current
@@ -720,8 +1220,10 @@ impl PiApp {
     /// never exceeds `term_height` rows.  The stored
     /// `conversation_viewport.height` still drives scroll-position management.
     fn view_effective_conversation_height(&self) -> usize {
-        // Fixed chrome: header(2) + footer(2).
-        let mut chrome: usize = 2 + 2;
+        // Fixed chrome:
+        // header(4) = title/model + hints + resources + spacer line
+        // footer(2) = blank line + footer line
+        let mut chrome: usize = 4 + 2;
 
         // Budget 1 row for the scroll indicator.  Slightly conservative
         // when content is short, but prevents the off-by-one that triggers
@@ -743,25 +1245,73 @@ impl PiApp {
             chrome += 8;
         }
 
+        // Custom extension overlay: spacer + title + source + content/help.
+        chrome += self.extension_custom_overlay_rows();
+
         // Branch picker overlay: header + N visible branches + help line + padding.
         if let Some(ref picker) = self.branch_picker {
             let visible = picker.branches.len().min(picker.max_visible);
             chrome += 3 + visible + 2; // title + header + separator + items + help + blank
         }
 
-        // Input area vs processing spinner.
-        let show_input = self.agent_state == AgentState::Idle
-            && self.session_picker.is_none()
-            && self.settings_ui.is_none()
-            && self.theme_picker.is_none()
-            && self.capability_prompt.is_none()
-            && self.branch_picker.is_none()
-            && self.model_selector.is_none();
+        // Model selector overlay: title + config-only hint + search + separator + items + detail + help + padding.
+        if let Some(ref selector) = self.model_selector {
+            let visible = selector.max_visible().min(selector.filtered_len().max(1));
+            // ~6 lines of chrome (title, optional hint, search, separator, detail/status, help)
+            chrome += visible + 6;
+        }
 
-        if show_input {
+        // Session picker overlay: title + search + separator + items + help + padding.
+        if let Some(ref picker) = self.session_picker {
+            let visible = picker.sessions.len().min(picker.max_visible);
+            chrome += visible + 6; // title + blank + search + separator + items + help + blank
+        }
+
+        // Settings UI overlay: title + items + help + padding.
+        if let Some(ref settings) = self.settings_ui {
+            let visible = settings.entries.len().min(settings.max_visible);
+            chrome += visible + 5; // title + blank + items + help + blank
+        }
+
+        // Theme picker overlay: title + items + help + padding.
+        if let Some(ref picker) = self.theme_picker {
+            let visible = picker.items.len().min(picker.max_visible);
+            chrome += visible + 5; // title + blank + items + help + blank
+        }
+
+        // Safety margin: when any overlay is active, add extra rows to absorb
+        // styling escape-sequence overhead and occasional line-wrap edge cases
+        // that can push content past the terminal bottom.
+        let any_overlay = self.session_picker.is_some()
+            || self.settings_ui.is_some()
+            || self.theme_picker.is_some()
+            || self.capability_prompt.is_some()
+            || self.extension_custom_overlay.is_some()
+            || self.branch_picker.is_some()
+            || self.model_selector.is_some();
+        if any_overlay {
+            chrome += 2;
+        }
+
+        // Input area vs processing spinner.
+        if self.editor_input_is_available() {
             // render_input: "\n  header\n" (2 rows) + input.height() rows.
             chrome += 2 + self.input.height();
-        } else if self.agent_state != AgentState::Idle {
+
+            // Autocomplete dropdown chrome when open: top border(1) +
+            // items(visible_count) + description(1) + pagination(1) +
+            // bottom border(1) + help(1).  Budget for the dropdown so
+            // the conversation viewport shrinks to make room.
+            if self.autocomplete.open && !self.autocomplete.items.is_empty() {
+                let visible = self
+                    .autocomplete
+                    .max_visible
+                    .min(self.autocomplete.items.len());
+                // 5 = top border + possible description + possible pagination
+                //     + bottom border + help line
+                chrome += visible + 5;
+            }
+        } else if self.show_processing_status_spinner() {
             // Processing spinner: "\n  spinner Processing...\n" = 2 rows.
             chrome += 2;
         }
@@ -782,7 +1332,7 @@ impl PiApp {
         let viewport_height = self.conversation_viewport_height();
         let mut viewport = Viewport::new(self.term_width.saturating_sub(2), viewport_height);
         viewport.mouse_wheel_enabled = true;
-        viewport.mouse_wheel_delta = 3;
+        viewport.mouse_wheel_delta = 1;
         self.conversation_viewport = viewport;
         self.scroll_to_bottom();
     }
@@ -793,7 +1343,7 @@ impl PiApp {
         self.term_width = width.max(1);
         self.term_height = height.max(1);
         self.input
-            .set_width(self.term_width.saturating_sub(4 + self.editor_padding_x));
+            .set_width(self.term_width.saturating_sub(5 + self.editor_padding_x));
 
         if !test_mode
             && self.term_height < previous_height
@@ -807,16 +1357,44 @@ impl PiApp {
 
         self.message_render_cache.invalidate_all();
         self.resize_conversation_viewport();
+
+        // Adapt open overlay pickers to the new terminal height.
+        let max_vis = overlay_max_visible(self.term_height);
+        if let Some(ref mut selector) = self.model_selector {
+            selector.set_max_visible(max_vis);
+        }
+        if let Some(ref mut picker) = self.session_picker {
+            picker.max_visible = max_vis;
+        }
+        if let Some(ref mut settings) = self.settings_ui {
+            settings.max_visible = max_vis;
+        }
+        if let Some(ref mut picker) = self.theme_picker {
+            picker.max_visible = max_vis;
+        }
+        if let Some(ref mut picker) = self.branch_picker {
+            picker.max_visible = max_vis;
+        }
     }
 
     fn accept_autocomplete(&mut self, item: &AutocompleteItem) {
         let text = self.input.value();
         let range = self.autocomplete.replace_range.clone();
 
+        // Guard against stale range if editor content changed since autocomplete was triggered.
+        let mut start = range.start.min(text.len());
+        while start > 0 && !text.is_char_boundary(start) {
+            start -= 1;
+        }
+        let mut end = range.end.min(text.len()).max(start);
+        while end < text.len() && !text.is_char_boundary(end) {
+            end += 1;
+        }
+
         let mut new_text = String::with_capacity(text.len().saturating_add(item.insert.len()));
-        new_text.push_str(&text[..range.start]);
+        new_text.push_str(&text[..start]);
         new_text.push_str(&item.insert);
-        new_text.push_str(&text[range.end..]);
+        new_text.push_str(&text[end..]);
 
         self.input.set_value(&new_text);
         self.input.cursor_end();
@@ -889,8 +1467,9 @@ impl PiApp {
             )
         };
 
+        let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
         runtime_handle.spawn(async move {
-            let cx = Cx::for_request();
+            let _current = Cx::set_current(Some(task_cx.clone()));
 
             if let Some(manager) = extensions.clone() {
                 let cancelled = manager
@@ -905,9 +1484,11 @@ impl PiApp {
                     .await
                     .unwrap_or(false);
                 if cancelled {
-                    let _ = event_tx.try_send(PiMsg::System(
-                        "Session switch cancelled by extension".to_string(),
-                    ));
+                    let _ = crate::interactive::enqueue_pi_event_current(
+                        &event_tx,
+                        PiMsg::System("Session switch cancelled by extension".to_string()),
+                    )
+                    .await;
                     return;
                 }
             }
@@ -915,8 +1496,11 @@ impl PiApp {
             let mut loaded_session = match Session::open(&path).await {
                 Ok(session) => session,
                 Err(err) => {
-                    let _ = event_tx
-                        .try_send(PiMsg::AgentError(format!("Failed to open session: {err}")));
+                    let _ = crate::interactive::enqueue_pi_event_current(
+                        &event_tx,
+                        PiMsg::AgentError(format!("Failed to open session: {err}")),
+                    )
+                    .await;
                     return;
                 }
             };
@@ -927,11 +1511,15 @@ impl PiApp {
 
             // Replace the session.
             {
-                let mut session_guard = match session.lock(&cx).await {
+                let mut session_guard = match session.lock(&task_cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
-                        let _ = event_tx
-                            .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
+                        let _ = crate::interactive::enqueue_pi_event(
+                            &event_tx,
+                            &Cx::for_request(),
+                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -940,11 +1528,14 @@ impl PiApp {
 
             // Update the agent messages.
             {
-                let mut agent_guard = match agent.lock(&cx).await {
+                let mut agent_guard = match agent.lock(&task_cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
-                        let _ = event_tx
-                            .try_send(PiMsg::AgentError(format!("Failed to lock agent: {err}")));
+                        let _ = crate::interactive::enqueue_pi_event_current(
+                            &event_tx,
+                            PiMsg::AgentError(format!("Failed to lock agent: {err}")),
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -952,22 +1543,30 @@ impl PiApp {
             }
 
             let (messages, usage) = {
-                let session_guard = match session.lock(&cx).await {
+                let session_guard = match session.lock(&task_cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
-                        let _ = event_tx
-                            .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
+                        let _ = crate::interactive::enqueue_pi_event(
+                            &event_tx,
+                            &Cx::for_request(),
+                            PiMsg::AgentError(format!("Failed to lock session: {err}")),
+                        )
+                        .await;
                         return;
                     }
                 };
                 conversation_from_session(&session_guard)
             };
 
-            let _ = event_tx.try_send(PiMsg::ConversationReset {
-                messages,
-                usage,
-                status: Some("Session resumed".to_string()),
-            });
+            let _ = crate::interactive::enqueue_pi_event_current(
+                &event_tx,
+                PiMsg::ConversationReset {
+                    messages,
+                    usage,
+                    status: Some("Session resumed".to_string()),
+                },
+            )
+            .await;
 
             if let Some(manager) = extensions {
                 let _ = manager
@@ -1023,11 +1622,13 @@ pub async fn run_interactive(
     }
 
     let (event_tx, event_rx) = mpsc::channel::<PiMsg>(1024);
+    let shutdown_event_tx = event_tx.clone();
     let (ui_tx, ui_rx) = std::sync::mpsc::channel::<Message>();
 
+    let ui_bridge_cx = Cx::current().unwrap_or_else(Cx::for_request);
     runtime_handle.spawn(async move {
-        let cx = Cx::for_request();
-        while let Ok(msg) = event_rx.recv(&cx).await {
+        let _current = Cx::set_current(Some(ui_bridge_cx.clone()));
+        while let Ok(msg) = event_rx.recv(&ui_bridge_cx).await {
             if matches!(msg, PiMsg::UiShutdown) {
                 break;
             }
@@ -1042,10 +1643,19 @@ pub async fn run_interactive(
         manager.set_ui_sender(extension_ui_tx);
 
         let extension_event_tx = event_tx.clone();
+        let extension_ui_cx = Cx::current().unwrap_or_else(Cx::for_request);
         runtime_handle.spawn(async move {
-            let cx = Cx::for_request();
-            while let Ok(request) = extension_ui_rx.recv(&cx).await {
-                let _ = extension_event_tx.try_send(PiMsg::ExtensionUiRequest(request));
+            let _current = Cx::set_current(Some(extension_ui_cx.clone()));
+            while let Ok(request) = extension_ui_rx.recv(&extension_ui_cx).await {
+                if !enqueue_pi_event(
+                    &extension_event_tx,
+                    &extension_ui_cx,
+                    PiMsg::ExtensionUiRequest(request),
+                )
+                .await
+                {
+                    break;
+                }
             }
         });
     }
@@ -1059,7 +1669,7 @@ pub async fn run_interactive(
         conversation_from_session(&guard)
     };
 
-    let app = PiApp::new(
+    Program::new(PiApp::new(
         agent,
         session,
         config,
@@ -1077,16 +1687,35 @@ pub async fn run_interactive(
         None,
         messages,
         usage,
-    );
+    ))
+    .with_alt_screen()
+    .with_mouse_all_motion()
+    .with_input_receiver(ui_rx)
+    .run()?;
 
-    Program::new(app)
-        .with_alt_screen()
-        .with_input_receiver(ui_rx)
-        .run()?;
+    // Tell the async bridge to exit promptly even if some background task still
+    // holds an event sender clone after the TUI has already shut down.
+    // Use a fresh cleanup scope so bridge teardown still runs even if the ambient
+    // interactive context is already cancelled while exiting.
+    let shutdown_cx = Cx::for_request();
+    enqueue_ui_shutdown(&shutdown_event_tx, &shutdown_cx).await;
 
     let _ = crossterm::execute!(std::io::stdout(), cursor::Show);
     println!("Goodbye!");
     Ok(())
+}
+
+pub(crate) async fn enqueue_pi_event(event_tx: &mpsc::Sender<PiMsg>, cx: &Cx, msg: PiMsg) -> bool {
+    event_tx.send(cx, msg).await.is_ok()
+}
+
+pub(crate) async fn enqueue_pi_event_current(event_tx: &mpsc::Sender<PiMsg>, msg: PiMsg) -> bool {
+    let cx = Cx::current().unwrap_or_else(Cx::for_request);
+    enqueue_pi_event(event_tx, &cx, msg).await
+}
+
+pub(crate) async fn enqueue_ui_shutdown(event_tx: &mpsc::Sender<PiMsg>, cx: &Cx) {
+    let _ = enqueue_pi_event(event_tx, cx, PiMsg::UiShutdown).await;
 }
 
 /// Custom message types for async agent events.
@@ -1127,6 +1756,8 @@ pub enum PiMsg {
     },
     /// Agent error.
     AgentError(String),
+    /// Credentials changed for a provider; refresh in-memory provider auth state.
+    CredentialUpdated { provider: String },
     /// Non-error system message.
     System(String),
     /// System note that does not mutate agent state (safe during streaming).
@@ -1137,6 +1768,14 @@ pub enum PiMsg {
     BashResult {
         display: String,
         content_for_agent: Option<Vec<ContentBlock>>,
+    },
+    /// Async OAuth device flow start
+    OAuthDeviceFlowStarted {
+        provider: String,
+        device_code: String,
+        user_code: String,
+        verification_uri: String,
+        expires_in: u64,
     },
     /// Replace conversation state from session (compaction/fork).
     ConversationReset {
@@ -1152,7 +1791,7 @@ pub enum PiMsg {
         status: String,
         diagnostics: Option<String>,
     },
-    /// Extension UI request (select/confirm/input/editor/notify).
+    /// Extension UI request (select/confirm/input/editor/custom/notify).
     ExtensionUiRequest(ExtensionUiRequest),
     /// Extension command finished execution.
     ExtensionCommandDone {
@@ -1160,6 +1799,9 @@ pub enum PiMsg {
         display: String,
         is_error: bool,
     },
+    /// OAuth callback server received the browser redirect.
+    /// The string is the full callback URL (e.g. `http://localhost:1455/auth/callback?code=abc&state=xyz`).
+    OAuthCallbackReceived(String),
 }
 
 /// Read the current git branch from `.git/HEAD` in the given directory.
@@ -1168,8 +1810,8 @@ pub enum PiMsg {
 /// `Some("abc1234")` (7-char short SHA) for detached HEAD,
 /// or `None` if not in a git repo or `.git/HEAD` is unreadable.
 fn read_git_branch(cwd: &Path) -> Option<String> {
-    let git_head = cwd.join(".git/HEAD");
-    let content = std::fs::read_to_string(&git_head).ok()?;
+    let git_head = find_git_head_path(cwd)?;
+    let content = std::fs::read_to_string(git_head).ok()?;
     let content = content.trim();
     content.strip_prefix("ref: refs/heads/").map_or_else(
         || {
@@ -1179,6 +1821,47 @@ fn read_git_branch(cwd: &Path) -> Option<String> {
         },
         |ref_path| Some(ref_path.to_string()),
     )
+}
+
+fn find_git_head_path(cwd: &Path) -> Option<PathBuf> {
+    let mut current = cwd.to_path_buf();
+    loop {
+        let dot_git = current.join(".git");
+        if let Some(git_head) = resolve_git_head_path(&dot_git) {
+            return Some(git_head);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+fn resolve_git_head_path(dot_git: &Path) -> Option<PathBuf> {
+    if dot_git.is_dir() {
+        let head = dot_git.join("HEAD");
+        return head.is_file().then_some(head);
+    }
+
+    if dot_git.is_file() {
+        let dot_git_contents = std::fs::read_to_string(dot_git).ok()?;
+        let gitdir = dot_git_contents
+            .trim()
+            .strip_prefix("gitdir:")
+            .map(str::trim)?;
+        if gitdir.is_empty() {
+            return None;
+        }
+        let resolved_gitdir = Path::new(gitdir);
+        let resolved_gitdir = if resolved_gitdir.is_absolute() {
+            resolved_gitdir.to_path_buf()
+        } else {
+            dot_git.parent()?.join(resolved_gitdir)
+        };
+        let head = resolved_gitdir.join("HEAD");
+        return head.is_file().then_some(head);
+    }
+
+    None
 }
 
 fn build_startup_welcome_message(config: &Config) -> String {
@@ -1210,6 +1893,7 @@ pub struct PiApp {
     input_mode: InputMode,
     pending_inputs: VecDeque<PendingInput>,
     message_queue: Arc<StdMutex<InteractiveMessageQueue>>,
+    injected_queue: Arc<StdMutex<InjectedMessageQueue>>,
 
     // Display state - viewport for scrollable conversation
     pub conversation_viewport: Viewport,
@@ -1266,6 +1950,9 @@ pub struct PiApp {
     extension_compacting: Arc<AtomicBool>,
     extension_ui_queue: VecDeque<ExtensionUiRequest>,
     active_extension_ui: Option<ExtensionUiRequest>,
+    extension_custom_overlay: Option<ExtensionCustomOverlay>,
+    extension_custom_active: bool,
+    extension_custom_key_queue: VecDeque<String>,
 
     // Status message (for slash command feedback)
     status_message: Option<String>,
@@ -1324,9 +2011,25 @@ pub struct PiApp {
     git_branch: Option<String>,
     // Startup banner shown in an empty conversation.
     startup_welcome: String,
+
+    // RAII guard for tmux wheel scroll override (dropped on exit/panic).
+    #[allow(dead_code)]
+    tmux_wheel_guard: Option<TmuxWheelGuard>,
 }
 
 impl PiApp {
+    fn initial_window_size_cmd() -> Cmd {
+        Cmd::new(|| {
+            let (width, height) = terminal::size().unwrap_or((80, 24));
+            Message::new(WindowSizeMsg { width, height })
+        })
+    }
+
+    fn startup_init_cmd(input_cmd: Option<Cmd>, pending_cmd: Option<Cmd>) -> Option<Cmd> {
+        let startup_cmd = sequence(vec![Some(Self::initial_window_size_cmd()), pending_cmd]);
+        batch(vec![input_cmd, startup_cmd])
+    }
+
     /// Create a new Pi application.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_lines)]
@@ -1370,20 +2073,21 @@ impl PiApp {
         input.show_line_numbers = false;
         input.prompt = "> ".to_string();
         input.set_height(3); // Start with 3 lines
-        input.set_width(term_width.saturating_sub(4 + editor_padding_x));
+        input.set_width(term_width.saturating_sub(5 + editor_padding_x));
         input.max_height = 10; // Allow expansion up to 10 lines
         input.focus();
 
         let spinner = SpinnerModel::with_spinner(spinners::dot()).style(styles.accent.clone());
 
         // Configure viewport for conversation history.
-        // Height budget: header(2) + input_decoration(2) + input_lines + footer(2).
-        let chrome = 2 + 2 + 2; // header + input_decoration + footer
+        // Height budget at startup (idle):
+        // header(4) + scroll-indicator reserve(1) + input_decoration(2) + input_lines + footer(2).
+        let chrome = 4 + 1 + 2 + 2;
         let viewport_height = term_height.saturating_sub(chrome + input.height());
         let mut conversation_viewport =
             Viewport::new(term_width.saturating_sub(2), viewport_height);
         conversation_viewport.mouse_wheel_enabled = true;
-        conversation_viewport.mouse_wheel_delta = 3;
+        conversation_viewport.mouse_wheel_delta = 1;
 
         let model = format!(
             "{}/{}",
@@ -1440,7 +2144,7 @@ impl PiApp {
                     out
                 })
             };
-            agent.set_message_fetchers(
+            agent.register_message_fetchers(
                 Some(Arc::new(steering_fetcher)),
                 Some(Arc::new(follow_up_fetcher)),
             );
@@ -1475,6 +2179,7 @@ impl PiApp {
             input_mode: InputMode::SingleLine,
             pending_inputs: VecDeque::from(pending_inputs),
             message_queue,
+            injected_queue: Arc::clone(&injected_queue),
             conversation_viewport,
             follow_stream_tail: true,
             spinner,
@@ -1511,6 +2216,9 @@ impl PiApp {
             extension_compacting: extension_compacting.clone(),
             extension_ui_queue: VecDeque::new(),
             active_extension_ui: None,
+            extension_custom_overlay: None,
+            extension_custom_active: false,
+            extension_custom_key_queue: VecDeque::new(),
             status_message: None,
             save_enabled,
             abort_handle: None,
@@ -1534,6 +2242,7 @@ impl PiApp {
             render_buffers: RenderBuffers::new(),
             git_branch,
             startup_welcome,
+            tmux_wheel_guard: TmuxWheelGuard::install(),
         };
 
         if let Some(manager) = app.extensions.clone() {
@@ -1577,6 +2286,11 @@ impl PiApp {
     #[must_use]
     pub fn session_handle(&self) -> Arc<Mutex<Session>> {
         Arc::clone(&self.session)
+    }
+
+    #[must_use]
+    pub fn agent_handle(&self) -> Arc<Mutex<Agent>> {
+        Arc::clone(&self.agent)
     }
 
     /// Get the current status message (for testing).
@@ -1653,26 +2367,29 @@ impl PiApp {
 
     /// Initialize the application.
     fn init(&self) -> Option<Cmd> {
-        // Start text input cursor blink and spinner
+        // Start text input cursor blink.
+        // Spinner ticks are started lazily when we transition idle -> busy.
         let test_mode = std::env::var_os("PI_TEST_MODE").is_some();
         let input_cmd = if test_mode {
             None
         } else {
             BubbleteaModel::init(&self.input)
         };
-        let spinner_cmd = if test_mode {
-            None
-        } else {
-            BubbleteaModel::init(&self.spinner)
-        };
         let pending_cmd = if self.pending_inputs.is_empty() {
             None
         } else {
             Some(Cmd::new(|| Message::new(PiMsg::RunPending)))
         };
+        // Ensure the initial window-size refresh lands before any queued startup work.
+        Self::startup_init_cmd(input_cmd, pending_cmd)
+    }
 
-        // Batch commands
-        batch(vec![input_cmd, spinner_cmd, pending_cmd])
+    fn spinner_init_cmd(&self) -> Option<Cmd> {
+        if std::env::var_os("PI_TEST_MODE").is_some() {
+            None
+        } else {
+            BubbleteaModel::init(&self.spinner)
+        }
     }
 
     /// Handle messages (keyboard input, async events, etc.).
@@ -1683,7 +2400,16 @@ impl PiApp {
         } else {
             None
         };
+        let was_busy = !matches!(self.agent_state, AgentState::Idle);
+        let was_spinner_visible = self.spinner_visible();
         let result = self.update_inner(msg);
+        let became_busy = !was_busy && !matches!(self.agent_state, AgentState::Idle);
+        let spinner_became_visible = !was_spinner_visible && self.spinner_visible();
+        let result = if became_busy || spinner_became_visible {
+            batch(vec![result, self.spinner_init_cmd()])
+        } else {
+            result
+        };
         if let Some(start) = update_start {
             self.frame_timing
                 .record_update(micros_as_u64(start.elapsed().as_micros()));
@@ -1698,13 +2424,33 @@ impl PiApp {
         self.memory_monitor.maybe_sample();
         self.run_memory_pressure_actions();
 
-        // Handle our custom Pi messages
-        if let Some(pi_msg) = msg.downcast_ref::<PiMsg>() {
-            return self.handle_pi_message(pi_msg.clone());
+        // Handle our custom Pi messages (take ownership to avoid per-token clone).
+        if msg.is::<PiMsg>() {
+            let pi_msg = msg
+                .downcast::<PiMsg>()
+                .expect("PiMsg downcast should succeed after type check");
+            return self.handle_pi_message(pi_msg);
         }
 
         if let Some(size) = msg.downcast_ref::<WindowSizeMsg>() {
             self.set_terminal_size(size.width as usize, size.height as usize);
+            return None;
+        }
+
+        // Handle mouse wheel events: route to overlays when open, otherwise
+        // scroll the conversation viewport.
+        if let Some(mouse) = msg.downcast_ref::<MouseMsg>() {
+            if mouse.is_wheel()
+                && (mouse.button == MouseButton::WheelUp || mouse.button == MouseButton::WheelDown)
+            {
+                let is_up = mouse.button == MouseButton::WheelUp;
+                return self.handle_mouse_wheel(is_up);
+            }
+        }
+
+        // Ignore spinner ticks when no spinner row is visible so old tick
+        // chains naturally stop and do not trigger hidden redraw churn.
+        if msg.downcast_ref::<SpinnerTickMsg>().is_some() && !self.spinner_visible() {
             return None;
         }
 
@@ -1714,6 +2460,10 @@ impl PiApp {
             self.status_message = None;
             if key.key_type != KeyType::Esc {
                 self.last_escape_time = None;
+            }
+
+            if self.handle_custom_extension_key(key) {
+                return None;
             }
 
             // /tree modal captures all input while active.
@@ -1745,6 +2495,8 @@ impl PiApp {
                 match key.key_type {
                     KeyType::Up => picker.select_prev(),
                     KeyType::Down => picker.select_next(),
+                    KeyType::PgUp => picker.select_page_up(),
+                    KeyType::PgDown => picker.select_page_down(),
                     KeyType::Runes if key.runes == ['k'] => picker.select_prev(),
                     KeyType::Runes if key.runes == ['j'] => picker.select_next(),
                     KeyType::Enter => {
@@ -1755,7 +2507,7 @@ impl PiApp {
                                     "solarized" => Theme::solarized(),
                                     _ => Theme::dark(),
                                 }),
-                                ThemePickerItem::File(path) => Theme::load(path),
+                                ThemePickerItem::File { path, .. } => Theme::load(path),
                             };
 
                             match loaded {
@@ -1782,12 +2534,16 @@ impl PiApp {
                     }
                     KeyType::Esc => {
                         self.theme_picker = None;
-                        self.settings_ui = Some(SettingsUiState::new());
+                        let mut settings = SettingsUiState::new();
+                        settings.max_visible = overlay_max_visible(self.term_height);
+                        self.settings_ui = Some(settings);
                         return None;
                     }
                     KeyType::Runes if key.runes == ['q'] => {
                         self.theme_picker = None;
-                        self.settings_ui = Some(SettingsUiState::new());
+                        let mut settings = SettingsUiState::new();
+                        settings.max_visible = overlay_max_visible(self.term_height);
+                        self.settings_ui = Some(settings);
                         return None;
                     }
                     _ => {}
@@ -1810,6 +2566,16 @@ impl PiApp {
                     }
                     KeyType::Down => {
                         settings_ui.select_next();
+                        self.settings_ui = Some(settings_ui);
+                        return None;
+                    }
+                    KeyType::PgUp => {
+                        settings_ui.select_page_up();
+                        self.settings_ui = Some(settings_ui);
+                        return None;
+                    }
+                    KeyType::PgDown => {
+                        settings_ui.select_page_down();
                         self.settings_ui = Some(settings_ui);
                         return None;
                     }
@@ -1918,6 +2684,14 @@ impl PiApp {
                         picker.select_next();
                         return None;
                     }
+                    KeyType::PgUp => {
+                        picker.select_page_up();
+                        return None;
+                    }
+                    KeyType::PgDown => {
+                        picker.select_page_down();
+                        return None;
+                    }
                     KeyType::Runes if key.runes == ['k'] && !picker.has_query() => {
                         picker.select_prev();
                         return None;
@@ -1977,6 +2751,11 @@ impl PiApp {
                         return None;
                     }
                     KeyType::Tab => {
+                        // If nothing is selected yet, select the first item
+                        // so Tab always accepts something when the popup is open.
+                        if self.autocomplete.selected.is_none() {
+                            self.autocomplete.select_next();
+                        }
                         // Accept the selected item
                         if let Some(item) = self.autocomplete.selected_item().cloned() {
                             self.accept_autocomplete(&item);
@@ -2020,7 +2799,7 @@ impl PiApp {
                 }
 
                 // Extension shortcuts: check if unhandled key matches an extension shortcut
-                if self.agent_state == AgentState::Idle {
+                if matches!(self.agent_state, AgentState::Idle) {
                     let key_id = binding.to_string().to_lowercase();
                     if let Some(manager) = &self.extensions {
                         if manager.has_shortcut(&key_id) {
@@ -2035,7 +2814,7 @@ impl PiApp {
         }
 
         // Forward to appropriate component based on state
-        if self.agent_state == AgentState::Idle {
+        if matches!(self.agent_state, AgentState::Idle) {
             let old_height = self.input.height();
 
             if let Some(key) = msg.downcast_ref::<KeyMsg>() {

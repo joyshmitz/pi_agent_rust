@@ -95,6 +95,50 @@ fn custom_model_entry(provider: &str, api_key: Option<&str>) -> ModelEntry {
 }
 
 #[test]
+fn dropin174_cli_surface_logs_include_requirement_id() {
+    let harness = TestHarness::new("dropin174_cli_surface_logs_include_requirement_id");
+    harness
+        .log()
+        .info_ctx("dropin174.cli", "CLI parity assertion", |ctx| {
+            ctx.push(("requirement_id".to_string(), "DROPIN-174-CLI".to_string()));
+            ctx.push(("surface".to_string(), "cli".to_string()));
+            ctx.push((
+                "parity_requirement".to_string(),
+                "CLI command/flag/subcommand parity".to_string(),
+            ));
+        });
+
+    let jsonl = harness.log().dump_jsonl();
+    let validation_errors = validate_jsonl(&jsonl);
+    assert!(
+        validation_errors.is_empty(),
+        "expected valid structured logs, got {validation_errors:?}"
+    );
+
+    let has_requirement_log = jsonl
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .any(|record| {
+            record.get("category").and_then(serde_json::Value::as_str) == Some("dropin174.cli")
+                && record
+                    .get("context")
+                    .and_then(|ctx| ctx.get("requirement_id"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("DROPIN-174-CLI")
+                && record
+                    .get("context")
+                    .and_then(|ctx| ctx.get("surface"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("cli")
+        });
+
+    assert!(
+        has_requirement_log,
+        "expected structured log entry to include requirement_id + surface context"
+    );
+}
+
+#[test]
 fn select_model_and_thinking_clamps_reasoning_disabled_models_to_off() {
     let harness =
         TestHarness::new("select_model_and_thinking_clamps_reasoning_disabled_models_to_off");
@@ -387,6 +431,7 @@ fn build_system_prompt_includes_custom_append_context_and_skills() {
         &global_dir,
         &package_dir,
         false,
+        true,
     );
 
     harness.log().info_ctx("prompt", "Prompt fragments", |ctx| {
@@ -595,16 +640,16 @@ fn resolve_api_key_precedence_and_error_paths() {
 
     let cli_override = cli::Cli::parse_from(["pi", "--api-key", "cli-key"]);
     let resolved = resolve_api_key(&auth, &cli_override, &entry).expect("resolve api key");
-    assert_eq!(resolved, "cli-key");
+    assert_eq!(resolved, Some("cli-key".to_string()));
 
     let cli_no_override = cli::Cli::parse_from(["pi"]);
     let resolved = resolve_api_key(&auth, &cli_no_override, &entry).expect("resolve api key");
-    assert_eq!(resolved, "auth-key");
+    assert_eq!(resolved, Some("auth-key".to_string()));
 
     let auth_empty =
         AuthStorage::load(harness.temp_path("empty-auth.json")).expect("load empty auth storage");
     let resolved = resolve_api_key(&auth_empty, &cli_no_override, &entry).expect("resolve api key");
-    assert_eq!(resolved, "entry-key");
+    assert_eq!(resolved, Some("entry-key".to_string()));
 
     let entry_missing = custom_model_entry("custom", None);
     let err = resolve_api_key(&auth_empty, &cli_no_override, &entry_missing)
@@ -1012,50 +1057,4 @@ fn extension_registered_flags_can_be_passed_through_cli_parser() {
     assert_eq!(parsed.extension_flags[0].value.as_deref(), Some("ship-it"));
     assert_eq!(parsed.extension_flags[1].name, "dry-run");
     assert!(parsed.extension_flags[1].value.is_none());
-}
-
-#[test]
-fn dropin174_cli_surface_logs_include_requirement_id() {
-    let harness = TestHarness::new("dropin174_cli_surface_logs_include_requirement_id");
-    harness
-        .log()
-        .info_ctx("parity", "DROPIN-174 CLI parity trace", |ctx| {
-            ctx.push(("requirement_id".to_string(), "DROPIN-141".to_string()));
-            ctx.push(("surface".to_string(), "cli".to_string()));
-            ctx.push((
-                "parity_requirement".to_string(),
-                "CLI command/flag/subcommand parity".to_string(),
-            ));
-        });
-
-    let jsonl = harness.dump_logs();
-    let errors = validate_jsonl(&jsonl);
-    assert!(
-        errors.is_empty(),
-        "harness log JSONL must validate: {errors:?}"
-    );
-
-    let matched = jsonl
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("valid json log line"))
-        .filter(|value| value.get("category").and_then(serde_json::Value::as_str) == Some("parity"))
-        .any(|value| {
-            let Some(ctx) = value.get("context").and_then(serde_json::Value::as_object) else {
-                return false;
-            };
-            ctx.get("requirement_id")
-                .and_then(serde_json::Value::as_str)
-                == Some("DROPIN-141")
-                && ctx.get("surface").and_then(serde_json::Value::as_str) == Some("cli")
-                && ctx
-                    .get("parity_requirement")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("CLI command/flag/subcommand parity")
-        });
-
-    assert!(
-        matched,
-        "expected a parity log line with DROPIN-141 cli requirement context"
-    );
 }

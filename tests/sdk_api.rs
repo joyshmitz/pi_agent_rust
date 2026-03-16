@@ -78,8 +78,10 @@ fn sdk_rpc_state_round_trips_via_serde() {
         "sessionId": "session-123",
         "sessionName": "demo",
         "autoCompactionEnabled": true,
+        "autoRetryEnabled": false,
         "messageCount": 2,
-        "pendingMessageCount": 0
+        "pendingMessageCount": 0,
+        "durabilityMode": "balanced"
     });
 
     let state: sdk::RpcSessionState =
@@ -112,7 +114,7 @@ while IFS= read -r line; do
   cmd=$(printf '%s\n' "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
   case "$cmd" in
     get_state)
-      printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{"model":null,"thinkingLevel":"off","isStreaming":false,"isCompacting":false,"steeringMode":"all","followUpMode":"all","sessionFile":null,"sessionId":"sess-1","sessionName":null,"autoCompactionEnabled":true,"messageCount":0,"pendingMessageCount":0}}\n' "$id"
+      printf '{"type":"response","id":"%s","command":"get_state","success":true,"data":{"model":null,"thinkingLevel":"off","isStreaming":false,"isCompacting":false,"steeringMode":"all","followUpMode":"all","sessionFile":null,"sessionId":"sess-1","sessionName":null,"autoCompactionEnabled":true,"autoRetryEnabled":true,"messageCount":0,"pendingMessageCount":0,"durabilityMode":"balanced"}}\n' "$id"
       ;;
     get_available_models)
       printf '{"type":"response","id":"%s","command":"get_available_models","success":true,"data":{"models":[{"id":"m1","name":"Model 1","api":"anthropic-messages","provider":"anthropic","baseUrl":"https://api.example.com","reasoning":false,"input":["text"],"contextWindow":8192,"maxTokens":1024,"cost":{"input":1.0,"output":2.0,"cacheRead":0.0,"cacheWrite":0.0}}]}}\n' "$id"
@@ -146,6 +148,8 @@ done
         let state = client.get_state().await.expect("get_state");
         assert_eq!(state.session_id, "sess-1");
         assert_eq!(state.thinking_level, "off");
+        assert!(state.auto_retry_enabled);
+        assert_eq!(state.durability_mode, "balanced");
 
         let models = client
             .get_available_models()

@@ -1,4 +1,5 @@
 use super::*;
+use unicode_width::UnicodeWidthChar;
 
 /// Ensure the view output fits within `term_height` terminal rows.
 ///
@@ -37,21 +38,261 @@ pub(super) fn normalize_raw_terminal_newlines(input: String) -> String {
         return input;
     }
 
+    let bytes = input.as_bytes();
     let mut out = String::with_capacity(input.len() + 16);
-    let mut prev_was_cr = false;
-    for ch in input.chars() {
-        if ch == '\n' {
-            if !prev_was_cr {
-                out.push('\r');
-            }
-            out.push('\n');
-            prev_was_cr = false;
-        } else {
-            prev_was_cr = ch == '\r';
-            out.push(ch);
+    let mut cursor = 0usize;
+
+    // Byte-scan with memchr avoids UTF-8 decode on the hot view() path.
+    for newline_idx in memchr::memchr_iter(b'\n', bytes) {
+        out.push_str(&input[cursor..newline_idx]);
+        if newline_idx == 0 || bytes[newline_idx - 1] != b'\r' {
+            out.push('\r');
+        }
+        out.push('\n');
+        cursor = newline_idx + 1;
+    }
+
+    out.push_str(&input[cursor..]);
+    out
+}
+
+/// Append one plain-text line with hard wrapping to `max_width` display cells.
+///
+/// We do explicit wrapping here instead of relying on terminal auto-wrap so the
+/// renderer's logical rows stay aligned with physical rows in alt-screen mode.
+fn wrapped_line_segments(line: &str, max_width: usize) -> Vec<&str> {
+    if max_width == 0 || line.is_empty() {
+        return vec![line];
+    }
+
+    let mut segments = Vec::new();
+    let mut segment_start = 0usize;
+    let mut segment_width = 0usize;
+
+    for (idx, ch) in line.char_indices() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if segment_width + ch_width > max_width && idx > segment_start {
+            segments.push(&line[segment_start..idx]);
+            segment_start = idx;
+            segment_width = 0;
+        }
+        segment_width += ch_width;
+    }
+
+    segments.push(&line[segment_start..]);
+    segments
+}
+
+#[inline]
+fn starts_with_unordered_list_marker(trimmed: &str) -> bool {
+    let bytes = trimmed.as_bytes();
+    bytes.len() >= 2 && matches!(bytes[0], b'-' | b'+' | b'*') && bytes[1].is_ascii_whitespace()
+}
+
+#[inline]
+fn starts_with_ordered_list_marker(trimmed: &str) -> bool {
+    let bytes = trimmed.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        idx += 1;
+    }
+
+    idx > 0
+        && idx <= 9
+        && (idx + 1) < bytes.len()
+        && matches!(bytes[idx], b'.' | b')')
+        && bytes[idx + 1].is_ascii_whitespace()
+}
+
+#[inline]
+fn is_repeated_marker_line(trimmed: &str, marker: u8) -> bool {
+    let mut marker_count = 0usize;
+    for byte in trimmed.bytes() {
+        if byte == marker {
+            marker_count += 1;
+        } else if !byte.is_ascii_whitespace() {
+            return false;
         }
     }
-    out
+    marker_count >= 3
+}
+
+#[inline]
+fn has_potential_underscore_emphasis(markdown: &str) -> bool {
+    let bytes = markdown.as_bytes();
+    for (idx, byte) in bytes.iter().enumerate() {
+        if *byte != b'_' {
+            continue;
+        }
+        let prev_alnum = idx
+            .checked_sub(1)
+            .and_then(|i| bytes.get(i))
+            .is_some_and(u8::is_ascii_alphanumeric);
+        let next_alnum = bytes.get(idx + 1).is_some_and(u8::is_ascii_alphanumeric);
+        if !(prev_alnum && next_alnum) {
+            return true;
+        }
+    }
+    false
+}
+
+fn streaming_needs_markdown_renderer(markdown: &str) -> bool {
+    // Inline syntax that can change visible formatting mid-stream.
+    if markdown.as_bytes().iter().any(|byte| {
+        matches!(
+            *byte,
+            b'`' | b'*' | b'[' | b']' | b'<' | b'>' | b'|' | b'!' | b'~' | b'\t'
+        )
+    }) {
+        return true;
+    }
+    if has_potential_underscore_emphasis(markdown) {
+        return true;
+    }
+
+    // Block-level syntax that only needs quick line-prefix checks.
+    for line in markdown.lines() {
+        if line.starts_with("    ") || parse_fence_line(line).is_some() {
+            return true;
+        }
+
+        let trimmed = line.trim_start_matches(' ');
+        let leading_spaces = line.len().saturating_sub(trimmed.len());
+        if leading_spaces > 3 || trimmed.is_empty() {
+            if leading_spaces > 3 {
+                return true;
+            }
+            continue;
+        }
+
+        let first = trimmed.as_bytes()[0];
+        if first == b'#'
+            || first == b'>'
+            || starts_with_unordered_list_marker(trimmed)
+            || starts_with_ordered_list_marker(trimmed)
+            || is_repeated_marker_line(trimmed, b'-')
+            || is_repeated_marker_line(trimmed, b'*')
+            || is_repeated_marker_line(trimmed, b'=')
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn append_wrapped_plain_line_to_output(output: &mut String, line: &str, max_width: usize) {
+    if max_width == 0 || line.is_empty() {
+        let _ = writeln!(output, "  {line}");
+        return;
+    }
+
+    let mut segment_start = 0usize;
+    let mut segment_width = 0usize;
+    for (idx, ch) in line.char_indices() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if segment_width + ch_width > max_width && idx > segment_start {
+            let _ = writeln!(output, "  {}", &line[segment_start..idx]);
+            segment_start = idx;
+            segment_width = 0;
+        }
+        segment_width += ch_width;
+    }
+
+    let _ = writeln!(output, "  {}", &line[segment_start..]);
+}
+
+fn append_streaming_plaintext_to_output(output: &mut String, markdown: &str, max_width: usize) {
+    for line in markdown.split_terminator('\n') {
+        append_wrapped_plain_line_to_output(output, line, max_width);
+    }
+}
+
+fn render_streaming_markdown_with_glamour(
+    markdown: &str,
+    markdown_style: &GlamourStyleConfig,
+    max_width: usize,
+) -> String {
+    let stabilized_markdown = stabilize_streaming_markdown(markdown);
+    glamour::Renderer::new()
+        .with_style_config(markdown_style.clone())
+        .with_word_wrap(max_width)
+        .render(stabilized_markdown.as_ref())
+}
+
+fn parse_fence_line(line: &str) -> Option<(char, usize, &str)> {
+    let trimmed_line = line.trim_end_matches(['\r', '\n']);
+    let leading_spaces = trimmed_line.chars().take_while(|ch| *ch == ' ').count();
+    if leading_spaces > 3 {
+        return None;
+    }
+
+    let trimmed = trimmed_line.get(leading_spaces..)?;
+    let marker = trimmed.chars().next()?;
+    if marker != '`' && marker != '~' {
+        return None;
+    }
+
+    let mut marker_len = 0usize;
+    for ch in trimmed.chars() {
+        if ch == marker {
+            marker_len += 1;
+        } else {
+            break;
+        }
+    }
+
+    if marker_len >= 3 {
+        Some((
+            marker,
+            marker_len,
+            trimmed.get(marker_len..).unwrap_or_default(),
+        ))
+    } else {
+        None
+    }
+}
+
+fn streaming_unclosed_fence(markdown: &str) -> Option<(char, usize)> {
+    let mut open_fence: Option<(char, usize)> = None;
+
+    for line in markdown.lines() {
+        let Some((marker, marker_len, tail)) = parse_fence_line(line) else {
+            continue;
+        };
+
+        if let Some((open_marker, open_len)) = open_fence {
+            if marker == open_marker && marker_len >= open_len && tail.trim().is_empty() {
+                open_fence = None;
+            }
+        } else {
+            // CommonMark: backtick fence info strings may not contain backticks.
+            if marker == '`' && tail.contains('`') {
+                continue;
+            }
+            open_fence = Some((marker, marker_len));
+        }
+    }
+
+    open_fence
+}
+
+fn stabilize_streaming_markdown(markdown: &str) -> std::borrow::Cow<'_, str> {
+    let Some((marker, marker_len)) = streaming_unclosed_fence(markdown) else {
+        return std::borrow::Cow::Borrowed(markdown);
+    };
+
+    // Close an unterminated fence in the transient streaming view so partial
+    // markdown renders predictably while tokens are still arriving.
+    let mut stabilized = String::with_capacity(markdown.len() + marker_len + 1);
+    stabilized.push_str(markdown);
+    if !stabilized.ends_with('\n') {
+        stabilized.push('\n');
+    }
+    for _ in 0..marker_len {
+        stabilized.push(marker);
+    }
+    std::borrow::Cow::Owned(stabilized)
 }
 
 fn format_persistence_footer_segment(
@@ -154,10 +395,13 @@ impl PiApp {
             // instead of collecting all lines into a Vec.  For a 10K-line
             // conversation this avoids a ~80KB Vec<&str> allocation per frame.
             let total_lines = memchr::memchr_iter(b'\n', viewport_content.as_bytes()).count() + 1;
-            let start = self
-                .conversation_viewport
-                .y_offset()
-                .min(total_lines.saturating_sub(1));
+            let start = if self.follow_stream_tail {
+                total_lines.saturating_sub(effective_vp)
+            } else {
+                self.conversation_viewport
+                    .y_offset()
+                    .min(total_lines.saturating_sub(1))
+            };
             let end = (start + effective_vp).min(total_lines);
 
             // Skip `start` lines, then take `end - start` lines — no Vec
@@ -177,7 +421,7 @@ impl PiApp {
             if total_lines > effective_vp {
                 let total = total_lines.saturating_sub(effective_vp);
                 let percent = (start * 100).checked_div(total).map_or(100, |p| p.min(100));
-                let indicator = format!("  [{percent}%] ↑/↓ PgUp/PgDn to scroll");
+                let indicator = format!("  [{percent}%] ↑/↓ PgUp/PgDn Shift+Up/Down to scroll");
                 output.push_str(&self.styles.muted.render(&indicator));
                 output.push('\n');
             }
@@ -243,6 +487,11 @@ impl PiApp {
             output.push_str(&self.render_capability_prompt(prompt));
         }
 
+        // Extension custom overlay (if open)
+        if let Some(ref overlay) = self.extension_custom_overlay {
+            output.push_str(&self.render_extension_custom_overlay(overlay));
+        }
+
         // Branch picker overlay (if open)
         if let Some(ref picker) = self.branch_picker {
             output.push_str(&self.render_branch_picker(picker));
@@ -254,14 +503,7 @@ impl PiApp {
         }
 
         // Input area (only when idle and no overlay open)
-        if self.agent_state == AgentState::Idle
-            && self.session_picker.is_none()
-            && self.settings_ui.is_none()
-            && self.theme_picker.is_none()
-            && self.capability_prompt.is_none()
-            && self.branch_picker.is_none()
-            && self.model_selector.is_none()
-        {
+        if self.editor_input_is_available() {
             output.push_str(&self.render_input());
 
             // Autocomplete dropdown (if open)
@@ -269,13 +511,16 @@ impl PiApp {
                 output.push_str(&self.render_autocomplete_dropdown());
             }
         } else if self.agent_state != AgentState::Idle {
-            // Show spinner when processing
-            let _ = write!(
-                output,
-                "\n  {} {}\n",
-                self.spinner.view(),
-                self.styles.accent.render("Processing...")
-            );
+            if self.show_processing_status_spinner() {
+                // Show spinner while waiting on provider/tool activity, before
+                // we have visible streaming deltas.
+                let _ = write!(
+                    output,
+                    "\n  {} {}\n",
+                    self.spinner.view(),
+                    self.styles.accent.render("Processing...")
+                );
+            }
 
             if let Some(pending_queue) = self.render_pending_message_queue() {
                 output.push_str(&pending_queue);
@@ -625,7 +870,10 @@ impl PiApp {
     /// all messages during streaming. Streaming content (current_response)
     /// always renders fresh.
     pub fn build_conversation_content(&self) -> String {
-        let is_streaming = !self.current_response.is_empty() || !self.current_thinking.is_empty();
+        let has_streaming_state =
+            !self.current_response.is_empty() || !self.current_thinking.is_empty();
+        let has_visible_streaming_tail = !self.current_response.is_empty()
+            || (self.thinking_visible && !self.current_thinking.is_empty());
 
         // PERF-7: Reuse the pre-allocated conversation buffer from the
         // previous frame. `take_conversation_buffer()` clears the buffer
@@ -634,11 +882,13 @@ impl PiApp {
 
         // PERF-2 fast path: during streaming, reuse the cached prefix
         // (all finalized messages) and only rebuild the streaming tail.
-        if is_streaming && self.message_render_cache.prefix_valid(self.messages.len()) {
+        if has_streaming_state && self.message_render_cache.prefix_valid(self.messages.len()) {
             // PERF-7: Append prefix directly into the reusable buffer
             // instead of cloning via prefix_get().
             self.message_render_cache.prefix_append_to(&mut output);
-            self.append_streaming_tail(&mut output);
+            if has_visible_streaming_tail {
+                self.append_streaming_tail(&mut output);
+            }
             return output;
         }
 
@@ -665,7 +915,7 @@ impl PiApp {
             .prefix_set(&output, self.messages.len());
 
         // Append streaming content if active.
-        if is_streaming {
+        if has_visible_streaming_tail {
             self.append_streaming_tail(&mut output);
         }
 
@@ -681,22 +931,36 @@ impl PiApp {
             self.styles.success_bold.render("Assistant:")
         );
 
+        let content_width = self.term_width.saturating_sub(4).max(1);
+
         // Show thinking if present
         if self.thinking_visible && !self.current_thinking.is_empty() {
             let truncated = truncate(&self.current_thinking, 100);
-            let _ = writeln!(
-                output,
-                "  {}",
-                self.styles
-                    .muted_italic
-                    .render(&format!("Thinking: {truncated}"))
-            );
+            let thinking_line = format!("Thinking: {truncated}");
+            for segment in wrapped_line_segments(&thinking_line, content_width) {
+                let _ = writeln!(output, "  {}", self.styles.muted_italic.render(segment));
+            }
         }
 
-        // Show response (no markdown rendering while streaming)
+        // Render partial markdown on every stream update so headings/lists/code
+        // format as they arrive instead of showing raw markers.
         if !self.current_response.is_empty() {
-            for line in self.current_response.lines() {
-                let _ = writeln!(output, "  {line}");
+            let markdown_width = self.term_width.saturating_sub(6).max(40);
+            if streaming_needs_markdown_renderer(&self.current_response) {
+                let rendered = render_streaming_markdown_with_glamour(
+                    &self.current_response,
+                    &self.markdown_style,
+                    markdown_width,
+                );
+                for line in rendered.lines() {
+                    let _ = writeln!(output, "  {line}");
+                }
+            } else {
+                append_streaming_plaintext_to_output(
+                    output,
+                    &self.current_response,
+                    markdown_width,
+                );
             }
         }
     }
@@ -758,10 +1022,18 @@ impl PiApp {
         let mut output = String::new();
 
         let offset = self.autocomplete.scroll_offset();
+        // Constrain visible items to available terminal space.
+        // Dropdown chrome uses ~5 rows (borders, help, pagination, description).
+        let max_dropdown_rows = self.term_height.saturating_sub(
+            // header(4) + min conversation(1) + scroll indicator(1)
+            // + input(2 + height) + footer(2) + dropdown chrome(5)
+            4 + 1 + 1 + 2 + self.input.height() + 2 + 5,
+        );
         let visible_count = self
             .autocomplete
             .max_visible
-            .min(self.autocomplete.items.len());
+            .min(self.autocomplete.items.len())
+            .min(max_dropdown_rows.max(1));
         let end = (offset + visible_count).min(self.autocomplete.items.len());
 
         // Styles
@@ -780,7 +1052,7 @@ impl PiApp {
 
         for (idx, item) in self.autocomplete.items[offset..end].iter().enumerate() {
             let global_idx = offset + idx;
-            let is_selected = global_idx == self.autocomplete.selected;
+            let is_selected = self.autocomplete.selected == Some(global_idx);
 
             let kind_icon = match item.kind {
                 AutocompleteItemKind::SlashCommand => "⚡",
@@ -984,7 +1256,7 @@ impl PiApp {
                 output,
                 "  {}",
                 self.styles.muted_italic.render(
-                    "Type: filter  Backspace: clear  ↑/↓/j/k: navigate  Enter: select  Ctrl+D: delete  Esc/q: cancel",
+                    "Type: filter  Backspace: clear  ↑/↓/j/k/PgUp/PgDn: navigate  Enter: select  Ctrl+D: delete  Esc/q: cancel",
                 )
             );
             if let Some(message) = &picker.status_message {
@@ -1026,6 +1298,15 @@ impl PiApp {
                     SettingsUiEntry::FollowUpMode => format!(
                         "followUpMode: {}",
                         self.config.follow_up_queue_mode().as_str()
+                    ),
+                    SettingsUiEntry::DefaultPermissive => format!(
+                        "extensionPolicy.defaultPermissive: {}{}",
+                        bool_label(self.effective_default_permissive()),
+                        if self.default_permissive_changes_require_extension_restart() {
+                            " (restart required)"
+                        } else {
+                            ""
+                        }
                     ),
                     SettingsUiEntry::QuietStartup => format!(
                         "quietStartup: {}",
@@ -1087,7 +1368,7 @@ impl PiApp {
             "  {}",
             self.styles
                 .muted_italic
-                .render("↑/↓/j/k: navigate  Enter: select  Esc/q: cancel")
+                .render("↑/↓/j/k/PgUp/PgDn: navigate  Enter: select  Esc/q: cancel")
         );
 
         output
@@ -1114,18 +1395,7 @@ impl PiApp {
                     ThemePickerItem::BuiltIn(name) => {
                         (name.to_string(), format!("{name} (built-in)"))
                     }
-                    ThemePickerItem::File(path) => {
-                        // Load theme to get name, or fallback to file stem.
-                        // Performance note: repetitive load, but themes are small JSON files.
-                        let name = Theme::load(path).map_or_else(
-                            |_| {
-                                path.file_stem().map_or_else(
-                                    || "unknown".to_string(),
-                                    |s| s.to_string_lossy().to_string(),
-                                )
-                            },
-                            |t| t.name,
-                        );
+                    ThemePickerItem::File { name, .. } => {
                         (name.clone(), format!("{name} (custom)"))
                     }
                 };
@@ -1163,7 +1433,7 @@ impl PiApp {
             "  {}",
             self.styles
                 .muted_italic
-                .render("↑/↓/j/k: navigate  Enter: select  Esc/q: back")
+                .render("↑/↓/j/k/PgUp/PgDn: navigate  Enter: select  Esc/q: back")
         );
 
         output
@@ -1234,6 +1504,52 @@ impl PiApp {
         output
     }
 
+    pub(super) fn render_extension_custom_overlay(
+        &self,
+        overlay: &ExtensionCustomOverlay,
+    ) -> String {
+        let mut output = String::new();
+        let title = overlay.title.as_deref().unwrap_or("Extension Overlay");
+        let source = overlay.extension_id.as_deref().unwrap_or("extension");
+
+        let _ = writeln!(output, "\n  {}", self.styles.title.render(title));
+        let _ = writeln!(
+            output,
+            "  {}",
+            self.styles
+                .muted
+                .render(&format!("[{source}] custom UI active"))
+        );
+
+        let max_lines = self.term_height.saturating_sub(12).max(4);
+        if overlay.lines.is_empty() {
+            let _ = writeln!(
+                output,
+                "  {}",
+                self.styles
+                    .muted_italic
+                    .render("Waiting for extension frame...")
+            );
+        } else {
+            for line in overlay
+                .lines
+                .iter()
+                .skip(overlay.lines.len().saturating_sub(max_lines))
+            {
+                let _ = writeln!(output, "  {line}");
+            }
+        }
+        let _ = writeln!(
+            output,
+            "  {}",
+            self.styles
+                .muted_italic
+                .render("Press q to exit extension overlays that support quit")
+        );
+
+        output
+    }
+
     pub(super) fn render_branch_picker(&self, picker: &BranchPickerOverlay) -> String {
         let mut output = String::new();
 
@@ -1292,7 +1608,7 @@ impl PiApp {
             "\n  {}",
             self.styles
                 .muted_italic
-                .render("↑/↓/j/k: navigate  Enter: switch  Esc: cancel  * = current")
+                .render("↑/↓/j/k/PgUp/PgDn: navigate  Enter: switch  Esc: cancel  * = current")
         );
         output
     }
@@ -1319,6 +1635,12 @@ mod tests {
     fn normalize_raw_terminal_newlines_handles_mixed_newlines() {
         let normalized = normalize_raw_terminal_newlines("a\r\nb\nc\r\nd\n".to_string());
         assert_eq!(normalized, "a\r\nb\r\nc\r\nd\r\n");
+    }
+
+    #[test]
+    fn normalize_raw_terminal_newlines_preserves_utf8_content() {
+        let normalized = normalize_raw_terminal_newlines("αβ\nγ\r\nδ\n".to_string());
+        assert_eq!(normalized, "αβ\r\nγ\r\nδ\r\n");
     }
 
     #[test]
@@ -1397,5 +1719,104 @@ mod tests {
         assert!(rendered.contains("pending 256/256"));
         assert!(rendered.contains("flush-fail 2"));
         assert!(rendered.contains("backpressure"));
+    }
+
+    #[test]
+    fn wrapped_plain_line_no_wrap_when_under_width() {
+        let segments = wrapped_line_segments("hello", 10);
+        assert_eq!(segments, vec!["hello"]);
+    }
+
+    #[test]
+    fn wrapped_plain_line_wraps_when_over_width() {
+        let segments = wrapped_line_segments("abcdef", 4);
+        assert_eq!(segments, vec!["abcd", "ef"]);
+    }
+
+    #[test]
+    fn wrapped_plain_line_preserves_empty_line() {
+        let segments = wrapped_line_segments("", 8);
+        assert_eq!(segments, vec![""]);
+    }
+
+    #[test]
+    fn parse_fence_line_detects_backtick_and_tilde_fences() {
+        assert_eq!(parse_fence_line("```rust"), Some(('`', 3, "rust")));
+        assert_eq!(parse_fence_line("   ~~~~~"), Some(('~', 5, "")));
+        assert_eq!(parse_fence_line("`not-a-fence"), None);
+    }
+
+    #[test]
+    fn parse_fence_line_rejects_four_space_indent() {
+        assert_eq!(parse_fence_line("    ```rust"), None);
+    }
+
+    #[test]
+    fn streaming_unclosed_fence_none_when_balanced() {
+        let markdown = "```rust\nfn main() {}\n```\n";
+        assert_eq!(streaming_unclosed_fence(markdown), None);
+    }
+
+    #[test]
+    fn streaming_unclosed_fence_detects_open_backtick_block() {
+        let markdown = "Heading\n\n```rust\nfn main() {\n    println!(\"hi\");";
+        assert_eq!(streaming_unclosed_fence(markdown), Some(('`', 3)));
+    }
+
+    #[test]
+    fn streaming_unclosed_fence_does_not_close_on_trailing_text() {
+        let markdown = "```rust\nfn main() {}\n``` trailing";
+        assert_eq!(streaming_unclosed_fence(markdown), Some(('`', 3)));
+    }
+
+    #[test]
+    fn streaming_unclosed_fence_closes_on_whitespace_only_suffix() {
+        let markdown = "```rust\nfn main() {}\n```   \n";
+        assert_eq!(streaming_unclosed_fence(markdown), None);
+    }
+
+    #[test]
+    fn streaming_unclosed_fence_ignores_invalid_backtick_info() {
+        let markdown = "```a`b\ncontent\n";
+        assert_eq!(streaming_unclosed_fence(markdown), None);
+    }
+
+    #[test]
+    fn stabilize_streaming_markdown_closes_unterminated_fence() {
+        let markdown = "```python\nprint('hello')";
+        let stabilized = stabilize_streaming_markdown(markdown);
+        assert_eq!(stabilized.as_ref(), "```python\nprint('hello')\n```");
+    }
+
+    #[test]
+    fn stabilize_streaming_markdown_preserves_balanced_input() {
+        let markdown = "# Title\n\n- item\n";
+        let stabilized = stabilize_streaming_markdown(markdown);
+        assert_eq!(stabilized.as_ref(), markdown);
+    }
+
+    #[test]
+    fn streaming_needs_markdown_renderer_false_for_plain_text() {
+        let markdown = "Starting response... token_1 token_2";
+        assert!(!streaming_needs_markdown_renderer(markdown));
+    }
+
+    #[test]
+    fn streaming_needs_markdown_renderer_true_for_heading() {
+        let markdown = "# Heading";
+        assert!(streaming_needs_markdown_renderer(markdown));
+    }
+
+    #[test]
+    fn streaming_needs_markdown_renderer_true_for_underscore_emphasis() {
+        let markdown = "This is _important_.";
+        assert!(streaming_needs_markdown_renderer(markdown));
+    }
+
+    #[test]
+    fn append_streaming_plaintext_to_output_wraps_without_trailing_blank() {
+        let mut out = String::new();
+        append_streaming_plaintext_to_output(&mut out, "abcdef\n", 4);
+        assert_eq!(out, "  abcd\n  ef\n");
     }
 }

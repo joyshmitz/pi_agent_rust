@@ -3,6 +3,7 @@
 //! This module implements the Provider trait for the Anthropic Messages API,
 //! supporting streaming responses, tool use, and extended thinking.
 
+use crate::auth::unmark_anthropic_oauth_bearer_token;
 use crate::error::{Error, Result};
 use crate::http::client::Client;
 use crate::model::{
@@ -11,11 +12,13 @@ use crate::model::{
 };
 use crate::models::CompatConfig;
 use crate::provider::{CacheRetention, Context, Provider, StreamOptions, ToolDef};
+use crate::provider_metadata::canonical_provider_id;
 use crate::sse::SseStream;
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::pin::Pin;
 
 // ============================================================================
@@ -27,10 +30,239 @@ const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 const ANTHROPIC_OAUTH_TOKEN_PREFIX: &str = "sk-ant-oat";
 const ANTHROPIC_OAUTH_BETA_FLAGS: &str = "claude-code-20250219,oauth-2025-04-20";
+const KIMI_SHARE_DIR_ENV_KEY: &str = "KIMI_SHARE_DIR";
 
 #[inline]
 fn is_anthropic_oauth_token(token: &str) -> bool {
     token.contains(ANTHROPIC_OAUTH_TOKEN_PREFIX)
+}
+
+#[inline]
+fn is_anthropic_provider(provider: &str) -> bool {
+    canonical_provider_id(provider).unwrap_or(provider) == "anthropic"
+}
+
+#[inline]
+fn is_anthropic_bearer_token(provider: &str, token: &str) -> bool {
+    if !is_anthropic_provider(provider) {
+        return false;
+    }
+    let token = token.trim();
+    if token.is_empty() {
+        return false;
+    }
+
+    // OAuth tokens use the Bearer lane.
+    if is_anthropic_oauth_token(token) {
+        return true;
+    }
+
+    // Legacy/external Claude credentials are bearer tokens and do not start with sk-ant.
+    !token.starts_with("sk-ant-")
+}
+
+#[inline]
+fn is_kimi_coding_provider(provider: &str) -> bool {
+    canonical_provider_id(provider).unwrap_or(provider) == "kimi-for-coding"
+}
+
+#[inline]
+fn is_kimi_oauth_token(provider: &str, token: &str) -> bool {
+    is_kimi_coding_provider(provider) && !token.starts_with("sk-")
+}
+
+fn bearer_token_from_authorization_header(value: &str) -> Option<String> {
+    let mut parts = value.split_whitespace();
+    let scheme = parts.next()?;
+    let bearer_value = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if scheme.eq_ignore_ascii_case("bearer") && !bearer_value.trim().is_empty() {
+        Some(bearer_value.trim().to_string())
+    } else {
+        None
+    }
+}
+
+fn authorization_override(
+    options: &StreamOptions,
+    compat: Option<&CompatConfig>,
+) -> Option<String> {
+    super::first_non_empty_header_value_case_insensitive(&options.headers, &["authorization"])
+        .or_else(|| {
+            compat
+                .and_then(|compat| compat.custom_headers.as_ref())
+                .and_then(|headers| {
+                    super::first_non_empty_header_value_case_insensitive(
+                        headers,
+                        &["authorization"],
+                    )
+                })
+        })
+}
+
+fn x_api_key_override(options: &StreamOptions, compat: Option<&CompatConfig>) -> Option<String> {
+    super::first_non_empty_header_value_case_insensitive(&options.headers, &["x-api-key"]).or_else(
+        || {
+            compat
+                .and_then(|compat| compat.custom_headers.as_ref())
+                .and_then(|headers| {
+                    super::first_non_empty_header_value_case_insensitive(headers, &["x-api-key"])
+                })
+        },
+    )
+}
+
+fn sanitize_ascii_header_value(value: &str, fallback: &str) -> String {
+    if value.is_ascii() && !value.trim().is_empty() {
+        return value.to_string();
+    }
+    let sanitized = value
+        .chars()
+        .filter(char::is_ascii)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if sanitized.is_empty() {
+        fallback.to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn home_dir_with_env_lookup<F>(env_lookup: F) -> Option<std::path::PathBuf>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    env_lookup("HOME")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            env_lookup("USERPROFILE")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(std::path::PathBuf::from)
+        })
+        .or_else(|| {
+            let drive = env_lookup("HOMEDRIVE")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())?;
+            let path = env_lookup("HOMEPATH")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())?;
+            if path.starts_with('\\') || path.starts_with('/') {
+                Some(std::path::PathBuf::from(format!("{drive}{path}")))
+            } else {
+                let mut combined = std::path::PathBuf::from(drive);
+                combined.push(path);
+                Some(combined)
+            }
+        })
+}
+
+fn home_dir() -> Option<std::path::PathBuf> {
+    home_dir_with_env_lookup(|key| std::env::var(key).ok())
+}
+
+fn kimi_share_dir_with_env_lookup<F>(env_lookup: F) -> Option<std::path::PathBuf>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    env_lookup(KIMI_SHARE_DIR_ENV_KEY)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| home_dir_with_env_lookup(env_lookup).map(|home| home.join(".kimi")))
+}
+
+fn kimi_share_dir() -> Option<std::path::PathBuf> {
+    kimi_share_dir_with_env_lookup(|key| std::env::var(key).ok())
+}
+
+fn kimi_device_id_paths() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let primary = kimi_share_dir()?.join("device_id");
+    let legacy = home_dir().map_or_else(
+        || primary.clone(),
+        |home| home.join(".pi").join("agent").join("kimi-device-id"),
+    );
+    Some((primary, legacy))
+}
+
+fn kimi_device_id() -> String {
+    static DEVICE_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DEVICE_ID.get_or_init(|| {
+        let generated = uuid::Uuid::new_v4().simple().to_string();
+        let Some((primary, legacy)) = kimi_device_id_paths() else {
+            return generated;
+        };
+
+        for path in [&primary, &legacy] {
+            if let Ok(existing) = fs::read_to_string(path) {
+                let existing = existing.trim();
+                if !existing.is_empty() {
+                    return existing.to_string();
+                }
+            }
+        }
+
+        if let Some(parent) = primary.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+
+        if let Ok(mut file) = options.open(&primary) {
+            use std::io::Write;
+            let _ = file.write_all(generated.as_bytes());
+        }
+
+        generated
+    }).clone()
+}
+
+fn kimi_common_headers() -> Vec<(String, String)> {
+    let device_name = std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .unwrap_or_else(|| "unknown".to_string());
+    let device_model = format!("{} {}", std::env::consts::OS, std::env::consts::ARCH);
+    let os_version = std::env::consts::OS.to_string();
+
+    vec![
+        (
+            "X-Msh-Platform".to_string(),
+            sanitize_ascii_header_value("kimi_cli", "unknown"),
+        ),
+        (
+            "X-Msh-Version".to_string(),
+            sanitize_ascii_header_value(env!("CARGO_PKG_VERSION"), "unknown"),
+        ),
+        (
+            "X-Msh-Device-Name".to_string(),
+            sanitize_ascii_header_value(&device_name, "unknown"),
+        ),
+        (
+            "X-Msh-Device-Model".to_string(),
+            sanitize_ascii_header_value(&device_model, "unknown"),
+        ),
+        (
+            "X-Msh-Os-Version".to_string(),
+            sanitize_ascii_header_value(&os_version, "unknown"),
+        ),
+        (
+            "X-Msh-Device-Id".to_string(),
+            sanitize_ascii_header_value(&kimi_device_id(), "unknown"),
+        ),
+    ]
 }
 
 // ============================================================================
@@ -42,6 +274,7 @@ pub struct AnthropicProvider {
     client: Client,
     model: String,
     base_url: String,
+    provider: String,
     compat: Option<CompatConfig>,
 }
 
@@ -52,8 +285,16 @@ impl AnthropicProvider {
             client: Client::new(),
             model: model.into(),
             base_url: ANTHROPIC_API_URL.to_string(),
+            provider: "anthropic".to_string(),
             compat: None,
         }
+    }
+
+    /// Override the provider name reported in streamed events.
+    #[must_use]
+    pub fn with_provider_name(mut self, provider: impl Into<String>) -> Self {
+        self.provider = provider.into();
+        self
     }
 
     /// Create with a custom base URL.
@@ -134,12 +375,18 @@ impl AnthropicProvider {
             }
         }
 
+        let temperature = if thinking.is_some() {
+            Some(1.0)
+        } else {
+            options.temperature
+        };
+
         AnthropicRequest {
             model: &self.model,
             messages,
             system: context.system_prompt.as_deref(),
             max_tokens,
-            temperature: options.temperature,
+            temperature,
             tools,
             stream: true,
             thinking,
@@ -149,8 +396,8 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl Provider for AnthropicProvider {
-    fn name(&self) -> &'static str {
-        "anthropic"
+    fn name(&self) -> &str {
+        &self.provider
     }
 
     fn api(&self) -> &'static str {
@@ -167,19 +414,11 @@ impl Provider for AnthropicProvider {
         context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-        let auth_value = options
-            .api_key
-            .clone()
-            .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
-            .ok_or_else(|| {
-                Error::provider(
-                    "anthropic",
-                    "Missing API key for Anthropic. Set ANTHROPIC_API_KEY or use `pi auth`.",
-                )
-            })?;
-
         let request_body = self.build_request(context, options);
-        let oauth_token = is_anthropic_oauth_token(&auth_value);
+        let authorization_override = authorization_override(options, self.compat.as_ref());
+        let x_api_key_override = x_api_key_override(options, self.compat.as_ref());
+        let mut anthropic_bearer_token = false;
+        let mut kimi_oauth_token = false;
 
         // Build request with headers (Content-Type set by .json() below)
         let mut request = self
@@ -188,9 +427,45 @@ impl Provider for AnthropicProvider {
             .header("Accept", "text/event-stream")
             .header("anthropic-version", ANTHROPIC_API_VERSION);
 
-        if oauth_token {
+        if let Some(authorization_override) = authorization_override {
+            if let Some(bearer_token) =
+                bearer_token_from_authorization_header(&authorization_override)
+            {
+                anthropic_bearer_token = is_anthropic_bearer_token(&self.provider, &bearer_token);
+                kimi_oauth_token = is_kimi_oauth_token(&self.provider, &bearer_token);
+            }
+        } else if x_api_key_override.is_none() {
+            let raw_auth_value = options
+                    .api_key
+                    .clone()
+                    .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+                    .ok_or_else(|| {
+                        Error::provider(
+                            self.name(),
+                            "Missing API key for provider. Configure credentials with /login <provider> or set the provider's API key env var.",
+                        )
+                    })?;
+            let forced_bearer_token = if is_anthropic_provider(&self.provider) {
+                unmark_anthropic_oauth_bearer_token(&raw_auth_value).map(ToString::to_string)
+            } else {
+                None
+            };
+            let force_bearer = forced_bearer_token.is_some();
+            let auth_value = forced_bearer_token.unwrap_or(raw_auth_value);
+
+            anthropic_bearer_token =
+                force_bearer || is_anthropic_bearer_token(&self.provider, &auth_value);
+            kimi_oauth_token = is_kimi_oauth_token(&self.provider, &auth_value);
+
+            if anthropic_bearer_token || kimi_oauth_token {
+                request = request.header("Authorization", format!("Bearer {auth_value}"));
+            } else {
+                request = request.header("X-API-Key", &auth_value);
+            }
+        }
+
+        if anthropic_bearer_token {
             request = request
-                .header("Authorization", format!("Bearer {auth_value}"))
                 .header("anthropic-dangerous-direct-browser-access", "true")
                 .header("x-app", "cli")
                 .header(
@@ -200,12 +475,21 @@ impl Provider for AnthropicProvider {
                         env!("CARGO_PKG_VERSION")
                     ),
                 );
-        } else {
-            request = request.header("X-API-Key", &auth_value);
+        } else if kimi_oauth_token {
+            request = request.header(
+                "user-agent",
+                format!(
+                    "pi_agent_rust/{} (kimi-oauth, cli)",
+                    env!("CARGO_PKG_VERSION")
+                ),
+            );
+            for (name, value) in kimi_common_headers() {
+                request = request.header(name, value);
+            }
         }
 
         let mut beta_flags: Vec<&str> = Vec::new();
-        if oauth_token {
+        if anthropic_bearer_token {
             beta_flags.push(ANTHROPIC_OAUTH_BETA_FLAGS);
         }
         if options.cache_retention != CacheRetention::None {
@@ -218,16 +502,20 @@ impl Provider for AnthropicProvider {
         // Apply provider-specific custom headers from compat config.
         if let Some(compat) = &self.compat {
             if let Some(custom_headers) = &compat.custom_headers {
-                for (key, value) in custom_headers {
-                    request = request.header(key, value);
-                }
+                request = super::apply_headers_ignoring_blank_auth_overrides(
+                    request,
+                    custom_headers,
+                    &["authorization", "x-api-key"],
+                );
             }
         }
 
         // Per-request headers from StreamOptions (highest priority).
-        for (key, value) in &options.headers {
-            request = request.header(key, value);
-        }
+        request = super::apply_headers_ignoring_blank_auth_overrides(
+            request,
+            &options.headers,
+            &["authorization", "x-api-key"],
+        );
 
         let request = request.json(&request_body)?;
 
@@ -239,7 +527,7 @@ impl Provider for AnthropicProvider {
                 .await
                 .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
             return Err(Error::provider(
-                "anthropic",
+                self.name(),
                 format!("Anthropic API error (HTTP {status}): {body}"),
             ));
         }
@@ -261,6 +549,7 @@ impl Provider for AnthropicProvider {
                 loop {
                     match state.event_source.next().await {
                         Some(Ok(msg)) => {
+                            state.write_zero_count = 0;
                             if msg.event == "ping" {
                                 // Skip ping events
                             } else {
@@ -283,6 +572,25 @@ impl Provider for AnthropicProvider {
                             }
                         }
                         Some(Err(e)) => {
+                            // WriteZero errors are transient (e.g. empty SSE
+                            // frames when TLS buffers are full). Skip them and
+                            // keep reading, but cap consecutive occurrences to
+                            // avoid infinite loops.
+                            const MAX_CONSECUTIVE_WRITE_ZERO: usize = 5;
+                            if e.kind() == std::io::ErrorKind::WriteZero {
+                                state.write_zero_count += 1;
+                                if state.write_zero_count <= MAX_CONSECUTIVE_WRITE_ZERO {
+                                    tracing::warn!(
+                                        count = state.write_zero_count,
+                                        "Transient WriteZero error in SSE stream, continuing"
+                                    );
+                                    continue;
+                                }
+                                tracing::warn!(
+                                    "WriteZero error persisted after {MAX_CONSECUTIVE_WRITE_ZERO} \
+                                     consecutive attempts, treating as fatal"
+                                );
+                            }
                             state.done = true;
                             let err = Error::api(format!("SSE error: {e}"));
                             return Some((Err(err), state));
@@ -319,6 +627,8 @@ where
     current_tool_id: Option<String>,
     current_tool_name: Option<String>,
     done: bool,
+    /// Consecutive WriteZero errors seen without a successful event in between.
+    write_zero_count: usize,
 }
 
 impl<S> StreamState<S>
@@ -352,13 +662,14 @@ where
             current_tool_id: None,
             current_tool_name: None,
             done: false,
+            write_zero_count: 0,
         }
     }
 
     #[allow(clippy::too_many_lines)]
     fn process_event(&mut self, data: &str) -> Result<Option<StreamEvent>> {
-        let event: AnthropicStreamEvent =
-            serde_json::from_str(data).map_err(|e| Error::api(format!("JSON parse error: {e}")))?;
+        let event: AnthropicStreamEvent = serde_json::from_str(data)
+            .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
 
         match event {
             AnthropicStreamEvent::MessageStart { message } => {
@@ -541,14 +852,13 @@ where
                             serde_json::Value::Null
                         }
                     };
-                tc.arguments = arguments.clone();
-
                 let tool_call = ToolCall {
                     id: self.current_tool_id.take().unwrap_or_default(),
                     name: self.current_tool_name.take().unwrap_or_default(),
-                    arguments,
+                    arguments: arguments.clone(),
                     thought_signature: None,
                 };
+                tc.arguments = arguments;
                 self.current_tool_json.clear();
 
                 Some(StreamEvent::ToolCallEnd {
@@ -907,6 +1217,27 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn home_dir_lookup_falls_back_to_userprofile() {
+        let home = home_dir_with_env_lookup(|key| match key {
+            "USERPROFILE" => Some("C:\\Users\\Ada".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(home, Some(PathBuf::from("C:\\Users\\Ada")));
+    }
+
+    #[test]
+    fn home_dir_lookup_falls_back_to_homedrive_homepath() {
+        let home = home_dir_with_env_lookup(|key| match key {
+            "HOMEDRIVE" => Some("D:".to_string()),
+            "HOMEPATH" => Some("\\Users\\Grace".to_string()),
+            _ => None,
+        });
+
+        assert_eq!(home, Some(PathBuf::from("D:\\Users\\Grace")));
+    }
+
+    #[test]
     fn test_convert_user_text_message() {
         let message = Message::User(crate::model::UserMessage {
             content: UserContent::Text("Hello".to_string()),
@@ -966,7 +1297,7 @@ mod tests {
         let request = provider.build_request(&context, &options);
         assert_eq!(request.model, "claude-test");
         assert_eq!(request.system, Some("System prompt"));
-        assert_eq!(request.temperature, Some(0.2));
+        assert_eq!(request.temperature, Some(1.0)); // thinking forces temperature to 1.0
         assert!(request.stream);
         assert_eq!(request.max_tokens, 13_096);
 
@@ -979,7 +1310,7 @@ mod tests {
         assert_eq!(request.messages[0].content.len(), 1);
         match &request.messages[0].content[0] {
             AnthropicContent::Text { text } => assert_eq!(*text, "Ping"),
-            other => panic!("expected text content, got {other:?}"),
+            other => panic!(),
         }
 
         let tools = request.tools.expect("tools");
@@ -1139,7 +1470,7 @@ mod tests {
             assert_eq!(tool_call.name, "search");
             assert_eq!(tool_call.arguments, json!({ "q": "rust" }));
         } else {
-            panic!("expected ToolCallEnd event, got {:?}", out[7]);
+            panic!();
         }
         assert!(matches!(
             &out[8],
@@ -1168,7 +1499,7 @@ mod tests {
             assert_eq!(*reason, StopReason::ToolUse);
             assert_eq!(message.stop_reason, StopReason::ToolUse);
         } else {
-            panic!("expected Done event, got {:?}", out[11]);
+            panic!();
         }
     }
 
@@ -1198,7 +1529,7 @@ mod tests {
             assert_eq!(message.usage.output, 7);
             assert_eq!(message.usage.total_tokens, 12);
         } else {
-            panic!("expected Done event, got {:?}", out[1]);
+            panic!();
         }
     }
 
@@ -1230,7 +1561,7 @@ mod tests {
         if let StreamEvent::Done { message, .. } = &out[1] {
             assert_eq!(message.usage.total_tokens, u64::MAX);
         } else {
-            panic!("expected Done event, got {:?}", out[1]);
+            panic!();
         }
     }
 
@@ -1333,9 +1664,104 @@ mod tests {
         assert_eq!(out.len(), 2, "parse error should stop further events");
         assert!(matches!(out[0], Ok(StreamEvent::Start { .. })));
         match &out[1] {
-            Ok(event) => panic!("expected parse error item, got event: {event:?}"),
+            Ok(event) => panic!(),
             Err(err) => assert!(err.to_string().contains("JSON parse error")),
         }
+    }
+
+    #[test]
+    fn test_stream_fragmented_sse_transport_preserves_text_delta_order() {
+        let response_parts = vec![
+            "seg-00|".to_string(),
+            "seg-01|".to_string(),
+            "seg-02|".to_string(),
+            "seg-03|".to_string(),
+            "seg-04|".to_string(),
+            "seg-05|".to_string(),
+            "seg-06|".to_string(),
+            "seg-07|".to_string(),
+            "seg-08|".to_string(),
+            "seg-09|".to_string(),
+            "seg-10|".to_string(),
+            "seg-11|".to_string(),
+        ];
+        let expected_text = response_parts.concat();
+        let part_refs = response_parts
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let frames = build_text_stream_sse_frames(&part_refs);
+        let chunks = split_ascii_stream_bytes(&frames, &[1, 2, 5, 3, 8, 13, 21]);
+        let out = collect_events_from_byte_chunks(chunks);
+
+        assert!(matches!(out.first(), Some(StreamEvent::Start { .. })));
+        assert!(matches!(
+            out.get(1),
+            Some(StreamEvent::TextStart {
+                content_index: 0,
+                ..
+            })
+        ));
+
+        let deltas = collect_text_deltas(&out);
+        assert_eq!(deltas, response_parts);
+        assert_eq!(deltas.concat(), expected_text);
+
+        let final_text = out
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::TextEnd { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .expect("text_end event");
+        assert_eq!(final_text, expected_text);
+
+        let done_count = out
+            .iter()
+            .filter(|event| matches!(event, StreamEvent::Done { .. }))
+            .count();
+        assert_eq!(done_count, 1, "expected exactly one Done event");
+
+        match out.last() {
+            Some(StreamEvent::Done { reason, message }) => {
+                assert_eq!(*reason, StopReason::Stop);
+                assert_eq!(message.stop_reason, StopReason::Stop);
+            }
+            other => panic!("expected final Done event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_stream_high_volume_fragmented_sse_preserves_delta_count_and_content() {
+        let response_parts = (0..128)
+            .map(|idx| format!("chunk-{idx:03}|"))
+            .collect::<Vec<_>>();
+        let expected_text = response_parts.concat();
+        let part_refs = response_parts
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let frames = build_text_stream_sse_frames(&part_refs);
+        let chunks = split_ascii_stream_bytes(&frames, &[1, 1, 2, 3, 5, 8, 13, 21, 34]);
+        let out = collect_events_from_byte_chunks(chunks);
+        let deltas = collect_text_deltas(&out);
+
+        assert_eq!(
+            deltas.len(),
+            response_parts.len(),
+            "expected one TextDelta per text fragment"
+        );
+        assert_eq!(deltas, response_parts);
+        assert_eq!(deltas.concat(), expected_text);
+
+        let final_text = out
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::TextEnd { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .expect("text_end event");
+        assert_eq!(final_text, expected_text);
     }
 
     #[test]
@@ -1344,7 +1770,7 @@ mod tests {
             .expect("captured request for required headers");
         assert_eq!(
             captured.headers.get("x-api-key").map(String::as_str),
-            Some("test-key")
+            Some("sk-ant-test-key")
         );
         assert_eq!(
             captured
@@ -1403,6 +1829,82 @@ mod tests {
     }
 
     #[test]
+    fn test_stream_uses_bearer_headers_for_marked_anthropic_oauth_token() {
+        let marked = "__pi_anthropic_oauth_bearer__:sk-ant-api-like-token";
+        let captured = run_stream_and_capture_headers_with_api_key(CacheRetention::None, marked)
+            .expect("captured request for marked oauth headers");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some("Bearer sk-ant-api-like-token")
+        );
+        assert!(!captured.headers.contains_key("x-api-key"));
+        assert!(
+            captured
+                .headers
+                .get("anthropic-beta")
+                .is_some_and(|value| value.contains("oauth-2025-04-20"))
+        );
+    }
+
+    #[test]
+    fn test_stream_claude_style_non_sk_token_uses_bearer_auth_headers() {
+        let captured =
+            run_stream_and_capture_headers_with_api_key(CacheRetention::None, "claude-oauth-token")
+                .expect("captured request for claude bearer headers");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some("Bearer claude-oauth-token")
+        );
+        assert!(!captured.headers.contains_key("x-api-key"));
+    }
+
+    #[test]
+    fn test_stream_kimi_oauth_uses_bearer_and_kimi_headers() {
+        let captured = run_stream_and_capture_headers_for_provider_with_api_key(
+            CacheRetention::None,
+            "kimi-for-coding",
+            "kimi-oauth-token",
+        )
+        .expect("captured request for kimi oauth headers");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some("Bearer kimi-oauth-token")
+        );
+        assert!(!captured.headers.contains_key("x-api-key"));
+        assert!(
+            !captured
+                .headers
+                .contains_key("anthropic-dangerous-direct-browser-access")
+        );
+        assert!(!captured.headers.contains_key("anthropic-beta"));
+        assert_eq!(
+            captured.headers.get("x-msh-platform").map(String::as_str),
+            Some("kimi_cli")
+        );
+        assert!(captured.headers.contains_key("x-msh-version"));
+        assert!(captured.headers.contains_key("x-msh-device-name"));
+        assert!(captured.headers.contains_key("x-msh-device-model"));
+        assert!(captured.headers.contains_key("x-msh-os-version"));
+        assert!(captured.headers.contains_key("x-msh-device-id"));
+    }
+
+    #[test]
+    fn test_stream_kimi_api_key_uses_x_api_key_header() {
+        let captured = run_stream_and_capture_headers_for_provider_with_api_key(
+            CacheRetention::None,
+            "kimi-for-coding",
+            "sk-kimi-api-key",
+        )
+        .expect("captured request for kimi api-key headers");
+        assert_eq!(
+            captured.headers.get("x-api-key").map(String::as_str),
+            Some("sk-kimi-api-key")
+        );
+        assert!(!captured.headers.contains_key("authorization"));
+        assert!(!captured.headers.contains_key("x-msh-platform"));
+    }
+
+    #[test]
     fn test_stream_oauth_beta_header_includes_prompt_caching_when_enabled() {
         let captured =
             run_stream_and_capture_headers_with_api_key(CacheRetention::Short, "sk-ant-oat-test")
@@ -1442,11 +1944,17 @@ mod tests {
             .expect("runtime build");
         let result = runtime.block_on(async { provider.stream(&context, &options).await });
         let Err(err) = result else {
-            panic!("expected HTTP error");
+            panic!();
         };
         let message = err.to_string();
         assert!(message.contains("Anthropic API error (HTTP 401)"));
         assert!(message.contains("Invalid API key"));
+    }
+
+    #[test]
+    fn test_provider_name_reflects_override() {
+        let provider = AnthropicProvider::new("claude-test").with_provider_name("kimi-for-coding");
+        assert_eq!(provider.name(), "kimi-for-coding");
     }
 
     #[derive(Debug)]
@@ -1456,15 +1964,29 @@ mod tests {
     }
 
     fn run_stream_and_capture_headers(cache_retention: CacheRetention) -> Option<CapturedRequest> {
-        run_stream_and_capture_headers_with_api_key(cache_retention, "test-key")
+        run_stream_and_capture_headers_with_api_key(cache_retention, "sk-ant-test-key")
     }
 
     fn run_stream_and_capture_headers_with_api_key(
         cache_retention: CacheRetention,
         api_key: &str,
     ) -> Option<CapturedRequest> {
+        run_stream_and_capture_headers_for_provider_with_api_key(
+            cache_retention,
+            "anthropic",
+            api_key,
+        )
+    }
+
+    fn run_stream_and_capture_headers_for_provider_with_api_key(
+        cache_retention: CacheRetention,
+        provider_name: &str,
+        api_key: &str,
+    ) -> Option<CapturedRequest> {
         let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
-        let provider = AnthropicProvider::new("claude-test").with_base_url(base_url);
+        let provider = AnthropicProvider::new("claude-test")
+            .with_provider_name(provider_name)
+            .with_base_url(base_url);
         let context = Context {
             system_prompt: Some("test system".to_string().into()),
             messages: vec![Message::User(crate::model::UserMessage {
@@ -1508,7 +2030,7 @@ mod tests {
             tools: Vec::new().into(),
         };
         let options = StreamOptions {
-            api_key: Some("test-key".to_string()),
+            api_key: Some("sk-ant-test-key".to_string()),
             ..Default::default()
         };
 
@@ -1571,7 +2093,7 @@ mod tests {
                     {
                         break;
                     }
-                    Err(err) => panic!("read request failed: {err}"),
+                    Err(err) => panic!(),
                 }
             }
 
@@ -1597,7 +2119,7 @@ mod tests {
                     {
                         break;
                     }
-                    Err(err) => panic!("read request body failed: {err}"),
+                    Err(err) => panic!(),
                 }
             }
 
@@ -1681,6 +2203,129 @@ mod tests {
 
             out
         })
+    }
+
+    fn collect_events_from_byte_chunks(chunks: Vec<Vec<u8>>) -> Vec<StreamEvent> {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let byte_stream = stream::iter(chunks.into_iter().map(Ok));
+            let event_source = crate::sse::SseStream::new(Box::pin(byte_stream));
+            let mut state = StreamState::new(
+                event_source,
+                "claude-test".to_string(),
+                "anthropic-messages".to_string(),
+                "anthropic".to_string(),
+            );
+            let mut out = Vec::new();
+
+            while let Some(item) = state.event_source.next().await {
+                let msg = item.expect("SSE event");
+                if msg.event == "ping" {
+                    continue;
+                }
+                if let Some(event) = state.process_event(&msg.data).expect("process_event") {
+                    out.push(event);
+                }
+            }
+
+            out
+        })
+    }
+
+    fn build_text_stream_sse_frames(text_parts: &[&str]) -> Vec<String> {
+        let message_start = json!({
+            "type": "message_start",
+            "message": {
+                "usage": {
+                    "input_tokens": 10,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 1
+                }
+            }
+        });
+        let content_start = json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": { "type": "text" }
+        });
+        let content_stop = json!({
+            "type": "content_block_stop",
+            "index": 0
+        });
+        let message_delta = json!({
+            "type": "message_delta",
+            "delta": { "stop_reason": "end_turn" },
+            "usage": { "output_tokens": text_parts.len().max(1) }
+        });
+
+        let mut frames = vec![
+            format!("event: message_start\ndata: {message_start}\n\n"),
+            format!("event: content_block_start\ndata: {content_start}\n\n"),
+        ];
+
+        for (idx, text) in text_parts.iter().enumerate() {
+            if idx % 4 == 1 {
+                frames.push("event: ping\ndata: {\"type\":\"ping\"}\n\n".to_string());
+            }
+            let content_delta = json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": { "type": "text_delta", "text": text }
+            });
+            frames.push(format!(
+                "event: content_block_delta\ndata: {content_delta}\n\n"
+            ));
+        }
+
+        frames.push(format!(
+            "event: content_block_stop\ndata: {content_stop}\n\n"
+        ));
+        frames.push(format!("event: message_delta\ndata: {message_delta}\n\n"));
+        frames.push("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string());
+        frames
+    }
+
+    fn split_ascii_stream_bytes(frames: &[String], fragment_sizes: &[usize]) -> Vec<Vec<u8>> {
+        assert!(
+            !fragment_sizes.is_empty(),
+            "fragment_sizes must contain at least one size"
+        );
+        assert!(
+            fragment_sizes.iter().all(|size| *size > 0),
+            "fragment_sizes must be positive"
+        );
+
+        let joined = frames.concat();
+        assert!(
+            joined.is_ascii(),
+            "test-only chunk fragmentation expects ASCII SSE fixtures"
+        );
+
+        let bytes = joined.as_bytes();
+        let mut offset = 0usize;
+        let mut idx = 0usize;
+        let mut chunks = Vec::new();
+        while offset < bytes.len() {
+            let size = fragment_sizes[idx % fragment_sizes.len()];
+            let end = (offset + size).min(bytes.len());
+            chunks.push(bytes[offset..end].to_vec());
+            offset = end;
+            idx += 1;
+        }
+        chunks
+    }
+
+    fn collect_text_deltas(events: &[StreamEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta { delta, .. } => Some(delta.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     fn summarize_event(event: &StreamEvent) -> EventSummary {
@@ -1784,7 +2429,7 @@ mod tests {
             tools: Vec::new().into(),
         };
         let options = StreamOptions {
-            api_key: Some("test-key".to_string()),
+            api_key: Some("sk-ant-test-key".to_string()),
             ..Default::default()
         };
 
@@ -1816,8 +2461,203 @@ mod tests {
         // Standard headers should still be present
         assert_eq!(
             captured.headers.get("x-api-key").map(String::as_str),
-            Some("test-key"),
+            Some("sk-ant-test-key"),
         );
+    }
+
+    #[test]
+    fn test_compat_authorization_header_works_without_api_key() {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+
+        let mut custom = HashMap::new();
+        custom.insert(
+            "Authorization".to_string(),
+            "Bearer sk-ant-oat-compat".to_string(),
+        );
+        let provider = AnthropicProvider::new("claude-test")
+            .with_base_url(base_url)
+            .with_compat(Some(crate::models::CompatConfig {
+                custom_headers: Some(custom),
+                ..Default::default()
+            }));
+
+        let context = Context {
+            system_prompt: Some("test".to_string().into()),
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider
+                .stream(&context, &StreamOptions::default())
+                .await
+                .expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let captured = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured request");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some("Bearer sk-ant-oat-compat")
+        );
+        assert!(!captured.headers.contains_key("x-api-key"));
+        assert_eq!(
+            captured
+                .headers
+                .get("anthropic-dangerous-direct-browser-access")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            captured.headers.get("x-app").map(String::as_str),
+            Some("cli")
+        );
+        assert!(
+            captured
+                .headers
+                .get("anthropic-beta")
+                .is_some_and(|value| value.contains("oauth-2025-04-20"))
+        );
+    }
+
+    #[test]
+    fn test_authorization_override_wins_side_effects_over_x_api_key_override() {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+
+        let mut custom = HashMap::new();
+        custom.insert(
+            "Authorization".to_string(),
+            "Bearer sk-ant-oat-compat".to_string(),
+        );
+        let provider = AnthropicProvider::new("claude-test")
+            .with_base_url(base_url)
+            .with_compat(Some(crate::models::CompatConfig {
+                custom_headers: Some(custom),
+                ..Default::default()
+            }));
+
+        let context = Context {
+            system_prompt: Some("test".to_string().into()),
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let mut headers = HashMap::new();
+        headers.insert("X-API-Key".to_string(), "header-ant-key".to_string());
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider
+                .stream(
+                    &context,
+                    &StreamOptions {
+                        headers,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let captured = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured request");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some("Bearer sk-ant-oat-compat")
+        );
+        assert_eq!(
+            captured.headers.get("x-api-key").map(String::as_str),
+            Some("header-ant-key")
+        );
+        assert_eq!(
+            captured
+                .headers
+                .get("anthropic-dangerous-direct-browser-access")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            captured.headers.get("x-app").map(String::as_str),
+            Some("cli")
+        );
+        assert!(
+            captured
+                .headers
+                .get("anthropic-beta")
+                .is_some_and(|value| value.contains("oauth-2025-04-20"))
+        );
+    }
+
+    #[test]
+    fn test_stream_option_x_api_key_header_works_without_api_key() {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+
+        let provider = AnthropicProvider::new("claude-test").with_base_url(base_url);
+        let context = Context {
+            system_prompt: Some("test".to_string().into()),
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let mut headers = HashMap::new();
+        headers.insert("X-API-Key".to_string(), "header-ant-key".to_string());
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider
+                .stream(
+                    &context,
+                    &StreamOptions {
+                        headers,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let captured = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured request");
+        assert_eq!(
+            captured.headers.get("x-api-key").map(String::as_str),
+            Some("header-ant-key")
+        );
+        assert!(!captured.headers.contains_key("authorization"));
     }
 
     #[test]
@@ -1838,7 +2678,7 @@ mod tests {
             tools: Vec::new().into(),
         };
         let options = StreamOptions {
-            api_key: Some("test-key".to_string()),
+            api_key: Some("sk-ant-test-key".to_string()),
             ..Default::default()
         };
 
@@ -1860,7 +2700,7 @@ mod tests {
         // Standard Anthropic headers present, no custom headers
         assert_eq!(
             captured.headers.get("x-api-key").map(String::as_str),
-            Some("test-key"),
+            Some("sk-ant-test-key"),
         );
         assert!(
             !captured.headers.contains_key("x-custom-tag"),

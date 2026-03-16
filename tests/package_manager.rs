@@ -194,6 +194,7 @@ fn resolve_with_roots_auto_discovery_ignores_parent_gitignore() {
     write_json(&project_settings_path, &serde_json::json!({}));
 
     let roots = ResolveRoots {
+        project_settings_enabled: true,
         global_settings_path,
         project_settings_path,
         global_base_dir,
@@ -231,6 +232,7 @@ fn resolve_with_roots_applies_auto_discovery_override_patterns() {
     std::fs::write(&auto_ext, "export const x = 1;\n").expect("write auto extension");
 
     let roots = ResolveRoots {
+        project_settings_enabled: true,
         global_settings_path: global_settings_path.clone(),
         project_settings_path: project_settings_path.clone(),
         global_base_dir,
@@ -367,6 +369,7 @@ fn resolve_with_roots_applies_package_filters_and_prefers_project_package() {
     );
 
     let roots = ResolveRoots {
+        project_settings_enabled: true,
         global_settings_path,
         project_settings_path,
         global_base_dir,
@@ -664,6 +667,7 @@ fn resolve_with_roots_auto_discovers_extension_directory_entries() {
     write_json(&project_settings_path, &serde_json::json!({}));
 
     let roots = ResolveRoots {
+        project_settings_enabled: true,
         global_settings_path,
         project_settings_path,
         global_base_dir,
@@ -721,6 +725,7 @@ fn resolve_with_roots_auto_discovers_extension_directory_index_fallback() {
     write_json(&project_settings_path, &serde_json::json!({}));
 
     let roots = ResolveRoots {
+        project_settings_enabled: true,
         global_settings_path,
         project_settings_path,
         global_base_dir,
@@ -764,6 +769,7 @@ fn resolve_with_roots_auto_discovery_follows_symlink_extension_dirs() {
     write_json(&project_settings_path, &serde_json::json!({}));
 
     let roots = ResolveRoots {
+        project_settings_enabled: true,
         global_settings_path,
         project_settings_path,
         global_base_dir,
@@ -849,6 +855,7 @@ fn resolve_with_roots_fixture_project_package_overrides_global_and_filters_resou
     let project_base_dir = cwd.join(".pi");
 
     let roots = ResolveRoots {
+        project_settings_enabled: true,
         global_settings_path: global_base_dir.join("settings.json"),
         project_settings_path: project_base_dir.join("settings.json"),
         global_base_dir: global_base_dir.clone(),

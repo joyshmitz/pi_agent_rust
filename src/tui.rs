@@ -320,7 +320,7 @@ impl PiConsole {
 
     /// Move cursor up N lines.
     pub fn cursor_up(&self, n: usize) {
-        if self.is_tty {
+        if self.is_tty && n > 0 {
             print!("\x1b[{n}A");
             let _ = io::stdout().flush();
         }
@@ -378,29 +378,38 @@ fn split_markdown_fenced_code_blocks(markdown: &str) -> Vec<MarkdownChunk> {
     let mut code_buf = String::new();
     let mut in_code_block = false;
     let mut fence_len = 0usize;
+    let mut fence_char = '\0';
     let mut code_language: Option<String> = None;
 
     for line in markdown.split_inclusive('\n') {
         let trimmed_start = line.trim_start();
         let trimmed_line = trimmed_start.trim_end_matches(['\r', '\n']);
 
-        let backtick_count = trimmed_line.chars().take_while(|ch| *ch == '`').count();
-        let is_fence = backtick_count >= 3 && trimmed_line.starts_with("```");
+        let marker = trimmed_line.chars().next().unwrap_or('\0');
+        let is_potential_fence = marker == '`' || marker == '~';
+        let marker_count = if is_potential_fence {
+            trimmed_line.chars().take_while(|ch| *ch == marker).count()
+        } else {
+            0
+        };
+        let is_fence = marker_count >= 3;
 
         if !in_code_block {
             if is_fence {
-                fence_len = backtick_count;
+                fence_len = marker_count;
+                fence_char = marker;
                 let info = trimmed_line.get(fence_len..).unwrap_or_default();
 
-                // CommonMark: The info string may not contain any backtick characters.
+                // CommonMark: backtick fence info strings may not contain backticks.
                 // If it does, this is likely an inline code span at the start of a line, not a fence.
-                if info.contains('`') {
+                if marker == '`' && info.contains('`') {
                     text_buf.push_str(line);
                     continue;
                 }
 
                 if !text_buf.is_empty() {
-                    chunks.push(MarkdownChunk::Text(std::mem::take(&mut text_buf)));
+                    chunks.push(MarkdownChunk::Text(text_buf.clone()));
+                    text_buf.clear();
                 }
 
                 code_language = parse_fenced_code_language(info);
@@ -414,15 +423,18 @@ fn split_markdown_fenced_code_blocks(markdown: &str) -> Vec<MarkdownChunk> {
         }
 
         if is_fence
-            && backtick_count >= fence_len
-            && trimmed_line[backtick_count..].trim().is_empty()
+            && marker == fence_char
+            && marker_count >= fence_len
+            && trimmed_line[marker_count..].trim().is_empty()
         {
             chunks.push(MarkdownChunk::CodeBlock {
                 language: code_language.take(),
-                code: std::mem::take(&mut code_buf),
+                code: code_buf.clone(),
             });
+            code_buf.clear();
             in_code_block = false;
             fence_len = 0;
+            fence_char = '\0';
             continue;
         }
 
@@ -562,68 +574,79 @@ fn render_markdown_with_syntax(markdown: &str, width: usize) -> Vec<Segment<'sta
 /// Strip rich markup tags from text.
 fn strip_markup(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
-    let mut chars = text.chars();
+    let mut buffer = String::new();
+    let mut in_tag = false;
 
-    while let Some(c) = chars.next() {
-        if c == '[' {
-            // Potential tag
-            let mut buffer = String::new();
-            let mut is_tag = true;
-            let mut closed = false;
+    for c in text.chars() {
+        if in_tag {
+            if c == ']' {
+                // End of potential tag
+                // Check heuristics:
+                // 1. Not pure digits (e.g. [0])
+                // 2. Contains only allowed characters
+                let is_pure_digits =
+                    !buffer.is_empty() && buffer.chars().all(|ch| ch.is_ascii_digit());
+                let contains_invalid_chars = buffer.chars().any(|ch| {
+                    !ch.is_ascii_alphanumeric()
+                        && !matches!(
+                            ch,
+                            ' ' | '/'
+                                | ','
+                                | '#'
+                                | '='
+                                | '.'
+                                | ':'
+                                | '-'
+                                | '_'
+                                | '?'
+                                | '&'
+                                | '%'
+                                | '+'
+                                | '~'
+                                | ';'
+                                | '*'
+                                | '\''
+                                | '('
+                                | ')'
+                        )
+                });
 
-            for next_c in chars.by_ref() {
-                if next_c == ']' {
-                    closed = true;
-                    break;
-                }
-                buffer.push(next_c);
-                // Heuristic: rich_rust tags usually contain alpha, space, slash, comma.
-                // If we see digits or other symbols, assume it's not a tag (e.g. array[0]).
-                if !next_c.is_ascii_alphanumeric()
-                    && !matches!(
-                        next_c,
-                        ' ' | '/'
-                            | ','
-                            | '#'
-                            | '='
-                            | '.'
-                            | ':'
-                            | '-'
-                            | '_'
-                            | '?'
-                            | '&'
-                            | '%'
-                            | '+'
-                            | '~'
-                            | ';'
-                            | '*'
-                            | '\''
-                            | '('
-                            | ')'
-                    )
-                {
-                    is_tag = false;
-                }
-            }
-
-            // Pure-digit content like [0] is never a markup tag.
-            if buffer.chars().all(|ch| ch.is_ascii_digit()) {
-                is_tag = false;
-            }
-
-            if closed && is_tag && !buffer.is_empty() {
-                // It was a tag, discard buffer (already consumed)
-            } else {
-                // Not a tag, or unclosed tag: restore literal
-                result.push('[');
-                result.push_str(&buffer);
-                if closed {
+                if is_pure_digits || contains_invalid_chars || buffer.is_empty() {
+                    // Not a tag, restore literal
+                    result.push('[');
+                    result.push_str(&buffer);
                     result.push(']');
+                } else {
+                    // Valid tag, discard (strip it)
                 }
+                buffer.clear();
+                in_tag = false;
+            } else if c == '[' {
+                result.push('[');
+                if buffer.is_empty() {
+                    // Escaped bracket: `[[` becomes `[`
+                    in_tag = false;
+                } else {
+                    // Nested '[' means the previous '[' was literal.
+                    // Flush previous '[' and buffer, start new tag candidate.
+                    result.push_str(&buffer);
+                    buffer.clear();
+                    // Stay in_tag for this new '['
+                }
+            } else {
+                buffer.push(c);
             }
+        } else if c == '[' {
+            in_tag = true;
         } else {
             result.push(c);
         }
+    }
+
+    // Flush any open tag at end of string
+    if in_tag {
+        result.push('[');
+        result.push_str(&buffer);
     }
 
     result
@@ -741,7 +764,13 @@ mod tests {
 
         pi_console.render_markdown("# Title\n\n- Item 1\n- Item 2\n\n**bold**");
 
-        let output = String::from_utf8(buffer.lock().expect("lock buffer").clone()).expect("utf-8");
+        let output = String::from_utf8(
+            buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+        .expect("utf-8");
 
         assert!(
             output.contains("\u{1b}["),
@@ -990,6 +1019,18 @@ Nested: **bold and *italic*** and ~~**strike bold**~~.
     }
 
     // ── split_markdown_fenced_code_blocks edge cases ───────────────────
+    #[test]
+    fn split_markdown_tilde_code_blocks() {
+        let input = "text1\n~~~rust\ncode1\n~~~\ntext2\n";
+        let chunks = split_markdown_fenced_code_blocks(input);
+        assert_eq!(chunks.len(), 3, "expected 3 chunks: {chunks:?}");
+        assert!(matches!(&chunks[0], MarkdownChunk::Text(_)));
+        assert!(
+            matches!(&chunks[1], MarkdownChunk::CodeBlock { language, .. } if language.as_deref() == Some("rust"))
+        );
+        assert!(matches!(&chunks[2], MarkdownChunk::Text(_)));
+    }
+
     #[test]
     fn split_markdown_multiple_code_blocks() {
         let input = "text1\n```rust\ncode1\n```\ntext2\n```python\ncode2\n```\ntext3\n";

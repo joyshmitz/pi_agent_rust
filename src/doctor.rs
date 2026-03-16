@@ -8,6 +8,7 @@ use crate::auth::{AuthStorage, CredentialStatus};
 use crate::config::Config;
 use crate::error::Result;
 use crate::provider_metadata::provider_auth_env_keys;
+use crate::session::SessionHeader;
 use crate::session_index::walk_sessions;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -356,7 +357,7 @@ pub fn run_doctor(opts: &DoctorOptions<'_>) -> Result<DoctorReport> {
             .as_ref()
             .is_none_or(|set| set.contains(&CheckCategory::Extensions))
         {
-            check_extension(opts.cwd, ext_path, opts.policy_override, &mut findings)?;
+            check_extension(opts.cwd, ext_path, opts.policy_override, &mut findings);
         }
     } else if opts
         .only
@@ -540,6 +541,12 @@ fn is_known_config_key(key: &str) -> bool {
             | "repair_policy"
             | "extensionRisk"
             | "extension_risk"
+            | "checkForUpdates"
+            | "check_for_updates"
+            | "sessionDurability"
+            | "session_durability"
+            | "markdown"
+            | "queueMode"
     )
 }
 
@@ -794,6 +801,28 @@ fn check_shell(findings: &mut Vec<Finding>) {
         ToolCheckMode::PresenceOnly,
         findings,
     );
+    check_tool(
+        cat,
+        "rg",
+        &["--version"],
+        Severity::Warn,
+        ToolCheckMode::PresenceOnly,
+        findings,
+    );
+
+    let fd_bin = if which_tool("fd").is_some() {
+        "fd"
+    } else {
+        "fdfind"
+    };
+    check_tool(
+        cat,
+        fd_bin,
+        &["--version"],
+        Severity::Warn,
+        ToolCheckMode::PresenceOnly,
+        findings,
+    );
 
     // Optional tools (Info if missing)
     check_tool(
@@ -832,7 +861,11 @@ fn check_tool(
 
     let command_target = discovered_path.as_deref().unwrap_or(tool);
 
-    match Command::new(command_target).args(args).output() {
+    match Command::new(command_target)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+    {
         Ok(output) if output.status.success() => {
             // Extract version from first line of stdout
             let version = String::from_utf8_lossy(&output.stdout);
@@ -1048,8 +1081,17 @@ fn check_sessions(findings: &mut Vec<Finding>) {
     }
 }
 
-/// Quick health check: non-empty and first line parses as JSON.
+/// Quick health check: non-empty and first line parses as a valid session header.
 fn is_session_healthy(path: &Path) -> bool {
+    #[cfg(feature = "sqlite-sessions")]
+    if path.extension().and_then(|ext| ext.to_str()) == Some("sqlite") {
+        return futures::executor::block_on(async {
+            crate::session_sqlite::load_session_meta(path)
+                .await
+                .is_ok_and(|meta| meta.header.is_valid())
+        });
+    }
+
     let Ok(file) = std::fs::File::open(path) else {
         return false;
     };
@@ -1057,7 +1099,7 @@ fn is_session_healthy(path: &Path) -> bool {
     let mut line = String::new();
     match reader.read_line(&mut line) {
         Ok(0) | Err(_) => false, // empty or unreadable
-        Ok(_) => serde_json::from_str::<serde_json::Value>(&line).is_ok(),
+        Ok(_) => serde_json::from_str::<SessionHeader>(&line).is_ok_and(|header| header.is_valid()),
     }
 }
 
@@ -1068,7 +1110,7 @@ fn check_extension(
     path: &str,
     policy_override: Option<&str>,
     findings: &mut Vec<Finding>,
-) -> Result<()> {
+) {
     use crate::extension_preflight::{FindingSeverity, PreflightAnalyzer, PreflightVerdict};
 
     let cat = CheckCategory::Extensions;
@@ -1086,11 +1128,35 @@ fn check_extension(
             )
             .with_remediation("Check the path and try again"),
         );
-        return Ok(());
+        return;
     }
 
-    let config = Config::load()?;
-    let resolved = config.resolve_extension_policy_with_metadata(policy_override);
+    let config_path = Config::config_path_override_from_env(cwd);
+    let resolved = match Config::load_with_roots(config_path.as_deref(), &Config::global_dir(), cwd)
+    {
+        Ok(config) => config.resolve_extension_policy_with_metadata(policy_override),
+        Err(err) => {
+            findings.push(
+                Finding::fail(
+                    cat,
+                    "Failed to load configuration for extension policy resolution",
+                )
+                .with_detail(err.to_string())
+                .with_remediation(
+                    "Fix the malformed settings.json, point PI_CONFIG_PATH at a valid file, or rerun with `--policy <safe|balanced|permissive>` to inspect extension compatibility independently",
+                ),
+            );
+            let has_explicit_policy =
+                policy_override.is_some() || std::env::var_os("PI_EXTENSION_POLICY").is_some();
+            if has_explicit_policy {
+                Config::default().resolve_extension_policy_with_metadata(policy_override)
+            } else {
+                // If project config is unreadable, fail closed instead of silently
+                // analyzing under the default permissive profile.
+                Config::default().resolve_extension_policy_with_metadata(Some("safe"))
+            }
+        }
+    };
     let ext_id = ext_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -1152,8 +1218,6 @@ fn check_extension(
         }
         findings.push(f);
     }
-
-    Ok(())
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -1161,6 +1225,14 @@ fn check_extension(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn write_extension_fixture(cwd: &Path, source: &str) -> PathBuf {
+        let extension_dir = cwd.join("ext");
+        std::fs::create_dir_all(&extension_dir).expect("create extension dir");
+        std::fs::write(extension_dir.join("index.js"), source).expect("write extension source");
+        extension_dir
+    }
 
     #[test]
     fn severity_ordering() {
@@ -1304,7 +1376,11 @@ mod tests {
     fn session_healthy_valid_json() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("valid.jsonl");
-        std::fs::write(&path, r#"{"type":"header","version":1}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"type":"session","version":3,"id":"doctor-jsonl","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}"#,
+        )
+        .unwrap();
         assert!(is_session_healthy(&path));
     }
 
@@ -1313,6 +1389,62 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("invalid.jsonl");
         std::fs::write(&path, "not json at all\n").unwrap();
+        assert!(!is_session_healthy(&path));
+    }
+
+    #[test]
+    fn session_healthy_rejects_non_header_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("array.jsonl");
+        std::fs::write(&path, "[1,2,3]\n").unwrap();
+        assert!(!is_session_healthy(&path));
+    }
+
+    #[cfg(feature = "sqlite-sessions")]
+    #[test]
+    fn session_healthy_valid_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("valid.sqlite");
+        let header = SessionHeader {
+            id: "doctor-sqlite".to_string(),
+            ..SessionHeader::default()
+        };
+        futures::executor::block_on(async {
+            crate::session_sqlite::save_session(&path, &header, &[])
+                .await
+                .expect("save sqlite session");
+        });
+        assert!(is_session_healthy(&path));
+    }
+
+    #[cfg(feature = "sqlite-sessions")]
+    #[test]
+    fn session_healthy_rejects_invalid_sqlite_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid.sqlite");
+        let header = SessionHeader {
+            id: "doctor-sqlite".to_string(),
+            ..SessionHeader::default()
+        };
+        futures::executor::block_on(async {
+            crate::session_sqlite::save_session(&path, &header, &[])
+                .await
+                .expect("save sqlite session");
+        });
+        let invalid_header = SessionHeader {
+            r#type: "not-session".to_string(),
+            ..header
+        };
+        let invalid_json =
+            serde_json::to_string(&invalid_header).expect("serialize invalid session header");
+        let config = sqlmodel_sqlite::SqliteConfig::file(path.to_string_lossy())
+            .flags(sqlmodel_sqlite::OpenFlags::create_read_write());
+        let conn = sqlmodel_sqlite::SqliteConnection::open(&config).expect("open sqlite db");
+        conn.execute_sync(
+            "UPDATE pi_session_header SET json = ?1",
+            &[sqlmodel_core::Value::Text(invalid_json)],
+        )
+        .expect("corrupt sqlite header row");
         assert!(!is_session_healthy(&path));
     }
 
@@ -1467,6 +1599,159 @@ mod tests {
                 .iter()
                 .any(|f| f.category == CheckCategory::Extensions && f.severity == Severity::Fail),
             "extensions-only mode without a path should emit a clear failure finding"
+        );
+    }
+
+    #[test]
+    fn run_doctor_extension_path_uses_supplied_cwd_for_policy_resolution() {
+        let project = tempfile::tempdir().expect("project dir");
+        let config_dir = project.path().join(".pi");
+        std::fs::create_dir_all(&config_dir).expect("create project config dir");
+        std::fs::write(
+            config_dir.join("settings.json"),
+            r#"{ "extensionPolicy": { "profile": "safe" } }"#,
+        )
+        .expect("write project settings");
+        write_extension_fixture(
+            project.path(),
+            r#"
+const { exec } = require("child_process");
+export default function(pi) {
+    pi.exec("ls");
+}
+"#,
+        );
+
+        let opts = DoctorOptions {
+            cwd: project.path(),
+            extension_path: Some("ext"),
+            policy_override: None,
+            fix: false,
+            only: None,
+        };
+        let report = run_doctor(&opts).expect("doctor report");
+
+        assert!(
+            report.findings.iter().any(|f| f.title.contains("exec")),
+            "doctor should honor the supplied cwd's safe policy and flag exec use"
+        );
+    }
+
+    #[test]
+    fn run_doctor_extension_path_reports_config_load_failure_without_aborting() {
+        let project = tempfile::tempdir().expect("project dir");
+        let config_dir = project.path().join(".pi");
+        std::fs::create_dir_all(&config_dir).expect("create project config dir");
+        std::fs::write(config_dir.join("settings.json"), r#"{ "extensionPolicy": "#)
+            .expect("write malformed project settings");
+        write_extension_fixture(
+            project.path(),
+            r#"
+import net from "node:net";
+"#,
+        );
+
+        let opts = DoctorOptions {
+            cwd: project.path(),
+            extension_path: Some("ext"),
+            policy_override: None,
+            fix: false,
+            only: None,
+        };
+        let report = run_doctor(&opts).expect("doctor report");
+
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|f| f.category == CheckCategory::Extensions),
+            "extension path mode should keep findings scoped to extensions"
+        );
+        assert!(
+            report.findings.iter().any(|f| {
+                f.title == "Failed to load configuration for extension policy resolution"
+            }),
+            "doctor should surface config load failures as findings instead of returning Err"
+        );
+        assert!(
+            report.findings.iter().any(|f| f.title.contains("node:net")),
+            "doctor should continue extension analysis after a config load failure"
+        );
+    }
+
+    #[test]
+    fn run_doctor_extension_path_config_load_failure_falls_back_to_safe_policy() {
+        let project = tempfile::tempdir().expect("project dir");
+        let config_dir = project.path().join(".pi");
+        std::fs::create_dir_all(&config_dir).expect("create project config dir");
+        std::fs::write(config_dir.join("settings.json"), r#"{ "extensionPolicy": "#)
+            .expect("write malformed project settings");
+        write_extension_fixture(
+            project.path(),
+            r#"
+export default function(pi) {
+    pi.exec("ls");
+}
+"#,
+        );
+
+        let opts = DoctorOptions {
+            cwd: project.path(),
+            extension_path: Some("ext"),
+            policy_override: None,
+            fix: false,
+            only: None,
+        };
+        let report = run_doctor(&opts).expect("doctor report");
+
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.title == "Extension ext: incompatible"),
+            "doctor should fail closed under a safe fallback when config loading fails"
+        );
+        assert!(
+            report.findings.iter().any(|f| f.title.contains("exec")),
+            "safe fallback should still flag denied exec usage"
+        );
+    }
+
+    #[test]
+    fn run_doctor_extension_path_config_load_failure_honors_cli_policy_override() {
+        let project = tempfile::tempdir().expect("project dir");
+        let config_dir = project.path().join(".pi");
+        std::fs::create_dir_all(&config_dir).expect("create project config dir");
+        std::fs::write(config_dir.join("settings.json"), r#"{ "extensionPolicy": "#)
+            .expect("write malformed project settings");
+        write_extension_fixture(
+            project.path(),
+            r#"
+export default function(pi) {
+    pi.exec("ls");
+}
+"#,
+        );
+
+        let opts = DoctorOptions {
+            cwd: project.path(),
+            extension_path: Some("ext"),
+            policy_override: Some("permissive"),
+            fix: false,
+            only: None,
+        };
+        let report = run_doctor(&opts).expect("doctor report");
+
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.title == "Extension ext: compatible"),
+            "explicit CLI overrides should still control fallback analysis"
+        );
+        assert!(
+            !report.findings.iter().any(|f| f.title.contains("exec")),
+            "permissive override should suppress safe-only exec denial findings"
         );
     }
 

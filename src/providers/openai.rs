@@ -6,6 +6,8 @@
 //! - Azure OpenAI
 //! - Any OpenAI-compatible API (Groq, Together, etc.)
 
+use std::borrow::Cow;
+
 use crate::error::{Error, Result};
 use crate::http::client::Client;
 use crate::model::{
@@ -31,22 +33,21 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 const OPENROUTER_DEFAULT_HTTP_REFERER: &str = "https://github.com/Dicklesworthstone/pi_agent_rust";
 const OPENROUTER_DEFAULT_X_TITLE: &str = "Pi Agent Rust";
 
-/// Map a role string (which may come from compat config at runtime) to a `&'static str`.
+/// Map a role string (which may come from compat config at runtime) to a `Cow<'_, str>`.
 ///
 /// The OpenAI API uses a small, well-known set of role names.  When the value
 /// matches one of these we return the corresponding string literal (zero
 /// allocation).  For an unknown role name (extremely rare – only possible via
-/// exotic compat overrides) we leak a heap copy so that callers can always
-/// work with `&'static str`.
-fn to_static_role(role: &str) -> &'static str {
+/// exotic compat overrides) we return an owned String.
+fn to_cow_role(role: &str) -> Cow<'_, str> {
     match role {
-        "system" => "system",
-        "developer" => "developer",
-        "user" => "user",
-        "assistant" => "assistant",
-        "tool" => "tool",
-        "function" => "function",
-        other => Box::leak(other.to_string().into_boxed_str()),
+        "system" => Cow::Borrowed("system"),
+        "developer" => Cow::Borrowed("developer"),
+        "user" => Cow::Borrowed("user"),
+        "assistant" => Cow::Borrowed("assistant"),
+        "tool" => Cow::Borrowed("tool"),
+        "function" => Cow::Borrowed("function"),
+        other => Cow::Owned(other.to_string()),
     }
 }
 
@@ -54,6 +55,23 @@ fn map_has_any_header(headers: &std::collections::HashMap<String, String>, names
     headers
         .keys()
         .any(|key| names.iter().any(|name| key.eq_ignore_ascii_case(name)))
+}
+
+fn authorization_override(
+    options: &StreamOptions,
+    compat: Option<&CompatConfig>,
+) -> Option<String> {
+    super::first_non_empty_header_value_case_insensitive(&options.headers, &["authorization"])
+        .or_else(|| {
+            compat
+                .and_then(|compat| compat.custom_headers.as_ref())
+                .and_then(|headers| {
+                    super::first_non_empty_header_value_case_insensitive(
+                        headers,
+                        &["authorization"],
+                    )
+                })
+        })
 }
 
 fn first_non_empty_env(keys: &[&str]) -> Option<String> {
@@ -135,7 +153,11 @@ impl OpenAIProvider {
     }
 
     /// Build the request body for the OpenAI API.
-    pub fn build_request(&self, context: &Context<'_>, options: &StreamOptions) -> OpenAIRequest {
+    pub fn build_request<'a>(
+        &'a self,
+        context: &'a Context<'_>,
+        options: &StreamOptions,
+    ) -> OpenAIRequest<'a> {
         let system_role = self
             .compat
             .as_ref()
@@ -149,7 +171,7 @@ impl OpenAIProvider {
             .and_then(|c| c.supports_tools)
             .unwrap_or(true);
 
-        let tools: Option<Vec<OpenAITool>> = if context.tools.is_empty() || !tools_supported {
+        let tools: Option<Vec<OpenAITool<'a>>> = if context.tools.is_empty() || !tools_supported {
             None
         } else {
             Some(context.tools.iter().map(convert_tool_to_openai).collect())
@@ -175,15 +197,17 @@ impl OpenAIProvider {
             .and_then(|c| c.supports_usage_in_streaming)
             .unwrap_or(true);
 
+        let stream_options = Some(OpenAIStreamOptions { include_usage });
+
         OpenAIRequest {
-            model: self.model.clone(),
+            model: &self.model,
             messages,
             max_tokens,
             max_completion_tokens,
             temperature: options.temperature,
             tools,
             stream: true,
-            stream_options: Some(OpenAIStreamOptions { include_usage }),
+            stream_options,
         }
     }
 
@@ -230,14 +254,17 @@ impl OpenAIProvider {
     }
 
     /// Build the messages array with system prompt prepended using the given role name.
-    fn build_messages_with_role(context: &Context<'_>, system_role: &str) -> Vec<OpenAIMessage> {
-        let mut messages = Vec::new();
+    fn build_messages_with_role<'a>(
+        context: &'a Context<'_>,
+        system_role: &'a str,
+    ) -> Vec<OpenAIMessage<'a>> {
+        let mut messages = Vec::with_capacity(context.messages.len() + 1);
 
         // Add system prompt as first message
         if let Some(system) = &context.system_prompt {
             messages.push(OpenAIMessage {
-                role: to_static_role(system_role),
-                content: Some(OpenAIContent::Text(system.to_string())),
+                role: to_cow_role(system_role),
+                content: Some(OpenAIContent::Text(Cow::Borrowed(system))),
                 tool_calls: None,
                 tool_call_id: None,
             });
@@ -272,12 +299,9 @@ impl Provider for OpenAIProvider {
         context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-        let has_authorization_header = options
-            .headers
-            .keys()
-            .any(|key| key.eq_ignore_ascii_case("authorization"));
+        let authorization_override = authorization_override(options, self.compat.as_ref());
 
-        let auth_value = if has_authorization_header {
+        let auth_value = if authorization_override.is_some() {
             None
         } else {
             Some(
@@ -287,8 +311,8 @@ impl Provider for OpenAIProvider {
                     .or_else(|| std::env::var("OPENAI_API_KEY").ok())
                     .ok_or_else(|| {
                         Error::provider(
-                            &self.provider,
-                            "Missing API key for OpenAI. Set OPENAI_API_KEY or configure in settings.",
+                            self.name(),
+                            "Missing API key for provider. Configure credentials with /login <provider> or set the provider's API key env var.",
                         )
                     })?,
             )
@@ -330,16 +354,20 @@ impl Provider for OpenAIProvider {
         // Apply provider-specific custom headers from compat config.
         if let Some(compat) = &self.compat {
             if let Some(custom_headers) = &compat.custom_headers {
-                for (key, value) in custom_headers {
-                    request = request.header(key, value);
-                }
+                request = super::apply_headers_ignoring_blank_auth_overrides(
+                    request,
+                    custom_headers,
+                    &["authorization"],
+                );
             }
         }
 
         // Per-request headers from StreamOptions (highest priority).
-        for (key, value) in &options.headers {
-            request = request.header(key, value);
-        }
+        request = super::apply_headers_ignoring_blank_auth_overrides(
+            request,
+            &options.headers,
+            &["authorization"],
+        );
 
         let request = request.json(&request_body)?;
 
@@ -401,6 +429,8 @@ impl Provider for OpenAIProvider {
 
                     match state.event_source.next().await {
                         Some(Ok(msg)) => {
+                            // A successful chunk resets the consecutive error counter.
+                            state.write_zero_count = 0;
                             // OpenAI sends "[DONE]" as final message
                             if msg.data == "[DONE]" {
                                 state.done = true;
@@ -415,6 +445,25 @@ impl Provider for OpenAIProvider {
                             }
                         }
                         Some(Err(e)) => {
+                            // WriteZero errors are transient (e.g. empty SSE
+                            // frames from certain providers like Kimi K2.5).
+                            // Skip them and keep reading the stream, but cap
+                            // consecutive occurrences to avoid infinite loops.
+                            const MAX_CONSECUTIVE_WRITE_ZERO: usize = 5;
+                            if e.kind() == std::io::ErrorKind::WriteZero {
+                                state.write_zero_count += 1;
+                                if state.write_zero_count <= MAX_CONSECUTIVE_WRITE_ZERO {
+                                    tracing::warn!(
+                                        count = state.write_zero_count,
+                                        "Transient WriteZero error in SSE stream, continuing"
+                                    );
+                                    continue;
+                                }
+                                tracing::warn!(
+                                    "WriteZero error persisted after {MAX_CONSECUTIVE_WRITE_ZERO} \
+                                     consecutive attempts, treating as fatal"
+                                );
+                            }
                             state.done = true;
                             let err = Error::api(format!("SSE error: {e}"));
                             return Some((Err(err), state));
@@ -448,11 +497,12 @@ where
 {
     event_source: SseStream<S>,
     partial: AssistantMessage,
-    current_text: String,
     tool_calls: Vec<ToolCallState>,
     pending_events: VecDeque<StreamEvent>,
     started: bool,
     done: bool,
+    /// Consecutive WriteZero errors seen without a successful event in between.
+    write_zero_count: usize,
 }
 
 struct ToolCallState {
@@ -480,11 +530,11 @@ where
                 error_message: None,
                 timestamp: chrono::Utc::now().timestamp_millis(),
             },
-            current_text: String::new(),
             tool_calls: Vec::new(),
             pending_events: VecDeque::new(),
             started: false,
             done: false,
+            write_zero_count: 0,
         }
     }
 
@@ -498,14 +548,17 @@ where
     }
 
     fn process_event(&mut self, data: &str) -> Result<()> {
-        let chunk: OpenAIStreamChunk =
-            serde_json::from_str(data).map_err(|e| Error::api(format!("JSON parse error: {e}")))?;
+        let chunk: OpenAIStreamChunk = serde_json::from_str(data)
+            .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
 
         // Handle usage in final chunk
         if let Some(usage) = chunk.usage {
             self.partial.usage.input = usage.prompt_tokens;
             self.partial.usage.output = usage.completion_tokens.unwrap_or(0);
             self.partial.usage.total_tokens = usage.total_tokens;
+            if let Some(details) = usage.prompt_tokens_details {
+                self.partial.usage.cache_read = details.cached_tokens.unwrap_or(0);
+            }
         }
 
         if let Some(error) = chunk.error {
@@ -693,7 +746,7 @@ where
                 // Update ID if present
 
                 if let Some(id) = tc_delta.id {
-                    tc.id = id;
+                    tc.id.push_str(&id);
 
                     if let Some(ContentBlock::ToolCall(block)) =
                         self.partial.content.get_mut(content_index)
@@ -706,7 +759,7 @@ where
 
                 if let Some(function) = tc_delta.function {
                     if let Some(name) = function.name {
-                        tc.name = name;
+                        tc.name.push_str(&name);
 
                         if let Some(ContentBlock::ToolCall(block)) =
                             self.partial.content.get_mut(content_index)
@@ -792,9 +845,9 @@ where
 // ============================================================================
 
 #[derive(Debug, Serialize)]
-pub struct OpenAIRequest {
-    model: String,
-    messages: Vec<OpenAIMessage>,
+pub struct OpenAIRequest<'a> {
+    model: &'a str,
+    messages: Vec<OpenAIMessage<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     /// Some providers (e.g., o1-series) use `max_completion_tokens` instead of `max_tokens`.
@@ -803,7 +856,7 @@ pub struct OpenAIRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<OpenAITool>>,
+    tools: Option<Vec<OpenAITool<'a>>>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<OpenAIStreamOptions>,
@@ -815,59 +868,62 @@ struct OpenAIStreamOptions {
 }
 
 #[derive(Debug, Serialize)]
-struct OpenAIMessage {
-    role: &'static str,
+struct OpenAIMessage<'a> {
+    role: Cow<'a, str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<OpenAIContent>,
+    content: Option<OpenAIContent<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_calls: Option<Vec<OpenAIToolCallRef>>,
+    tool_calls: Option<Vec<OpenAIToolCallRef<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<String>,
+    tool_call_id: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
-enum OpenAIContent {
-    Text(String),
-    Parts(Vec<OpenAIContentPart>),
+enum OpenAIContent<'a> {
+    Text(Cow<'a, str>),
+    Parts(Vec<OpenAIContentPart<'a>>),
 }
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum OpenAIContentPart {
-    Text { text: String },
-    ImageUrl { image_url: OpenAIImageUrl },
+enum OpenAIContentPart<'a> {
+    Text { text: Cow<'a, str> },
+    ImageUrl { image_url: OpenAIImageUrl<'a> },
 }
 
 #[derive(Debug, Serialize)]
-struct OpenAIImageUrl {
+struct OpenAIImageUrl<'a> {
     url: String,
+    #[serde(skip)]
+    // Phantom data for lifetime if needed, but url is String here as constructed from format!
+    _phantom: std::marker::PhantomData<&'a ()>,
 }
 
 #[derive(Debug, Serialize)]
-struct OpenAIToolCallRef {
-    id: String,
+struct OpenAIToolCallRef<'a> {
+    id: &'a str,
     r#type: &'static str,
-    function: OpenAIFunctionRef,
+    function: OpenAIFunctionRef<'a>,
 }
 
 #[derive(Debug, Serialize)]
-struct OpenAIFunctionRef {
-    name: String,
+struct OpenAIFunctionRef<'a> {
+    name: &'a str,
     arguments: String,
 }
 
 #[derive(Debug, Serialize)]
-struct OpenAITool {
+struct OpenAITool<'a> {
     r#type: &'static str,
-    function: OpenAIFunction,
+    function: OpenAIFunction<'a>,
 }
 
 #[derive(Debug, Serialize)]
-struct OpenAIFunction {
-    name: String,
-    description: String,
-    parameters: serde_json::Value,
+struct OpenAIFunction<'a> {
+    name: &'a str,
+    description: &'a str,
+    parameters: &'a serde_json::Value,
 }
 
 // ============================================================================
@@ -925,6 +981,14 @@ struct OpenAIUsage {
     #[serde(default)]
     completion_tokens: Option<u64>,
     total_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenAIPromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -937,17 +1001,18 @@ struct OpenAIChunkError {
 // Conversion Functions
 // ============================================================================
 
-fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage> {
+#[allow(clippy::too_many_lines)]
+fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
     match message {
         Message::User(user) => vec![OpenAIMessage {
-            role: "user",
+            role: Cow::Borrowed("user"),
             content: Some(convert_user_content(&user.content)),
             tool_calls: None,
             tool_call_id: None,
         }],
         Message::Custom(custom) => vec![OpenAIMessage {
-            role: "user",
-            content: Some(OpenAIContent::Text(custom.content.clone())),
+            role: Cow::Borrowed("user"),
+            content: Some(OpenAIContent::Text(Cow::Borrowed(&custom.content))),
             tool_calls: None,
             tool_call_id: None,
         }],
@@ -962,19 +1027,18 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage> {
                     ContentBlock::Text(t) => Some(t.text.as_str()),
                     _ => None,
                 })
-                .collect::<Vec<_>>()
-                .join("");
+                .collect::<String>();
 
             // Collect tool calls
-            let tool_calls: Vec<OpenAIToolCallRef> = assistant
+            let tool_calls: Vec<OpenAIToolCallRef<'_>> = assistant
                 .content
                 .iter()
                 .filter_map(|b| match b {
                     ContentBlock::ToolCall(tc) => Some(OpenAIToolCallRef {
-                        id: tc.id.clone(),
+                        id: &tc.id,
                         r#type: "function",
                         function: OpenAIFunctionRef {
-                            name: tc.name.clone(),
+                            name: &tc.name,
                             arguments: tc.arguments.to_string(),
                         },
                     }),
@@ -985,7 +1049,7 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage> {
             let content = if text.is_empty() {
                 None
             } else {
-                Some(OpenAIContent::Text(text))
+                Some(OpenAIContent::Text(Cow::Owned(text)))
             };
 
             let tool_calls = if tool_calls.is_empty() {
@@ -995,7 +1059,7 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage> {
             };
 
             messages.push(OpenAIMessage {
-                role: "assistant",
+                role: Cow::Borrowed("assistant"),
                 content,
                 tool_calls,
                 tool_call_id: None,
@@ -1004,62 +1068,78 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage> {
             messages
         }
         Message::ToolResult(result) => {
-            // OpenAI expects tool results as separate messages with role "tool"
-            let parts: Vec<OpenAIContentPart> = result
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text(t) => Some(OpenAIContentPart::Text {
-                        text: t.text.clone(),
-                    }),
+            let mut text_parts = Vec::new();
+            let mut image_parts = Vec::new();
+
+            for block in &result.content {
+                match block {
+                    ContentBlock::Text(t) => text_parts.push(t.text.as_str()),
                     ContentBlock::Image(img) => {
                         let url = format!("data:{};base64,{}", img.mime_type, img.data);
-                        Some(OpenAIContentPart::ImageUrl {
-                            image_url: OpenAIImageUrl { url },
-                        })
+                        image_parts.push(OpenAIContentPart::ImageUrl {
+                            image_url: OpenAIImageUrl {
+                                url,
+                                _phantom: std::marker::PhantomData,
+                            },
+                        });
                     }
-                    _ => None,
-                })
-                .collect();
+                    _ => {}
+                }
+            }
 
-            let content = if parts.is_empty() {
-                None
-            } else if parts.len() == 1 && matches!(parts[0], OpenAIContentPart::Text { .. }) {
-                // Optimization: use simple text content if possible
-                if let OpenAIContentPart::Text { text } = &parts[0] {
-                    Some(OpenAIContent::Text(text.clone()))
+            let text_content = if text_parts.is_empty() {
+                if image_parts.is_empty() {
+                    Some(OpenAIContent::Text(Cow::Borrowed("")))
                 } else {
-                    Some(OpenAIContent::Parts(parts))
+                    Some(OpenAIContent::Text(Cow::Borrowed("(see attached image)")))
                 }
             } else {
-                Some(OpenAIContent::Parts(parts))
+                Some(OpenAIContent::Text(Cow::Owned(text_parts.join("\n"))))
             };
 
-            vec![OpenAIMessage {
-                role: "tool",
-                content,
+            let mut messages = vec![OpenAIMessage {
+                role: Cow::Borrowed("tool"),
+                content: text_content,
                 tool_calls: None,
-                tool_call_id: Some(result.tool_call_id.clone()),
-            }]
+                tool_call_id: Some(&result.tool_call_id),
+            }];
+
+            if !image_parts.is_empty() {
+                let mut parts = vec![OpenAIContentPart::Text {
+                    text: Cow::Borrowed("Attached image(s) from tool result:"),
+                }];
+                parts.extend(image_parts);
+                messages.push(OpenAIMessage {
+                    role: Cow::Borrowed("user"),
+                    content: Some(OpenAIContent::Parts(parts)),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
+
+            messages
         }
     }
 }
 
-fn convert_user_content(content: &UserContent) -> OpenAIContent {
+fn convert_user_content(content: &UserContent) -> OpenAIContent<'_> {
     match content {
-        UserContent::Text(text) => OpenAIContent::Text(text.clone()),
+        UserContent::Text(text) => OpenAIContent::Text(Cow::Borrowed(text)),
         UserContent::Blocks(blocks) => {
-            let parts: Vec<OpenAIContentPart> = blocks
+            let parts: Vec<OpenAIContentPart<'_>> = blocks
                 .iter()
                 .filter_map(|block| match block {
                     ContentBlock::Text(t) => Some(OpenAIContentPart::Text {
-                        text: t.text.clone(),
+                        text: Cow::Borrowed(&t.text),
                     }),
                     ContentBlock::Image(img) => {
                         // Convert to data URL for OpenAI
                         let url = format!("data:{};base64,{}", img.mime_type, img.data);
                         Some(OpenAIContentPart::ImageUrl {
-                            image_url: OpenAIImageUrl { url },
+                            image_url: OpenAIImageUrl {
+                                url,
+                                _phantom: std::marker::PhantomData,
+                            },
                         })
                     }
                     _ => None,
@@ -1070,13 +1150,13 @@ fn convert_user_content(content: &UserContent) -> OpenAIContent {
     }
 }
 
-fn convert_tool_to_openai(tool: &ToolDef) -> OpenAITool {
+fn convert_tool_to_openai(tool: &ToolDef) -> OpenAITool<'_> {
     OpenAITool {
         r#type: "function",
         function: OpenAIFunction {
-            name: tool.name.clone(),
-            description: tool.description.clone(),
-            parameters: tool.parameters.clone(),
+            name: &tool.name,
+            description: &tool.description,
+            parameters: &tool.parameters,
         },
     }
 }
@@ -1130,7 +1210,7 @@ mod tests {
         assert_eq!(converted.function.description, "A test tool");
         assert_eq!(
             converted.function.parameters,
-            serde_json::json!({
+            &serde_json::json!({
                 "type": "object",
                 "properties": {
                     "arg": {"type": "string"}
@@ -1674,7 +1754,7 @@ mod tests {
                     {
                         break;
                     }
-                    Err(err) => panic!("read request failed: {err}"),
+                    Err(err) => panic!("read error: {err}"),
                 }
             }
 
@@ -1700,7 +1780,7 @@ mod tests {
                     {
                         break;
                     }
-                    Err(err) => panic!("read request body failed: {err}"),
+                    Err(err) => panic!("read error: {err}"),
                 }
             }
 
@@ -1888,7 +1968,9 @@ mod tests {
             system_role_name: Some("developer".to_string()),
             ..Default::default()
         }));
-        let req = provider.build_request(&context_with_tools(), &default_stream_options());
+        let context = context_with_tools();
+        let options = default_stream_options();
+        let req = provider.build_request(&context, &options);
         let value = serde_json::to_value(&req).expect("serialize");
         assert_eq!(
             value["messages"][0]["role"], "developer",
@@ -1899,7 +1981,9 @@ mod tests {
     #[test]
     fn compat_none_uses_default_system_role() {
         let provider = OpenAIProvider::new("gpt-4o");
-        let req = provider.build_request(&context_with_tools(), &default_stream_options());
+        let context = context_with_tools();
+        let options = default_stream_options();
+        let req = provider.build_request(&context, &options);
         let value = serde_json::to_value(&req).expect("serialize");
         assert_eq!(
             value["messages"][0]["role"], "system",
@@ -1913,7 +1997,9 @@ mod tests {
             supports_tools: Some(false),
             ..Default::default()
         }));
-        let req = provider.build_request(&context_with_tools(), &default_stream_options());
+        let context = context_with_tools();
+        let options = default_stream_options();
+        let req = provider.build_request(&context, &options);
         let value = serde_json::to_value(&req).expect("serialize");
         assert!(
             value["tools"].is_null(),
@@ -1927,7 +2013,9 @@ mod tests {
             supports_tools: Some(true),
             ..Default::default()
         }));
-        let req = provider.build_request(&context_with_tools(), &default_stream_options());
+        let context = context_with_tools();
+        let options = default_stream_options();
+        let req = provider.build_request(&context, &options);
         let value = serde_json::to_value(&req).expect("serialize");
         assert!(
             value["tools"].is_array(),
@@ -1941,7 +2029,9 @@ mod tests {
             max_tokens_field: Some("max_completion_tokens".to_string()),
             ..Default::default()
         }));
-        let req = provider.build_request(&context_with_tools(), &default_stream_options());
+        let context = context_with_tools();
+        let options = default_stream_options();
+        let req = provider.build_request(&context, &options);
         let value = serde_json::to_value(&req).expect("serialize");
         assert!(
             value["max_tokens"].is_null(),
@@ -1956,7 +2046,9 @@ mod tests {
     #[test]
     fn compat_default_routes_to_max_tokens() {
         let provider = OpenAIProvider::new("gpt-4o");
-        let req = provider.build_request(&context_with_tools(), &default_stream_options());
+        let context = context_with_tools();
+        let options = default_stream_options();
+        let req = provider.build_request(&context, &options);
         let value = serde_json::to_value(&req).expect("serialize");
         assert_eq!(
             value["max_tokens"], 1024,
@@ -1974,7 +2066,9 @@ mod tests {
             supports_usage_in_streaming: Some(false),
             ..Default::default()
         }));
-        let req = provider.build_request(&context_with_tools(), &default_stream_options());
+        let context = context_with_tools();
+        let options = default_stream_options();
+        let req = provider.build_request(&context, &options);
         let value = serde_json::to_value(&req).expect("serialize");
         assert_eq!(
             value["stream_options"]["include_usage"], false,
@@ -1991,7 +2085,9 @@ mod tests {
             supports_usage_in_streaming: Some(false),
             ..Default::default()
         }));
-        let req = provider.build_request(&context_with_tools(), &default_stream_options());
+        let context = context_with_tools();
+        let options = default_stream_options();
+        let req = provider.build_request(&context, &options);
         let value = serde_json::to_value(&req).expect("serialize");
         assert_eq!(value["messages"][0]["role"], "developer");
         assert!(value["max_tokens"].is_null());
@@ -2054,6 +2150,48 @@ mod tests {
                 .map(String::as_str),
             Some("us-east-1"),
             "custom header should be present in request"
+        );
+    }
+
+    #[test]
+    fn compat_authorization_header_is_used_without_api_key() {
+        let mut custom = HashMap::new();
+        custom.insert(
+            "Authorization".to_string(),
+            "Bearer compat-openai-token".to_string(),
+        );
+        let provider = OpenAIProvider::new("gpt-4o").with_compat(Some(CompatConfig {
+            custom_headers: Some(custom),
+            ..Default::default()
+        }));
+        let options = StreamOptions::default();
+
+        let captured =
+            run_stream_and_capture_headers_with(provider, &options).expect("captured request");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some("Bearer compat-openai-token")
+        );
+    }
+
+    #[test]
+    fn blank_compat_authorization_header_does_not_override_builtin_api_key() {
+        let mut custom = HashMap::new();
+        custom.insert("Authorization".to_string(), "   ".to_string());
+        let provider = OpenAIProvider::new("gpt-4o").with_compat(Some(CompatConfig {
+            custom_headers: Some(custom),
+            ..Default::default()
+        }));
+        let options = StreamOptions {
+            api_key: Some("test-openai-key".to_string()),
+            ..Default::default()
+        };
+
+        let captured =
+            run_stream_and_capture_headers_with(provider, &options).expect("captured request");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some("Bearer test-openai-key")
         );
     }
 
@@ -2125,12 +2263,14 @@ mod tests {
                 // Empty delta (initial or heartbeat)
                 2 => Just(r#"{"choices":[{"delta":{}}]}"#.to_string()),
                 // Finish-only delta
-                2 => finish_reason().prop_filter("some reason", Option::is_some).prop_map(|fr| {
-                    serde_json::json!({
-                        "choices": [{"delta": {}, "finish_reason": fr.unwrap()}]
-                    })
-                    .to_string()
-                }),
+                2 => finish_reason()
+                    .prop_filter_map("some reason", |fr| fr)
+                    .prop_map(|reason| {
+                        serde_json::json!({
+                            "choices": [{"delta": {}, "finish_reason": reason}]
+                        })
+                        .to_string()
+                    }),
                 // Tool call delta
                 3 => (tool_call_index(), optional_string(), optional_string(), optional_string())
                     .prop_map(|(idx, id, name, args)| {

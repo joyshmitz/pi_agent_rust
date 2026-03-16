@@ -15,7 +15,6 @@
 //! - **I5 (total order):** all observable scheduling is ordered by seq
 
 use std::cmp::Ordering;
-use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::BinaryHeap;
 use std::collections::VecDeque;
@@ -239,14 +238,16 @@ impl Clock for DeterministicClock {
 pub struct Scheduler<C: Clock = WallClock> {
     /// Monotone sequence counter.
     seq: Seq,
-    /// Macrotask queue (Min-Heap via Reverse, ordered by seq).
-    macrotask_queue: BinaryHeap<Reverse<Macrotask>>,
+    /// Macrotask queue (FIFO, ordered by seq).
+    macrotask_queue: VecDeque<Macrotask>,
     /// Timer heap (min-heap by deadline_ms, seq).
     timer_heap: BinaryHeap<TimerEntry>,
     /// Next timer ID.
     next_timer_id: u64,
     /// Cancelled timer IDs.
     cancelled_timers: std::collections::HashSet<u64>,
+    /// All timer IDs currently in the heap (active or cancelled).
+    heap_timer_ids: std::collections::HashSet<u64>,
     /// Clock source.
     clock: C,
 }
@@ -271,10 +272,11 @@ impl<C: Clock> Scheduler<C> {
     pub fn with_clock(clock: C) -> Self {
         Self {
             seq: Seq::zero(),
-            macrotask_queue: BinaryHeap::new(),
+            macrotask_queue: VecDeque::new(),
             timer_heap: BinaryHeap::new(),
             next_timer_id: 1,
             cancelled_timers: std::collections::HashSet::new(),
+            heap_timer_ids: std::collections::HashSet::new(),
             clock,
         }
     }
@@ -301,7 +303,11 @@ impl<C: Clock> Scheduler<C> {
     /// Check if there are pending tasks.
     #[must_use]
     pub fn has_pending(&self) -> bool {
-        !self.macrotask_queue.is_empty() || !self.timer_heap.is_empty()
+        !self.macrotask_queue.is_empty()
+            || self
+                .timer_heap
+                .iter()
+                .any(|entry| !self.cancelled_timers.contains(&entry.timer_id))
     }
 
     /// Get the number of pending macrotasks.
@@ -313,7 +319,10 @@ impl<C: Clock> Scheduler<C> {
     /// Get the number of pending timers.
     #[must_use]
     pub fn timer_count(&self) -> usize {
-        self.timer_heap.len()
+        self.timer_heap
+            .iter()
+            .filter(|entry| !self.cancelled_timers.contains(&entry.timer_id))
+            .count()
     }
 
     /// Schedule a timer to fire at the given deadline.
@@ -326,6 +335,7 @@ impl<C: Clock> Scheduler<C> {
 
         self.timer_heap
             .push(TimerEntry::new(timer_id, deadline_ms, seq));
+        self.heap_timer_ids.insert(timer_id);
 
         tracing::trace!(
             event = "scheduler.timer.set",
@@ -340,29 +350,30 @@ impl<C: Clock> Scheduler<C> {
     }
 
     fn timer_id_in_use(&self, timer_id: u64) -> bool {
-        self.cancelled_timers.contains(&timer_id)
-            || self
-                .timer_heap
-                .iter()
-                .any(|entry| entry.timer_id == timer_id)
+        self.heap_timer_ids.contains(&timer_id)
     }
 
     fn allocate_timer_id(&mut self) -> u64 {
-        if self.next_timer_id < u64::MAX {
-            let timer_id = self.next_timer_id;
-            self.next_timer_id += 1;
-            return timer_id;
-        }
+        let start = self.next_timer_id;
+        let mut candidate = start;
 
-        if !self.timer_id_in_use(u64::MAX) {
-            self.next_timer_id = 1;
-            return u64::MAX;
-        }
+        loop {
+            // Calculate the next ID to try after this one
+            self.next_timer_id = if candidate == u64::MAX {
+                1
+            } else {
+                candidate + 1
+            };
 
-        for candidate in 1..u64::MAX {
             if !self.timer_id_in_use(candidate) {
-                self.next_timer_id = candidate.saturating_add(1);
                 return candidate;
+            }
+
+            candidate = self.next_timer_id;
+
+            // If we've looped all the way around back to where we started, we're exhausted.
+            if candidate == start {
+                break;
             }
         }
 
@@ -377,11 +388,8 @@ impl<C: Clock> Scheduler<C> {
     ///
     /// Returns true if the timer was found and cancelled.
     pub fn clear_timeout(&mut self, timer_id: u64) -> bool {
-        let pending = self
-            .timer_heap
-            .iter()
-            .any(|entry| entry.timer_id == timer_id)
-            && !self.cancelled_timers.contains(&timer_id);
+        let pending =
+            self.heap_timer_ids.contains(&timer_id) && !self.cancelled_timers.contains(&timer_id);
 
         let cancelled = if pending {
             self.cancelled_timers.insert(timer_id)
@@ -409,7 +417,7 @@ impl<C: Clock> Scheduler<C> {
             "Hostcall completion enqueued"
         );
         let task = Macrotask::new(seq, MacrotaskKind::HostcallComplete { call_id, outcome });
-        self.macrotask_queue.push(Reverse(task));
+        self.macrotask_queue.push_back(task);
     }
 
     /// Enqueue multiple hostcall completions in one scheduler mutation pass.
@@ -450,7 +458,7 @@ impl<C: Clock> Scheduler<C> {
             "Inbound event enqueued"
         );
         let task = Macrotask::new(seq, MacrotaskKind::InboundEvent { event_id, payload });
-        self.macrotask_queue.push(Reverse(task));
+        self.macrotask_queue.push_back(task);
     }
 
     /// Move due timers from the timer heap to the macrotask queue.
@@ -465,6 +473,7 @@ impl<C: Clock> Scheduler<C> {
             }
 
             let entry = self.timer_heap.pop().expect("peeked");
+            self.heap_timer_ids.remove(&entry.timer_id);
 
             // Skip cancelled timers
             if self.cancelled_timers.remove(&entry.timer_id) {
@@ -485,7 +494,7 @@ impl<C: Clock> Scheduler<C> {
                     timer_id: entry.timer_id,
                 },
             );
-            self.macrotask_queue.push(Reverse(task));
+            self.macrotask_queue.push_back(task);
 
             tracing::trace!(
                 event = "scheduler.timer.fire",
@@ -513,7 +522,7 @@ impl<C: Clock> Scheduler<C> {
         self.move_due_timers();
 
         // Step 3: Run one macrotask
-        let task = self.macrotask_queue.pop().map(|Reverse(t)| t);
+        let task = self.macrotask_queue.pop_front();
 
         if let Some(ref task) = task {
             tracing::debug!(
@@ -897,8 +906,19 @@ impl ReactorMesh {
     #[must_use]
     #[allow(clippy::needless_pass_by_value)]
     pub fn new(config: ReactorMeshConfig) -> Self {
-        let shard_count = config.shard_count.max(1);
-        let lane_capacity = config.lane_capacity.max(1);
+        if config.shard_count == 0 || config.lane_capacity == 0 {
+            return Self {
+                seq: Seq::zero(),
+                lanes: Vec::new(),
+                shard_seq: Vec::new(),
+                rr_cursor: 0,
+                rejected_enqueues: 0,
+                placement_manifest: ReactorPlacementManifest::plan(0, config.topology.as_ref()),
+            };
+        }
+
+        let shard_count = config.shard_count;
+        let lane_capacity = config.lane_capacity;
         let placement_manifest =
             ReactorPlacementManifest::plan(shard_count, config.topology.as_ref());
         let lanes = (0..shard_count)
@@ -995,7 +1015,7 @@ impl ReactorMesh {
             return 0;
         }
         let idx = self.rr_cursor % self.lanes.len();
-        self.rr_cursor = self.rr_cursor.saturating_add(1);
+        self.rr_cursor = self.rr_cursor.wrapping_add(1);
         idx
     }
 
@@ -1734,7 +1754,7 @@ impl<C: Clock> fmt::Debug for Scheduler<C> {
         f.debug_struct("Scheduler")
             .field("seq", &self.seq)
             .field("macrotask_count", &self.macrotask_queue.len())
-            .field("timer_count", &self.timer_heap.len())
+            .field("timer_count", &self.timer_count())
             .field("next_timer_id", &self.next_timer_id)
             .field("cancelled_timers", &self.cancelled_timers.len())
             .finish_non_exhaustive()
@@ -2166,6 +2186,25 @@ mod tests {
         assert!(debug.contains("seq"));
     }
 
+    #[test]
+    fn scheduler_debug_reports_live_timer_count() {
+        let mut sched = Scheduler::with_clock(DeterministicClock::new(0));
+        let cancelled = sched.set_timeout(10);
+        sched.set_timeout(20);
+
+        assert!(sched.clear_timeout(cancelled));
+
+        let debug = format!("{sched:?}");
+        assert!(
+            debug.contains("timer_count: 1"),
+            "unexpected debug: {debug}"
+        );
+        assert!(
+            debug.contains("cancelled_timers: 1"),
+            "unexpected debug: {debug}"
+        );
+    }
+
     #[derive(Debug, Clone)]
     struct XorShift64 {
         state: u64,
@@ -2337,6 +2376,34 @@ mod tests {
         sched.enqueue_event("e".to_string(), serde_json::json!({}));
         assert!(sched.has_pending());
         assert_eq!(sched.macrotask_count(), 1);
+        assert_eq!(sched.timer_count(), 0);
+    }
+
+    #[test]
+    fn has_pending_ignores_cancelled_timers_without_macrotasks() {
+        let mut sched = Scheduler::with_clock(DeterministicClock::new(0));
+        let timer = sched.set_timeout(10_000);
+        assert!(sched.clear_timeout(timer));
+        assert!(!sched.has_pending());
+        assert_eq!(sched.timer_count(), 0);
+    }
+
+    #[test]
+    fn timer_count_ignores_cancelled_timers_before_they_are_reaped() {
+        let mut sched = Scheduler::with_clock(DeterministicClock::new(0));
+        let live = sched.set_timeout(50);
+        let cancelled = sched.set_timeout(100);
+
+        assert!(sched.clear_timeout(cancelled));
+        assert_eq!(sched.timer_count(), 1);
+        assert_eq!(sched.next_timer_deadline(), Some(50));
+
+        sched.clock.advance(60);
+        let task = sched.tick().expect("live timer should fire");
+        match task.kind {
+            MacrotaskKind::TimerFired { timer_id } => assert_eq!(timer_id, live),
+            other => unreachable!("Expected live timer, got {other:?}"),
+        }
         assert_eq!(sched.timer_count(), 0);
     }
 
@@ -2670,13 +2737,13 @@ mod tests {
         if let MacrotaskKind::InboundEvent { event_id, .. } = task1.kind {
             assert_eq!(event_id, "E1");
         } else {
-            panic!("Expected InboundEvent first, got {:?}", task1.kind);
+            unreachable!();
         }
 
         if let MacrotaskKind::TimerFired { timer_id } = task2.kind {
             assert_eq!(timer_id, t1_id);
         } else {
-            panic!("Expected TimerFired second, got {:?}", task2.kind);
+            unreachable!();
         }
     }
 
@@ -3747,7 +3814,7 @@ mod tests {
                 MacrotaskKind::HostcallComplete { ref call_id, .. } => {
                     assert_eq!(call_id, expected);
                 }
-                _ => panic!("expected HostcallComplete"),
+                _ => unreachable!(),
             }
         }
         assert!(sched.tick().is_none());
@@ -3834,6 +3901,54 @@ mod tests {
             .unwrap();
         let drained = mesh.drain_shard(99, 10);
         assert!(drained.is_empty());
+    }
+
+    #[test]
+    fn reactor_mesh_zero_shards_is_empty_and_rejects_enqueues() {
+        let mut mesh = ReactorMesh::new(ReactorMeshConfig {
+            shard_count: 0,
+            lane_capacity: 16,
+            topology: None,
+        });
+
+        assert_eq!(mesh.shard_count(), 0);
+        assert_eq!(mesh.total_depth(), 0);
+        assert!(!mesh.has_pending());
+        assert_eq!(mesh.queue_depth(0), None);
+        assert!(mesh.telemetry().queue_depths.is_empty());
+
+        let err = mesh
+            .enqueue_event("evt".to_string(), serde_json::json!(null))
+            .expect_err("empty mesh should reject enqueues");
+        assert_eq!(err.shard_id, 0);
+        assert_eq!(err.depth, 0);
+        assert_eq!(err.capacity, 0);
+        assert_eq!(mesh.telemetry().rejected_enqueues, 1);
+    }
+
+    #[test]
+    fn reactor_mesh_zero_capacity_is_empty_and_rejects_enqueues() {
+        let mut mesh = ReactorMesh::new(ReactorMeshConfig {
+            shard_count: 4,
+            lane_capacity: 0,
+            topology: None,
+        });
+
+        assert_eq!(mesh.shard_count(), 0);
+        assert_eq!(mesh.total_depth(), 0);
+        assert!(!mesh.has_pending());
+        assert_eq!(mesh.telemetry().queue_depths, Vec::<usize>::new());
+
+        let err = mesh
+            .enqueue_hostcall_complete(
+                "call".to_string(),
+                HostcallOutcome::Success(serde_json::json!({"ok": true})),
+            )
+            .expect_err("empty mesh should reject hostcall completions");
+        assert_eq!(err.shard_id, 0);
+        assert_eq!(err.depth, 0);
+        assert_eq!(err.capacity, 0);
+        assert_eq!(mesh.telemetry().rejected_enqueues, 1);
     }
 
     #[test]

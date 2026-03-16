@@ -45,7 +45,7 @@ fn main_impl() -> Result<()> {
 
     let reactor = create_reactor()?;
     let runtime = RuntimeBuilder::multi_thread()
-        .blocking_threads(1, 8)
+        .blocking_threads(1, 2)
         .with_reactor(reactor)
         .build()
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -57,7 +57,7 @@ fn main_impl() -> Result<()> {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn run_debug(mut cli: cli::Cli, _runtime_handle: RuntimeHandle) -> Result<()> {
+async fn run_debug(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     step!("1. Loading config...");
@@ -172,14 +172,18 @@ async fn run_debug(mut cli: cli::Cli, _runtime_handle: RuntimeHandle) -> Result<
         }
     };
 
-    step!("10. Resolving API key...");
+    step!("10. Resolving provider credentials...");
     let resolved_key = match pi::app::resolve_api_key(&auth, &cli, &selection.model_entry) {
         Ok(key) => {
-            step!("    API key resolved");
+            if key.is_some() {
+                step!("    Credential resolved");
+            } else {
+                step!("    No credential required for selected model");
+            }
             key
         }
         Err(err) => {
-            step!("    API key resolution FAILED: {err}");
+            step!("    Credential resolution FAILED: {err}");
             return Err(err);
         }
     };
@@ -206,6 +210,7 @@ async fn run_debug(mut cli: cli::Cli, _runtime_handle: RuntimeHandle) -> Result<
         &global_dir,
         &package_dir,
         test_mode,
+        !cli.hide_cwd_in_prompt,
     );
     let provider =
         providers::create_provider(&selection.model_entry, None).map_err(anyhow::Error::new)?;
@@ -229,7 +234,8 @@ async fn run_debug(mut cli: cli::Cli, _runtime_handle: RuntimeHandle) -> Result<
         session_arc,
         !cli.no_session,
         compaction_settings,
-    );
+    )
+    .with_runtime_handle(runtime_handle.clone());
     step!("    Agent built");
 
     step!("12. Loading session history...");

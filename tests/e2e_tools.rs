@@ -1,6 +1,6 @@
 //! E2E: Built-in tool execution with artifact logging (bd-2xyv).
 //!
-//! Tests all 7 built-in tools (read, write, edit, bash, grep, find, ls) via direct
+//! Tests 7 of the 8 built-in tools (read, write, edit, bash, grep, find, ls) via direct
 //! `ToolRegistry::get(name).execute()` calls against real file system operations in
 //! temp directories. No mocks, no network, fully deterministic.
 
@@ -376,11 +376,7 @@ fn edit_text_not_found_error() {
     });
 
     let err = output.unwrap_err();
-    h.log().info("result", format!("error={err}"));
-    assert!(
-        matches!(err, Error::Tool { .. }),
-        "should be Tool error: {err}"
-    );
+    h.log().info("result", format!("error={err:?}"));
     assert!(
         err.to_string().contains("Could not find"),
         "message should say text not found: {err}"
@@ -409,11 +405,7 @@ fn edit_ambiguous_match_error() {
     });
 
     let err = output.unwrap_err();
-    h.log().info("result", format!("error={err}"));
-    assert!(
-        matches!(err, Error::Tool { .. }),
-        "should be Tool error: {err}"
-    );
+    h.log().info("result", format!("error={err:?}"));
     assert!(
         err.to_string().contains("occurrences"),
         "message should mention multiple occurrences: {err}"
@@ -536,11 +528,11 @@ fn bash_nonzero_exit() {
     });
 
     // Non-zero exit returns Error::Tool
-    let err = output.unwrap_err();
-    h.log().info("result", format!("error={err}"));
+    let output = output.unwrap();
+    h.log().info("result", format!("output={output:?}"));
     assert!(
-        matches!(err, Error::Tool { .. }),
-        "should be Tool error: {err}"
+        output.is_error,
+        "expected tool execution to be marked as an error due to non-zero exit code"
     );
 }
 
@@ -560,11 +552,11 @@ fn bash_timeout() {
     });
 
     // Timeout should result in an error (cancelled)
-    let err = output.unwrap_err();
-    h.log().info("result", format!("error={err}"));
+    let output = output.unwrap();
+    h.log().info("result", format!("output={output:?}"));
     assert!(
-        matches!(err, Error::Tool { .. }),
-        "should be Tool error: {err}"
+        output.is_error,
+        "expected tool execution to be marked as an error due to non-zero exit code"
     );
 }
 
@@ -583,8 +575,9 @@ fn bash_timeout_reports_partial_output_for_repro() {
         .await
     });
 
-    let err = output.expect_err("timeout should return tool error");
-    let msg = err.to_string().to_ascii_lowercase();
+    let result = output.expect("timeout should return Ok with is_error=true");
+    assert!(result.is_error, "expected is_error=true");
+    let msg = first_text(&result.content).to_ascii_lowercase();
     h.log().info("result", format!("error={msg}"));
     assert!(
         msg.contains("before-timeout"),
@@ -1205,12 +1198,11 @@ fn bash_process_tree_cleanup_on_timeout() {
         .await
     });
 
-    let err = output.unwrap_err();
-    h.log().info("result", format!("error={err}"));
-    assert!(
-        err.to_string().contains("timed out"),
-        "should report timeout: {err}"
-    );
+    let result = output.unwrap();
+    assert!(result.is_error);
+    let msg = first_text(&result.content);
+    h.log().info("result", format!("error={msg}"));
+    assert!(msg.contains("timed out"), "should report timeout: {msg}");
 
     // Give a moment for cleanup
     std::thread::sleep(std::time::Duration::from_millis(500));
@@ -1330,8 +1322,9 @@ fn bash_exit_code_captured() {
             .await
         });
 
-        let err = output.unwrap_err();
-        let msg = err.to_string();
+        let result = output.unwrap();
+        assert!(result.is_error);
+        let msg = first_text(&result.content).to_string();
         h.log().info("result", format!("exit {code}: error={msg}"));
         assert!(
             msg.contains(&format!("code {code}")),

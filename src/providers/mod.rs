@@ -5,7 +5,7 @@
 
 use crate::error::{Error, Result};
 use crate::extensions::{ExtensionManager, ExtensionRuntimeHandle};
-use crate::http::client::Client;
+use crate::http::client::{Client, RequestBuilder};
 use crate::model::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, StopReason, TextContent, Usage,
 };
@@ -20,6 +20,7 @@ use chrono::Utc;
 use futures::stream;
 use futures::stream::Stream;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::env;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -35,6 +36,36 @@ pub mod gitlab;
 pub mod openai;
 pub mod openai_responses;
 pub mod vertex;
+
+pub(super) fn first_non_empty_header_value_case_insensitive(
+    headers: &HashMap<String, String>,
+    names: &[&str],
+) -> Option<String> {
+    headers.iter().find_map(|(key, value)| {
+        names
+            .iter()
+            .any(|name| key.eq_ignore_ascii_case(name))
+            .then_some(value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+pub(super) fn apply_headers_ignoring_blank_auth_overrides<'a>(
+    mut request: RequestBuilder<'a>,
+    headers: &HashMap<String, String>,
+    auth_names: &[&str],
+) -> RequestBuilder<'a> {
+    for (key, value) in headers {
+        let is_blank_auth_override =
+            auth_names.iter().any(|name| key.eq_ignore_ascii_case(name)) && value.trim().is_empty();
+        if is_blank_auth_override {
+            continue;
+        }
+        request = request.header(key, value);
+    }
+    request
+}
 
 fn vcr_client_if_enabled() -> Result<Option<Client>> {
     if env::var(VCR_ENV_MODE).is_err() {
@@ -148,7 +179,9 @@ fn resolve_provider_route(entry: &ModelEntry) -> Result<(ProviderRouteKind, Stri
         "google-gemini-cli" | "google-antigravity" => ProviderRouteKind::NativeGoogleGeminiCli,
         "google-vertex" | "vertexai" => ProviderRouteKind::NativeGoogleVertex,
         "amazon-bedrock" | "bedrock" => ProviderRouteKind::NativeBedrock,
-        "azure-openai" | "azure" | "azure-cognitive-services" => ProviderRouteKind::NativeAzure,
+        "azure-openai" | "azure" | "azure-cognitive-services" | "azure-openai-responses" => {
+            ProviderRouteKind::NativeAzure
+        }
         "github-copilot" | "copilot" => ProviderRouteKind::NativeCopilot,
         "gitlab" | "gitlab-duo" => ProviderRouteKind::NativeGitlab,
         _ => match effective_api.as_str() {
@@ -161,6 +194,7 @@ fn resolve_provider_route(entry: &ModelEntry) -> Result<(ProviderRouteKind, Stri
             "google-gemini-cli" => ProviderRouteKind::ApiGoogleGeminiCli,
             "google-vertex" => ProviderRouteKind::NativeGoogleVertex,
             "bedrock-converse-stream" => ProviderRouteKind::NativeBedrock,
+            "azure-openai-responses" => ProviderRouteKind::NativeAzure,
             _ => {
                 let suggestions = suggest_similar_providers(&entry.model.provider);
                 let msg = if suggestions.is_empty() {
@@ -258,7 +292,7 @@ fn suggest_similar_providers(input: &str) -> Vec<String> {
         }
     }
 
-    matches.sort_by_key(|(score, name)| (*score, name.clone()));
+    matches.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     matches.dedup_by(|a, b| a.1 == b.1);
     matches.truncate(3);
     matches.into_iter().map(|(_, name)| name).collect()
@@ -390,6 +424,34 @@ where
     })
 }
 
+fn resolve_copilot_token(entry: &ModelEntry) -> Result<String> {
+    resolve_copilot_token_with_env(entry, |name| env::var(name).ok())
+}
+
+fn resolve_copilot_token_with_env<F>(entry: &ModelEntry, mut env_lookup: F) -> Result<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let inline = entry
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let from_env = || {
+        env_lookup("GITHUB_COPILOT_API_KEY")
+            .or_else(|| env_lookup("GITHUB_TOKEN"))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+
+    inline.or_else(from_env).ok_or_else(|| {
+        Error::auth(
+            "GitHub Copilot requires login credentials or GITHUB_COPILOT_API_KEY/GITHUB_TOKEN",
+        )
+    })
+}
+
 impl ExtensionStreamSimpleProvider {
     const NEXT_TIMEOUT_MS: u64 = 600_000;
 
@@ -399,17 +461,17 @@ impl ExtensionStreamSimpleProvider {
 
     fn build_js_model(model: &crate::provider::Model) -> Value {
         serde_json::json!({
-            "id": model.id.clone(),
-            "name": model.name.clone(),
-            "api": model.api.clone(),
-            "provider": model.provider.clone(),
-            "baseUrl": model.base_url.clone(),
+            "id": &model.id,
+            "name": &model.name,
+            "api": &model.api,
+            "provider": &model.provider,
+            "baseUrl": &model.base_url,
             "reasoning": model.reasoning,
-            "input": model.input.clone(),
-            "cost": model.cost.clone(),
+            "input": &model.input,
+            "cost": &model.cost,
             "contextWindow": model.context_window,
             "maxTokens": model.max_tokens,
-            "headers": model.headers.clone(),
+            "headers": &model.headers,
         })
     }
 
@@ -648,12 +710,25 @@ impl Provider for ExtensionStreamSimpleProvider {
                     if let Some(chunk) = value.as_str() {
                         let chunk = chunk.to_string();
                         state.accumulated_text.push_str(&chunk);
-                        state.last_message = Some(Self::make_partial(
-                            &state.model_id,
-                            &state.provider,
-                            &state.api,
-                            &state.accumulated_text,
-                        ));
+                        // Update last_message in-place: mutate existing text
+                        // content instead of rebuilding the entire
+                        // AssistantMessage (avoids 3 String + Vec allocs per
+                        // chunk).
+                        match &mut state.last_message {
+                            Some(msg) => {
+                                if let Some(ContentBlock::Text(t)) = msg.content.first_mut() {
+                                    t.text.clone_from(&state.accumulated_text);
+                                }
+                            }
+                            None => {
+                                state.last_message = Some(Self::make_partial(
+                                    &state.model_id,
+                                    &state.provider,
+                                    &state.api,
+                                    &state.accumulated_text,
+                                ));
+                            }
+                        }
 
                         // Emit Start + TextStart before first string-chunk TextDelta.
                         if !state.string_chunk_started {
@@ -823,7 +898,8 @@ pub fn create_provider(
         ProviderRouteKind::NativeAnthropic | ProviderRouteKind::ApiAnthropicMessages => {
             Ok(Arc::new(
                 anthropic::AnthropicProvider::new(entry.model.id.clone())
-                    .with_base_url(entry.model.base_url.clone())
+                    .with_provider_name(entry.model.provider.clone())
+                    .with_base_url(normalize_anthropic_base(&entry.model.base_url))
                     .with_compat(entry.compat.clone())
                     .with_client(client),
             ))
@@ -911,13 +987,7 @@ pub fn create_provider(
             ))
         }
         ProviderRouteKind::NativeCopilot => {
-            let github_token = env::var("GITHUB_COPILOT_API_KEY")
-                .or_else(|_| env::var("GITHUB_TOKEN"))
-                .map_err(|_| {
-                    Error::auth(
-                        "GitHub Copilot requires GITHUB_COPILOT_API_KEY or GITHUB_TOKEN to be set",
-                    )
-                })?;
+            let github_token = resolve_copilot_token(entry)?;
             let mut provider = copilot::CopilotProvider::new(&entry.model.id, github_token)
                 .with_provider_name(&entry.model.provider)
                 .with_compat(entry.compat.clone())
@@ -937,32 +1007,141 @@ pub fn create_provider(
     }
 }
 
+pub fn normalize_anthropic_base(base_url: &str) -> String {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return "https://api.anthropic.com/v1/messages".to_string();
+    }
+
+    let mut base_for_fallback = trimmed.trim_end_matches('/').to_string();
+
+    if let Ok(url) = Url::parse(trimmed) {
+        if url.cannot_be_a_base() {
+            base_for_fallback = url.as_str().trim_end_matches('/').to_string();
+        } else {
+            if trimmed_url_path(&url).ends_with("/v1/messages") {
+                return canonicalize_url_path(&url);
+            }
+            return append_url_path(&url, "v1/messages");
+        }
+    }
+
+    let base_url = base_for_fallback;
+    if base_url.ends_with("/v1/messages") {
+        return base_url;
+    }
+    format!("{base_url}/v1/messages")
+}
+
+fn trimmed_url_path(url: &Url) -> &str {
+    match url.path().trim_end_matches('/') {
+        "" => "/",
+        trimmed => trimmed,
+    }
+}
+
+fn canonicalize_url_path(url: &Url) -> String {
+    let mut canonical = url.clone();
+    canonical.set_path(trimmed_url_path(url));
+    canonical.to_string()
+}
+
+fn replace_url_path(url: &Url, path: &str) -> String {
+    let mut updated = url.clone();
+    updated.set_path(path);
+    updated.to_string()
+}
+
+fn append_url_path(url: &Url, suffix: &str) -> String {
+    let base_path = trimmed_url_path(url);
+    let path = if base_path == "/" {
+        format!("/{suffix}")
+    } else {
+        format!("{base_path}/{suffix}")
+    };
+    replace_url_path(url, &path)
+}
+
+fn strip_url_path_suffix(url: &Url, suffix: &str) -> Option<Url> {
+    let base_path = trimmed_url_path(url);
+    let prefix = base_path.strip_suffix(suffix)?;
+    let mut stripped = url.clone();
+    stripped.set_path(if prefix.is_empty() { "/" } else { prefix });
+    Some(stripped)
+}
+
+fn is_official_https_origin(url: &Url, host: &str, default_port: u16) -> bool {
+    url.scheme().eq_ignore_ascii_case("https")
+        && url
+            .host_str()
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(host))
+        && url.port_or_known_default() == Some(default_port)
+        && trimmed_url_path(url) == "/"
+}
+
 pub fn normalize_openai_base(base_url: &str) -> String {
-    let base_url = base_url.trim_end_matches('/');
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return "https://api.openai.com/v1/chat/completions".to_string();
+    }
+
+    let mut base_for_fallback = trimmed.trim_end_matches('/').to_string();
+
+    if let Ok(url) = Url::parse(trimmed) {
+        if url.cannot_be_a_base() {
+            base_for_fallback = url.as_str().trim_end_matches('/').to_string();
+        } else {
+            if trimmed_url_path(&url).ends_with("/chat/completions") {
+                return canonicalize_url_path(&url);
+            }
+            let url = strip_url_path_suffix(&url, "/responses").unwrap_or(url);
+            if is_official_https_origin(&url, "api.openai.com", 443) {
+                return replace_url_path(&url, "/v1/chat/completions");
+            }
+            return append_url_path(&url, "chat/completions");
+        }
+    }
+
+    let base_url = base_for_fallback;
     if base_url.ends_with("/chat/completions") {
-        return base_url.to_string();
+        return base_url;
     }
-    let base_url = base_url.strip_suffix("/responses").unwrap_or(base_url);
-    if base_url.ends_with("/v1") {
-        return format!("{base_url}/chat/completions");
-    }
+    let base_url = base_url
+        .strip_suffix("/responses")
+        .unwrap_or(base_url.as_str());
     format!("{base_url}/chat/completions")
 }
 
 pub fn normalize_openai_responses_base(base_url: &str) -> String {
-    let base_url = base_url.trim_end_matches('/');
-    if base_url.is_empty() {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
         return "https://api.openai.com/v1/responses".to_string();
     }
+
+    let mut base_for_fallback = trimmed.trim_end_matches('/').to_string();
+
+    if let Ok(url) = Url::parse(trimmed) {
+        if url.cannot_be_a_base() {
+            base_for_fallback = url.as_str().trim_end_matches('/').to_string();
+        } else {
+            if trimmed_url_path(&url).ends_with("/responses") {
+                return canonicalize_url_path(&url);
+            }
+            let url = strip_url_path_suffix(&url, "/chat/completions").unwrap_or(url);
+            if is_official_https_origin(&url, "api.openai.com", 443) {
+                return replace_url_path(&url, "/v1/responses");
+            }
+            return append_url_path(&url, "responses");
+        }
+    }
+
+    let base_url = base_for_fallback;
     if base_url.ends_with("/responses") {
-        return base_url.to_string();
+        return base_url;
     }
     let base_url = base_url
         .strip_suffix("/chat/completions")
-        .unwrap_or(base_url);
-    if base_url.ends_with("/v1") {
-        return format!("{base_url}/responses");
-    }
+        .unwrap_or(base_url.as_str());
     format!("{base_url}/responses")
 }
 
@@ -971,23 +1150,65 @@ pub fn normalize_openai_codex_responses_base(base_url: &str) -> String {
     if trimmed.is_empty() {
         return openai_responses::CODEX_RESPONSES_API_URL.to_string();
     }
-    let base = trimmed.trim_end_matches('/');
+
+    let mut base_for_fallback = trimmed.trim_end_matches('/').to_string();
+
+    if let Ok(url) = Url::parse(trimmed) {
+        if url.cannot_be_a_base() {
+            base_for_fallback = url.as_str().trim_end_matches('/').to_string();
+        } else {
+            let path = trimmed_url_path(&url);
+            if path.ends_with("/backend-api/codex/responses") || path.ends_with("/responses") {
+                return canonicalize_url_path(&url);
+            }
+            if path.ends_with("/backend-api") {
+                return append_url_path(&url, "codex/responses");
+            }
+            return append_url_path(&url, "backend-api/codex/responses");
+        }
+    }
+
+    let base = base_for_fallback;
     if base.ends_with("/backend-api/codex/responses") {
-        return base.to_string();
+        return base;
+    }
+    // Some registries (including legacy Pi) store the ChatGPT base as
+    // `https://chatgpt.com/backend-api`. In that case we only want to append
+    // `/codex/responses`, not `/backend-api/codex/responses` again.
+    if base.ends_with("/backend-api") {
+        return format!("{base}/codex/responses");
     }
     if base.ends_with("/responses") {
-        return base.to_string();
+        return base;
     }
     format!("{base}/backend-api/codex/responses")
 }
 
 pub fn normalize_cohere_base(base_url: &str) -> String {
-    let base_url = base_url.trim_end_matches('/');
-    if base_url.ends_with("/chat") {
-        return base_url.to_string();
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return "https://api.cohere.com/v2/chat".to_string();
     }
-    if base_url.ends_with("/v2") {
-        return format!("{base_url}/chat");
+
+    let mut base_for_fallback = trimmed.trim_end_matches('/').to_string();
+
+    if let Ok(url) = Url::parse(trimmed) {
+        if url.cannot_be_a_base() {
+            base_for_fallback = url.as_str().trim_end_matches('/').to_string();
+        } else {
+            if trimmed_url_path(&url).ends_with("/chat") {
+                return canonicalize_url_path(&url);
+            }
+            if is_official_https_origin(&url, "api.cohere.com", 443) {
+                return replace_url_path(&url, "/v2/chat");
+            }
+            return append_url_path(&url, "chat");
+        }
+    }
+
+    let base_url = base_for_fallback;
+    if base_url.ends_with("/chat") {
+        return base_url;
     }
     format!("{base_url}/chat")
 }
@@ -1613,6 +1834,71 @@ export default function init(pi) {
     }
 
     #[test]
+    fn resolve_provider_route_uses_native_azure_route_for_legacy_provider_alias() {
+        let entry = model_entry(
+            "azure-openai-responses",
+            "azure-openai-responses",
+            "gpt-4o-mini",
+            "https://myresource.openai.azure.com",
+        );
+        let (route, canonical_provider, effective_api) =
+            resolve_provider_route(&entry).expect("resolve azure legacy alias route");
+        assert_eq!(route, ProviderRouteKind::NativeAzure);
+        assert_eq!(canonical_provider, "azure-openai");
+        assert_eq!(effective_api, "azure-openai-responses");
+    }
+
+    #[test]
+    fn resolve_provider_route_accepts_azure_legacy_api_for_custom_provider_id() {
+        let entry = model_entry(
+            "my-azure",
+            "azure-openai-responses",
+            "gpt-4o-mini",
+            "https://example.invalid",
+        );
+        let (route, canonical_provider, effective_api) =
+            resolve_provider_route(&entry).expect("resolve azure legacy api fallback");
+        assert_eq!(route, ProviderRouteKind::NativeAzure);
+        assert_eq!(canonical_provider, "my-azure");
+        assert_eq!(effective_api, "azure-openai-responses");
+    }
+
+    #[test]
+    fn resolve_copilot_token_prefers_inline_model_api_key() {
+        let mut entry = model_entry("github-copilot", "", "gpt-4o", "");
+        entry.api_key = Some("inline-copilot-token".to_string());
+
+        let token = resolve_copilot_token_with_env(&entry, |_| None)
+            .expect("inline token should be accepted");
+        assert_eq!(token, "inline-copilot-token");
+    }
+
+    #[test]
+    fn resolve_copilot_token_falls_back_to_env() {
+        let mut entry = model_entry("github-copilot", "", "gpt-4o", "");
+        entry.api_key = None;
+
+        let token = resolve_copilot_token_with_env(&entry, |name| match name {
+            "GITHUB_COPILOT_API_KEY" => Some("env-copilot-token".to_string()),
+            _ => None,
+        })
+        .expect("env token should be accepted");
+        assert_eq!(token, "env-copilot-token");
+    }
+
+    #[test]
+    fn resolve_copilot_token_errors_when_missing_everywhere() {
+        let mut entry = model_entry("github-copilot", "", "gpt-4o", "");
+        entry.api_key = None;
+
+        let err = resolve_copilot_token_with_env(&entry, |_| None).expect_err("expected error");
+        assert!(
+            err.to_string().contains("GitHub Copilot requires"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn suggest_similar_providers_finds_prefix_match() {
         let suggestions = suggest_similar_providers("deep");
         assert!(
@@ -1958,12 +2244,62 @@ export default function init(pi) {
             "https://example.com",
         );
         let Err(err) = create_provider(&entry, None) else {
-            panic!("unknown should fail");
+            panic!();
         };
         let msg = err.to_string();
         assert!(
             msg.contains("not implemented"),
             "expected 'not implemented' message, got: {msg}"
+        );
+    }
+
+    // ── normalize_anthropic_base ───────────────────────────────────
+
+    #[test]
+    fn normalize_anthropic_base_appends_v1_messages() {
+        assert_eq!(
+            normalize_anthropic_base("https://api.anthropic.com"),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn normalize_anthropic_base_keeps_existing_v1_messages() {
+        assert_eq!(
+            normalize_anthropic_base("https://api.anthropic.com/v1/messages"),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn normalize_anthropic_base_strips_trailing_slash() {
+        assert_eq!(
+            normalize_anthropic_base("https://api.anthropic.com/"),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn normalize_anthropic_base_empty_uses_default() {
+        assert_eq!(
+            normalize_anthropic_base("   "),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    #[test]
+    fn normalize_anthropic_base_preserves_query_and_fragment() {
+        assert_eq!(
+            normalize_anthropic_base("https://api.anthropic.com/?via=proxy#frag"),
+            "https://api.anthropic.com/v1/messages?via=proxy#frag"
+        );
+    }
+
+    #[test]
+    fn normalize_anthropic_base_handles_opaque_url_fallback() {
+        assert_eq!(
+            normalize_anthropic_base("data:text/plain,hello"),
+            "data:text/plain,hello/v1/messages"
         );
     }
 
@@ -2002,10 +2338,58 @@ export default function init(pi) {
     }
 
     #[test]
-    fn normalize_openai_base_bare_url_gets_chat_completions() {
+    fn normalize_openai_base_official_bare_url_gets_v1_chat_completions() {
+        assert_eq!(
+            normalize_openai_base("https://api.openai.com"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn normalize_openai_base_official_default_port_gets_v1_chat_completions() {
+        assert_eq!(
+            normalize_openai_base("https://api.openai.com:443"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn normalize_openai_base_strips_non_v1_official_responses_suffix() {
+        assert_eq!(
+            normalize_openai_base("https://api.openai.com/responses"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn normalize_openai_base_custom_bare_url_gets_chat_completions() {
         assert_eq!(
             normalize_openai_base("https://my-llm-proxy.com"),
             "https://my-llm-proxy.com/chat/completions"
+        );
+    }
+
+    #[test]
+    fn normalize_openai_base_preserves_query_and_fragment_on_official_origin() {
+        assert_eq!(
+            normalize_openai_base("https://api.openai.com:443/?via=proxy#frag"),
+            "https://api.openai.com/v1/chat/completions?via=proxy#frag"
+        );
+    }
+
+    #[test]
+    fn normalize_openai_base_empty_uses_default() {
+        assert_eq!(
+            normalize_openai_base(""),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn normalize_openai_base_handles_opaque_url_fallback() {
+        assert_eq!(
+            normalize_openai_base("data:text/plain,hello"),
+            "data:text/plain,hello/chat/completions"
         );
     }
 
@@ -2044,10 +2428,110 @@ export default function init(pi) {
     }
 
     #[test]
-    fn normalize_responses_bare_url_gets_responses() {
+    fn normalize_responses_official_bare_url_gets_v1_responses() {
+        assert_eq!(
+            normalize_openai_responses_base("https://api.openai.com"),
+            "https://api.openai.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn normalize_responses_official_default_port_gets_v1_responses() {
+        assert_eq!(
+            normalize_openai_responses_base("https://api.openai.com:443"),
+            "https://api.openai.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn normalize_responses_strips_non_v1_official_chat_completions_suffix() {
+        assert_eq!(
+            normalize_openai_responses_base("https://api.openai.com/chat/completions"),
+            "https://api.openai.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn normalize_responses_custom_bare_url_gets_responses() {
         assert_eq!(
             normalize_openai_responses_base("https://my-llm-proxy.com"),
             "https://my-llm-proxy.com/responses"
+        );
+    }
+
+    #[test]
+    fn normalize_responses_preserves_query_and_fragment() {
+        assert_eq!(
+            normalize_openai_responses_base("https://my-llm-proxy.com/api?via=proxy#frag"),
+            "https://my-llm-proxy.com/api/responses?via=proxy#frag"
+        );
+    }
+
+    #[test]
+    fn normalize_responses_preserves_query_and_fragment_on_official_origin() {
+        assert_eq!(
+            normalize_openai_responses_base("https://api.openai.com:443/?via=proxy#frag"),
+            "https://api.openai.com/v1/responses?via=proxy#frag"
+        );
+    }
+
+    #[test]
+    fn normalize_responses_base_empty_uses_default() {
+        assert_eq!(
+            normalize_openai_responses_base("  "),
+            "https://api.openai.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn normalize_responses_base_handles_opaque_url_fallback() {
+        assert_eq!(
+            normalize_openai_responses_base("data:text/plain,hello"),
+            "data:text/plain,hello/responses"
+        );
+    }
+
+    // ── normalize_openai_codex_responses_base ──────────────────────
+
+    #[test]
+    fn normalize_codex_responses_base_empty_uses_default() {
+        assert_eq!(
+            normalize_openai_codex_responses_base(""),
+            openai_responses::CODEX_RESPONSES_API_URL
+        );
+    }
+
+    #[test]
+    fn normalize_codex_responses_base_keeps_existing_suffix() {
+        assert_eq!(
+            normalize_openai_codex_responses_base(
+                "https://chatgpt.com/backend-api/codex/responses"
+            ),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+    }
+
+    #[test]
+    fn normalize_codex_responses_base_appends_suffix_from_backend_api() {
+        assert_eq!(
+            normalize_openai_codex_responses_base("https://chatgpt.com/backend-api"),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+    }
+
+    #[test]
+    fn normalize_codex_responses_base_preserves_query_and_fragment() {
+        assert_eq!(
+            normalize_openai_codex_responses_base("https://chatgpt.com/backend-api?via=proxy#frag"),
+            "https://chatgpt.com/backend-api/codex/responses?via=proxy#frag"
+        );
+    }
+
+    #[test]
+    fn normalize_codex_responses_base_handles_opaque_url_fallback() {
+        assert_eq!(
+            normalize_openai_codex_responses_base("data:text/plain,hello"),
+            "data:text/plain,hello/backend-api/codex/responses"
         );
     }
 
@@ -2078,10 +2562,55 @@ export default function init(pi) {
     }
 
     #[test]
-    fn normalize_cohere_bare_url_gets_chat() {
+    fn normalize_cohere_official_bare_url_gets_v2_chat() {
+        assert_eq!(
+            normalize_cohere_base("https://api.cohere.com"),
+            "https://api.cohere.com/v2/chat"
+        );
+    }
+
+    #[test]
+    fn normalize_cohere_official_default_port_gets_v2_chat() {
+        assert_eq!(
+            normalize_cohere_base("https://api.cohere.com:443"),
+            "https://api.cohere.com/v2/chat"
+        );
+    }
+
+    #[test]
+    fn normalize_cohere_custom_bare_url_gets_chat() {
         assert_eq!(
             normalize_cohere_base("https://custom-cohere.example.com"),
             "https://custom-cohere.example.com/chat"
+        );
+    }
+
+    #[test]
+    fn normalize_cohere_preserves_query_and_fragment() {
+        assert_eq!(
+            normalize_cohere_base("https://custom-cohere.example.com/v2?tenant=test#frag"),
+            "https://custom-cohere.example.com/v2/chat?tenant=test#frag"
+        );
+    }
+
+    #[test]
+    fn normalize_cohere_preserves_query_and_fragment_on_official_origin() {
+        assert_eq!(
+            normalize_cohere_base("https://api.cohere.com:443/?tenant=test#frag"),
+            "https://api.cohere.com/v2/chat?tenant=test#frag"
+        );
+    }
+
+    #[test]
+    fn normalize_cohere_base_empty_uses_default() {
+        assert_eq!(normalize_cohere_base(""), "https://api.cohere.com/v2/chat");
+    }
+
+    #[test]
+    fn normalize_cohere_base_handles_opaque_url_fallback() {
+        assert_eq!(
+            normalize_cohere_base("data:text/plain,hello"),
+            "data:text/plain,hello/chat"
         );
     }
 
@@ -2090,6 +2619,15 @@ export default function init(pi) {
         use proptest::prelude::*;
 
         proptest! {
+            #[test]
+            fn normalize_anthropic_base_is_idempotent_and_targets_v1_messages(
+                base in "[A-Za-z0-9:/._-]{1,96}"
+            ) {
+                let normalized = normalize_anthropic_base(&base);
+                prop_assert!(normalized.ends_with("/v1/messages"));
+                prop_assert_eq!(normalize_anthropic_base(&normalized), normalized);
+            }
+
             #[test]
             fn normalize_openai_base_is_idempotent_and_targets_chat_completions(
                 base in "[A-Za-z0-9:/._-]{1,96}"

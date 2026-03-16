@@ -779,19 +779,20 @@ fn run_cmd_capture_stdout(cmd: &mut Command) -> Option<String> {
 
 fn git_rev_parse_head(repo: &Path) -> Option<String> {
     let mut cmd = Command::new("git");
-    cmd.args(["-C", repo.to_string_lossy().as_ref(), "rev-parse", "HEAD"]);
+    cmd.stdin(Stdio::null())
+        .args(["-C", repo.to_string_lossy().as_ref(), "rev-parse", "HEAD"]);
     run_cmd_capture_stdout(&mut cmd)
 }
 
 fn node_version() -> Option<String> {
     let mut cmd = Command::new("/usr/bin/node");
-    cmd.arg("-v");
+    cmd.stdin(Stdio::null()).arg("-v");
     run_cmd_capture_stdout(&mut cmd)
 }
 
 fn npm_version() -> Option<String> {
     let mut cmd = Command::new("/usr/bin/npm");
-    cmd.arg("--version");
+    cmd.stdin(Stdio::null()).arg("--version");
     run_cmd_capture_stdout(&mut cmd)
 }
 

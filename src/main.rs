@@ -10,11 +10,12 @@
 #![allow(dead_code, clippy::unused_async)]
 
 use std::fmt::Write as _;
+use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
 use asupersync::runtime::reactor::create_reactor;
@@ -33,10 +34,12 @@ use pi::config::Config;
 use pi::config::SettingsScope;
 use pi::extension_index::ExtensionIndexStore;
 use pi::extensions::{
-    ALL_CAPABILITIES, Capability, ExtensionLoadSpec, ExtensionRuntimeHandle,
-    NativeRustExtensionRuntimeHandle, PolicyDecision, resolve_extension_load_spec,
+    ALL_CAPABILITIES, Capability, ExtensionLoadSpec, ExtensionRegion, ExtensionRuntimeHandle,
+    JsExtensionRuntimeHandle, NativeRustExtensionRuntimeHandle, PolicyDecision,
+    resolve_extension_load_spec,
 };
-use pi::model::{AssistantMessage, ContentBlock, StopReason};
+use pi::extensions_js::PiJsRuntimeConfig;
+use pi::model::{AssistantMessage, ContentBlock, StopReason, ThinkingLevel};
 use pi::models::{ModelEntry, ModelRegistry, default_models_path};
 use pi::package_manager::{
     PackageEntry, PackageManager, PackageScope, ResolvedPaths, ResolvedResource, ResourceOrigin,
@@ -49,8 +52,9 @@ use pi::session::Session;
 use pi::session_index::SessionIndex;
 use pi::tools::ToolRegistry;
 use pi::tui::PiConsole;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tracing_subscriber::EnvFilter;
 
 const EXIT_CODE_FAILURE: i32 = 1;
@@ -92,6 +96,149 @@ fn parse_cli_from_env() -> Result<Option<(cli::Cli, Vec<cli::ExtensionCliFlag>)>
     parse_cli_args(std::env::args().collect())
 }
 
+fn reload_model_registry_with_extra_entries(
+    auth: &AuthStorage,
+    models_path: &Path,
+    extra_entries: &[ModelEntry],
+) -> ModelRegistry {
+    let mut registry = ModelRegistry::load(auth, Some(models_path.to_path_buf()));
+    if let Some(error) = registry.error() {
+        eprintln!("Warning: models.json error: {error}");
+    }
+    if !extra_entries.is_empty() {
+        registry.merge_entries(extra_entries.to_vec());
+    }
+    registry
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn resolve_selection_with_auth(
+    cli: &mut cli::Cli,
+    config: &Config,
+    session: &Session,
+    model_registry: &mut ModelRegistry,
+    scoped_patterns: &[String],
+    auth: &mut AuthStorage,
+    models_path: &Path,
+    allow_setup_prompt: bool,
+    extra_entries: &[ModelEntry],
+) -> Result<Option<(pi::app::ModelSelection, Option<String>)>> {
+    loop {
+        let scoped_models = if scoped_patterns.is_empty() {
+            Vec::new()
+        } else {
+            pi::app::resolve_model_scope(scoped_patterns, model_registry, cli.api_key.is_some())
+        };
+
+        let selection = match pi::app::select_model_and_thinking(
+            cli,
+            config,
+            session,
+            model_registry,
+            &scoped_models,
+            &Config::global_dir(),
+        ) {
+            Ok(selection) => selection,
+            Err(err) => {
+                if let Some(startup) = err.downcast_ref::<StartupError>()
+                    && allow_setup_prompt
+                {
+                    if run_first_time_setup(startup, auth, cli, models_path).await? {
+                        *model_registry = reload_model_registry_with_extra_entries(
+                            auth,
+                            models_path,
+                            extra_entries,
+                        );
+                        continue;
+                    }
+                    return Ok(None);
+                }
+                return Err(err);
+            }
+        };
+
+        match pi::app::resolve_api_key(auth, cli, &selection.model_entry) {
+            Ok(key) => return Ok(Some((selection, key))),
+            Err(err) => {
+                if let Some(startup) = err.downcast_ref::<StartupError>() {
+                    if let StartupError::MissingApiKey { provider } = startup {
+                        let canonical_provider =
+                            pi::provider_metadata::canonical_provider_id(provider)
+                                .unwrap_or(provider.as_str());
+                        if canonical_provider == "sap-ai-core" {
+                            if let Some(token) = pi::auth::exchange_sap_access_token(auth).await? {
+                                return Ok(Some((selection, Some(token))));
+                            }
+                        }
+                    }
+
+                    if allow_setup_prompt {
+                        if run_first_time_setup(startup, auth, cli, models_path).await? {
+                            *model_registry = reload_model_registry_with_extra_entries(
+                                auth,
+                                models_path,
+                                extra_entries,
+                            );
+                            continue;
+                        }
+                        return Ok(None);
+                    }
+                }
+                return Err(err);
+            }
+        }
+    }
+}
+
+fn should_retry_selection_after_extensions(
+    cli: &cli::Cli,
+    err: &anyhow::Error,
+    has_extensions: bool,
+) -> bool {
+    if !has_extensions || (cli.provider.is_none() && cli.model.is_none()) {
+        return false;
+    }
+
+    let message = err.to_string().to_ascii_lowercase();
+    message.contains(" not found") || message.contains("no models available for provider")
+}
+
+fn build_extension_bootstrap_selection(
+    config: &Config,
+    model_registry: &ModelRegistry,
+    models_path: &Path,
+) -> Result<pi::app::ModelSelection> {
+    let model_entry = pi::app::bootstrap_model_entry(model_registry).ok_or_else(|| {
+        anyhow::Error::new(StartupError::NoModelsAvailable {
+            models_path: models_path.to_path_buf(),
+        })
+    })?;
+    let thinking_level = config
+        .default_thinking_level
+        .as_deref()
+        .and_then(|value| value.parse::<ThinkingLevel>().ok());
+
+    Ok(pi::app::ModelSelection {
+        thinking_level: model_entry
+            .clamp_thinking_level(thinking_level.unwrap_or(ThinkingLevel::XHigh)),
+        model_entry,
+        scoped_models: Vec::new(),
+        fallback_message: None,
+    })
+}
+
+fn context_window_tokens_for_entry(entry: &ModelEntry) -> u32 {
+    if entry.model.context_window == 0 {
+        tracing::warn!(
+            "Model {} reported context_window=0; falling back to default compaction window",
+            entry.model.id
+        );
+        ResolvedCompactionSettings::default().context_window_tokens
+    } else {
+        entry.model.context_window
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn main_impl() -> Result<()> {
     // Parse CLI arguments
@@ -99,15 +246,15 @@ fn main_impl() -> Result<()> {
         return Ok(());
     };
 
-    // Validate theme file paths before --version so invalid paths always error.
-    // Named themes (without .json, /, ~) are validated later after resource loading.
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    validate_theme_path_spec(cli.theme.as_deref(), &cwd)?;
-
     if cli.version {
         print_version();
         return Ok(());
     }
+
+    // Validate theme file paths.
+    // Named themes (without .json, /, ~) are validated later after resource loading.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    validate_theme_path_spec(cli.theme.as_deref(), &cwd)?;
 
     // Ultra-fast paths that don't need tracing or the async runtime.
     if let Some(command) = &cli.command {
@@ -147,6 +294,36 @@ fn main_impl() -> Result<()> {
                     only.as_deref(),
                 )?;
                 return Ok(());
+            }
+            cli::Commands::Config { show, paths, json } => {
+                if *paths && !*show && !*json {
+                    handle_config_paths_fast(&cwd);
+                    return Ok(());
+                }
+                if !*paths && (*show || *json) {
+                    let manager = PackageManager::new(cwd.clone());
+                    let entries = manager.list_packages_blocking()?;
+                    if entries.is_empty() {
+                        if *show {
+                            handle_config_show_fast(&cwd);
+                            return Ok(());
+                        }
+                        if *json {
+                            handle_config_json_fast(&cwd)?;
+                            return Ok(());
+                        }
+                    } else if let Some(packages) =
+                        collect_config_packages_blocking(&manager, entries)?
+                    {
+                        let report = build_config_report(&cwd, &packages);
+                        if *json {
+                            println!("{}", serde_json::to_string_pretty(&report)?);
+                        } else {
+                            print_config_report(&report, true);
+                        }
+                        return Ok(());
+                    }
+                }
             }
             _ => {}
         }
@@ -192,13 +369,50 @@ fn main_impl() -> Result<()> {
 
             if !compat_scan_enabled && !has_cli_extensions {
                 // Note: we intentionally skip OAuth refresh here to keep this path fast and offline.
-                let auth = AuthStorage::load(Config::auth_path())?;
                 let models_path = default_models_path(&Config::global_dir());
-                let registry = ModelRegistry::load(&auth, Some(models_path));
-                if let Some(error) = registry.error() {
+                if let Some(payload) = load_list_models_cache(&models_path) {
+                    if let Some(error) = &payload.error {
+                        eprintln!("Warning: models.json error: {error}");
+                    }
+                    list_models_from_cached_rows(&payload.rows, pattern.as_deref());
+                    return Ok(());
+                }
+
+                let auth = AuthStorage::load(Config::auth_path())?;
+                let registry = ModelRegistry::load_for_listing(&auth, Some(models_path.clone()));
+                let error = registry.error().map(std::string::ToString::to_string);
+                if let Some(error) = &error {
                     eprintln!("Warning: models.json error: {error}");
                 }
-                list_models(&registry, pattern.as_deref());
+
+                let mut models = registry.available_models();
+                models.sort_by(|a, b| {
+                    let provider_cmp = a.model.provider.cmp(&b.model.provider);
+                    if provider_cmp == std::cmp::Ordering::Equal {
+                        a.model.id.cmp(&b.model.id)
+                    } else {
+                        provider_cmp
+                    }
+                });
+                let rows = build_model_rows(&models);
+                let payload = ListModelsCachePayload {
+                    error,
+                    rows: rows
+                        .into_iter()
+                        .map(|(provider, model, context, max_out, thinking, images)| {
+                            CachedModelRow {
+                                provider,
+                                model,
+                                context,
+                                max_out,
+                                thinking,
+                                images,
+                            }
+                        })
+                        .collect(),
+                };
+                save_list_models_cache(&models_path, &payload);
+                list_models_from_cached_rows(&payload.rows, pattern.as_deref());
                 return Ok(());
             }
         }
@@ -214,7 +428,7 @@ fn main_impl() -> Result<()> {
     // Run the application
     let reactor = create_reactor()?;
     let runtime = RuntimeBuilder::multi_thread()
-        .blocking_threads(1, 8)
+        .blocking_threads(1, 2)
         .with_reactor(reactor)
         .build()
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -232,7 +446,7 @@ fn print_error_with_hints(err: &anyhow::Error) {
         }
     }
 
-    eprintln!("{err}");
+    eprintln!("{err:?}");
 }
 
 fn exit_code_for_error(err: &anyhow::Error) -> i32 {
@@ -420,38 +634,43 @@ fn policy_config_example(profile: &str, allow_dangerous: bool) -> serde_json::Va
     })
 }
 
+fn policy_default_toggle_example(default_permissive: bool) -> serde_json::Value {
+    serde_json::json!({
+        "extensionPolicy": {
+            "defaultPermissive": default_permissive,
+        }
+    })
+}
+
 fn extension_policy_migration_guardrails(
     resolved: &pi::config::ResolvedExtensionPolicy,
 ) -> serde_json::Value {
     serde_json::json!({
-        "default_profile": "safe",
-        "active_default_profile": resolved.profile_source == "default" && resolved.effective_profile == "safe",
+        "default_profile": "permissive",
+        "active_default_profile": resolved.profile_source == "default" && resolved.effective_profile == "permissive",
         "profile_source": resolved.profile_source,
-        "safe_by_default_reason": "Fresh installs deny dangerous capabilities unless explicitly opted in.",
-        "opt_in_cli": {
+        "permissive_by_default_reason": "Fresh installs favor extension compatibility and custom UI out of the box.",
+        "override_cli": {
+            "safe_strict_mode": "pi --extension-policy safe <your command>",
             "balanced_prompt_mode": "pi --extension-policy balanced <your command>",
             "balanced_with_dangerous_caps": "PI_EXTENSION_ALLOW_DANGEROUS=1 pi --extension-policy balanced <your command>",
-            "temporary_permissive": "pi --extension-policy permissive <your command>",
+            "explicit_permissive": "pi --extension-policy permissive <your command>",
         },
         "settings_examples": {
-            "safe_default": policy_config_example("safe", false),
+            "default_permissive": policy_default_toggle_example(true),
+            "default_safe": policy_default_toggle_example(false),
+            "safe_strict_mode": policy_config_example("safe", false),
             "balanced_prompt_mode": policy_config_example("balanced", false),
             "balanced_with_dangerous_caps": policy_config_example("balanced", true),
-            "temporary_permissive": policy_config_example("permissive", false),
+            "explicit_permissive": policy_config_example("permissive", false),
         },
         "revert_to_safe_cli": "pi --extension-policy safe <your command>",
     })
 }
 
-fn maybe_print_extension_policy_migration_notice(resolved: &pi::config::ResolvedExtensionPolicy) {
-    if resolved.profile_source == "default" && resolved.effective_profile == "safe" {
-        eprintln!(
-            "Note: extension policy now defaults to `safe` (dangerous capabilities denied by default)."
-        );
-        eprintln!(
-            "If an extension needs broader access, try `--extension-policy balanced` and optionally `PI_EXTENSION_ALLOW_DANGEROUS=1`."
-        );
-    }
+const fn maybe_print_extension_policy_migration_notice(
+    _resolved: &pi::config::ResolvedExtensionPolicy,
+) {
 }
 
 fn policy_reason_detail(reason: &str) -> &'static str {
@@ -599,7 +818,7 @@ fn print_resolved_extension_policy(resolved: &pi::config::ResolvedExtensionPolic
         },
         {
             "profile": "permissive",
-            "summary": "Allow-most profile for temporary troubleshooting.",
+            "summary": "Allow-most profile for compatibility-first workflows.",
             "cli": "pi --extension-policy permissive <your command>",
             "config_example": policy_config_example("permissive", false),
         },
@@ -698,7 +917,10 @@ async fn run(
     let resources = match resources_result {
         Ok(resources) => resources,
         Err(err) => {
-            eprintln!("Warning: Failed to load skills/prompts: {err}");
+            if resource_cli.has_explicit_paths() {
+                return Err(anyhow::Error::new(err));
+            }
+            eprintln!("Warning: Failed to load skills/prompts/themes/extensions: {err}");
             ResourceLoader::empty(config.enable_skill_commands())
         }
     };
@@ -720,18 +942,12 @@ async fn run(
         .into());
     }
 
-    // Pre-warm native extension runtime in a background task so startup
-    // work can overlap with auth refresh, model selection, and session creation.
+    let mut has_js_extensions = false;
+    let mut has_native_extensions = false;
     for entry in resources.extensions() {
         match resolve_extension_load_spec(entry) {
-            Ok(ExtensionLoadSpec::NativeRust(_)) => {}
-            Ok(ExtensionLoadSpec::Js(_)) => {
-                return Err(pi::error::Error::validation(format!(
-                    "QuickJS extensions are retired: {}. Use `runtime: \"native-rust\"` with a `.native.json` entrypoint.",
-                    entry.display()
-                ))
-                .into());
-            }
+            Ok(ExtensionLoadSpec::NativeRust(_)) => has_native_extensions = true,
+            Ok(ExtensionLoadSpec::Js(_)) => has_js_extensions = true,
             #[cfg(feature = "wasm-host")]
             Ok(ExtensionLoadSpec::Wasm(_)) => {}
             Err(err) => {
@@ -740,16 +956,83 @@ async fn run(
         }
     }
 
-    let extension_prewarm_handle = if resources.extensions().is_empty() {
-        None
+    if has_js_extensions && has_native_extensions {
+        return Err(pi::error::Error::validation(
+            "Mixed extension runtimes are not supported in one session yet. Use either JS/TS extensions (QuickJS) or native-rust descriptors (*.native.json), but not both at once."
+                .to_string(),
+        )
+        .into());
+    }
+
+    let prewarm_policy = config
+        .resolve_extension_policy_with_metadata(cli.extension_policy.as_deref())
+        .policy;
+    let prewarm_repair = config.resolve_repair_policy_with_metadata(cli.repair_policy.as_deref());
+    let prewarm_repair_mode = if prewarm_repair.source == "default" {
+        pi::extensions::RepairPolicyMode::AutoStrict
+    } else {
+        prewarm_repair.effective_mode
+    };
+    let prewarm_memory_limit_bytes =
+        (prewarm_policy.max_memory_mb as usize).saturating_mul(1024 * 1024);
+
+    // Pre-warm extension runtime in a background task so startup work can overlap
+    // with auth refresh, model selection, and session creation.
+    let extension_prewarm_handle = if resources.extensions().is_empty() || has_js_extensions {
+        if resources.extensions().is_empty() {
+            None
+        } else {
+            let pre_enabled_tools = cli.enabled_tools();
+            let pre_mgr = pi::extensions::ExtensionManager::new();
+            pre_mgr.set_cwd(cwd.display().to_string());
+
+            let pre_tools = Arc::new(ToolRegistry::new(&pre_enabled_tools, &cwd, Some(&config)));
+
+            let resolved_risk = config.resolve_extension_risk_with_metadata();
+            pre_mgr.set_runtime_risk_config(resolved_risk.settings);
+
+            let pre_mgr_for_runtime = pre_mgr.clone();
+            let pre_tools_for_runtime = Arc::clone(&pre_tools);
+            let prewarm_policy_for_runtime = prewarm_policy.clone();
+            let prewarm_cwd = cwd.display().to_string();
+            Some((
+                pre_mgr,
+                pre_tools,
+                runtime_handle.spawn(async move {
+                    let mut js_config = PiJsRuntimeConfig {
+                        cwd: prewarm_cwd,
+                        repair_mode: AgentSession::runtime_repair_mode_from_policy_mode(
+                            prewarm_repair_mode,
+                        ),
+                        ..PiJsRuntimeConfig::default()
+                    };
+                    js_config.limits.memory_limit_bytes =
+                        Some(prewarm_memory_limit_bytes).filter(|bytes| *bytes > 0);
+                    let runtime = JsExtensionRuntimeHandle::start_with_policy(
+                        js_config,
+                        pre_tools_for_runtime,
+                        pre_mgr_for_runtime,
+                        prewarm_policy_for_runtime,
+                    )
+                    .await
+                    .map(ExtensionRuntimeHandle::Js)
+                    .map_err(anyhow::Error::new)?;
+                    tracing::info!(
+                        event = "pi.extension_runtime.engine_decision",
+                        stage = "main_prewarm",
+                        requested = "quickjs",
+                        selected = "quickjs",
+                        fallback = false,
+                        "Extension runtime engine selected for prewarm (legacy JS/TS)"
+                    );
+                    Ok::<ExtensionRuntimeHandle, anyhow::Error>(runtime)
+                }),
+            ))
+        }
     } else {
         let pre_enabled_tools = cli.enabled_tools();
         let pre_mgr = pi::extensions::ExtensionManager::new();
         pre_mgr.set_cwd(cwd.display().to_string());
-
-        let _pre_ext_policy = config
-            .resolve_extension_policy_with_metadata(cli.extension_policy.as_deref())
-            .policy;
         let pre_tools = Arc::new(ToolRegistry::new(&pre_enabled_tools, &cwd, Some(&config)));
 
         let resolved_risk = config.resolve_extension_risk_with_metadata();
@@ -769,7 +1052,7 @@ async fn run(
                     requested = "native-rust",
                     selected = "native-rust",
                     fallback = false,
-                    "Extension runtime engine selected for prewarm (native-only)"
+                    "Extension runtime engine selected for prewarm (native-rust)"
                 );
                 Ok::<ExtensionRuntimeHandle, anyhow::Error>(runtime)
             }),
@@ -837,15 +1120,25 @@ async fn run(
             .unwrap_or(true),
     )?;
 
-    let is_interactive = !cli.print && cli.mode.is_none();
-    let mode = cli.mode.clone().unwrap_or_else(|| "text".to_string());
+    let is_interactive = !cli.print && cli.mode.is_none() && cli.export.is_none();
+    let mode = cli.mode.clone().unwrap_or_else(|| {
+        if is_interactive {
+            "interactive".to_string()
+        } else {
+            "text".to_string()
+        }
+    });
+    let is_print_mode = mode == "text" || mode == "json";
+    if is_print_mode {
+        cli.no_session = true;
+    }
 
     let scoped_patterns = if let Some(models_arg) = &cli.models {
         pi::app::parse_models_arg(models_arg)
     } else {
         config.enabled_models.clone().unwrap_or_default()
     };
-    let mut scoped_models = if scoped_patterns.is_empty() {
+    let scoped_models = if scoped_patterns.is_empty() {
         Vec::new()
     } else {
         pi::app::resolve_model_scope(&scoped_patterns, &model_registry, cli.api_key.is_some())
@@ -859,79 +1152,37 @@ async fn run(
         bail!("--api-key requires a model to be specified via --provider/--model or --models");
     }
 
-    let mut session = Box::pin(Session::new(&cli, &config)).await?;
+    let allow_setup_prompt =
+        is_interactive && io::stdin().is_terminal() && io::stdout().is_terminal();
+    let has_extensions = !resources.extensions().is_empty();
+    let session = Box::pin(Session::new(&cli, &config)).await?;
 
-    let (selection, resolved_key) = loop {
-        scoped_models = if scoped_patterns.is_empty() {
-            Vec::new()
-        } else {
-            pi::app::resolve_model_scope(&scoped_patterns, &model_registry, cli.api_key.is_some())
-        };
-
-        let selection = match pi::app::select_model_and_thinking(
-            &cli,
-            &config,
-            &session,
-            &model_registry,
-            &scoped_models,
-            &global_dir,
-        ) {
-            Ok(selection) => selection,
-            Err(err) => {
-                if let Some(startup) = err.downcast_ref::<StartupError>() {
-                    if is_interactive && io::stdin().is_terminal() && io::stdout().is_terminal() {
-                        if run_first_time_setup(startup, &mut auth, &mut cli, &models_path).await? {
-                            model_registry = ModelRegistry::load(&auth, Some(models_path.clone()));
-                            if let Some(error) = model_registry.error() {
-                                eprintln!("Warning: models.json error: {error}");
-                            }
-                            continue;
-                        }
-                        return Ok(());
-                    }
-                }
-                return Err(err);
-            }
-        };
-
-        match pi::app::resolve_api_key(&auth, &cli, &selection.model_entry) {
-            Ok(key) => {
-                break (selection, key);
-            }
-            Err(err) => {
-                if let Some(startup) = err.downcast_ref::<StartupError>() {
-                    if let StartupError::MissingApiKey { provider } = startup {
-                        let canonical_provider =
-                            pi::provider_metadata::canonical_provider_id(provider)
-                                .unwrap_or(provider.as_str());
-                        if canonical_provider == "sap-ai-core" {
-                            if let Some(token) = pi::auth::exchange_sap_access_token(&auth).await? {
-                                break (selection, token);
-                            }
-                        }
-                    }
-
-                    if is_interactive && io::stdin().is_terminal() && io::stdout().is_terminal() {
-                        if run_first_time_setup(startup, &mut auth, &mut cli, &models_path).await? {
-                            model_registry = ModelRegistry::load(&auth, Some(models_path.clone()));
-                            if let Some(error) = model_registry.error() {
-                                eprintln!("Warning: models.json error: {error}");
-                            }
-                            continue;
-                        }
-                        return Ok(());
-                    }
-                }
+    let (mut selection, mut resolved_key) = match resolve_selection_with_auth(
+        &mut cli,
+        &config,
+        &session,
+        &mut model_registry,
+        &scoped_patterns,
+        &mut auth,
+        &models_path,
+        allow_setup_prompt,
+        &[],
+    )
+    .await
+    {
+        Ok(Some(result)) => result,
+        Ok(None) => return Ok(()),
+        Err(err) => {
+            if should_retry_selection_after_extensions(&cli, &err, has_extensions) {
+                (
+                    build_extension_bootstrap_selection(&config, &model_registry, &models_path)?,
+                    None,
+                )
+            } else {
                 return Err(err);
             }
         }
     };
-
-    pi::app::update_session_for_selection(&mut session, &selection);
-
-    if let Some(message) = &selection.fallback_message {
-        eprintln!("Warning: {message}");
-    }
 
     let enabled_tools = cli.enabled_tools();
     let skills_prompt = if enabled_tools.contains(&"read") {
@@ -952,10 +1203,12 @@ async fn run(
         &global_dir,
         &package_dir,
         test_mode,
+        !cli.hide_cwd_in_prompt,
     );
     let provider =
         providers::create_provider(&selection.model_entry, None).map_err(anyhow::Error::new)?;
-    let stream_options = pi::app::build_stream_options(&config, resolved_key, &selection, &session);
+    let stream_options =
+        pi::app::build_stream_options(&config, resolved_key.clone(), &selection, &session);
     let agent_config = AgentConfig {
         system_prompt: Some(system_prompt),
         max_tool_iterations: 50,
@@ -965,40 +1218,20 @@ async fn run(
 
     let tools = ToolRegistry::new(&enabled_tools, &cwd, Some(&config));
     let session_arc = Arc::new(Mutex::new(session));
-    let context_window_tokens = if selection.model_entry.model.context_window == 0 {
-        tracing::warn!(
-            "Model {} reported context_window=0; falling back to default compaction window",
-            selection.model_entry.model.id
-        );
-        ResolvedCompactionSettings::default().context_window_tokens
-    } else {
-        selection.model_entry.model.context_window
-    };
     let compaction_settings = ResolvedCompactionSettings {
         enabled: config.compaction_enabled(),
         reserve_tokens: config.compaction_reserve_tokens(),
         keep_recent_tokens: config.compaction_keep_recent_tokens(),
-        context_window_tokens,
+        context_window_tokens: context_window_tokens_for_entry(&selection.model_entry),
     };
     let mut agent_session = AgentSession::new(
         Agent::new(provider, tools, agent_config),
         session_arc,
         !cli.no_session,
         compaction_settings,
-    );
-
-    let history = {
-        let cx = pi::agent_cx::AgentCx::for_request();
-        let session = agent_session
-            .session
-            .lock(cx.cx())
-            .await
-            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-        session.to_messages_for_current_path()
-    };
-    if !history.is_empty() {
-        agent_session.agent.replace_messages(history);
-    }
+    )
+    .with_runtime_handle(runtime_handle.clone());
+    let mut extension_model_entries = Vec::new();
 
     if !resources.extensions().is_empty() {
         // Await the pre-warmed extension runtime (spawned earlier to overlap with
@@ -1076,11 +1309,11 @@ async fn run(
 
         // Merge extension-registered providers into the model registry.
         if let Some(region) = &agent_session.extensions {
-            let ext_entries = region.manager().extension_model_entries();
-            if !ext_entries.is_empty() {
+            extension_model_entries = region.manager().extension_model_entries();
+            if !extension_model_entries.is_empty() {
                 // Build OAuth configs map from model entries before merging.
                 let ext_oauth_configs: std::collections::HashMap<String, pi::models::OAuthConfig> =
-                    ext_entries
+                    extension_model_entries
                         .iter()
                         .filter_map(|entry| {
                             entry
@@ -1090,7 +1323,7 @@ async fn run(
                         })
                         .collect();
 
-                model_registry.merge_entries(ext_entries);
+                model_registry.merge_entries(extension_model_entries.clone());
 
                 // Refresh expired OAuth tokens for extension-registered providers.
                 if !ext_oauth_configs.is_empty() {
@@ -1120,8 +1353,86 @@ async fn run(
         .into());
     }
 
+    if has_extensions {
+        let session_snapshot = {
+            let cx = pi::agent_cx::AgentCx::for_request();
+            let session = agent_session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            session.clone()
+        };
+
+        let final_selection = resolve_selection_with_auth(
+            &mut cli,
+            &config,
+            &session_snapshot,
+            &mut model_registry,
+            &scoped_patterns,
+            &mut auth,
+            &models_path,
+            allow_setup_prompt,
+            &extension_model_entries,
+        )
+        .await?;
+        let Some((updated_selection, updated_key)) = final_selection else {
+            return Ok(());
+        };
+
+        selection = updated_selection;
+        resolved_key = updated_key;
+
+        let provider = providers::create_provider(
+            &selection.model_entry,
+            agent_session
+                .extensions
+                .as_ref()
+                .map(ExtensionRegion::manager),
+        )
+        .map_err(anyhow::Error::new)?;
+        agent_session.agent.set_provider(provider);
+        {
+            let stream_options = agent_session.agent.stream_options_mut();
+            stream_options.api_key.clone_from(&resolved_key);
+            stream_options
+                .headers
+                .clone_from(&selection.model_entry.headers);
+            stream_options.thinking_level = Some(selection.thinking_level);
+        }
+        agent_session
+            .set_compaction_context_window(context_window_tokens_for_entry(&selection.model_entry));
+    }
+
+    {
+        let cx = pi::agent_cx::AgentCx::for_request();
+        let mut session = agent_session
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        pi::app::update_session_for_selection(&mut session, &selection);
+    }
+
+    if let Some(message) = &selection.fallback_message {
+        eprintln!("Warning: {message}");
+    }
+
     agent_session.set_model_registry(model_registry.clone());
     agent_session.set_auth_storage(auth.clone());
+
+    let history = {
+        let cx = pi::agent_cx::AgentCx::for_request();
+        let session = agent_session
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        session.to_messages_for_current_path()
+    };
+    if !history.is_empty() {
+        agent_session.agent.replace_messages(history);
+    }
 
     // Clone session handle for shutdown flush (ensures autosave queue is drained).
     let session_handle = Arc::clone(&agent_session.session);
@@ -1170,7 +1481,7 @@ async fn run(
         )
         .await
     } else {
-        run_print_mode(
+        let result = run_print_mode(
             &mut agent_session,
             &mode,
             initial,
@@ -1179,14 +1490,24 @@ async fn run(
             runtime_handle.clone(),
             &config,
         )
-        .await
+        .await;
+        // Explicitly shut down extension runtimes before the session drops.
+        // Without this, ExtensionRegion::drop() runs synchronously and cannot
+        // coordinate with the QuickJS runtime thread, causing a GC assertion
+        // failure (non-empty gc_obj_list) when 2+ JS extensions are loaded.
+        if let Some(ref ext) = agent_session.extensions {
+            ext.shutdown().await;
+        }
+        result
     };
 
     // Best-effort autosave flush on shutdown.
-    let cx = pi::agent_cx::AgentCx::for_request();
-    if let Ok(mut guard) = session_handle.lock(cx.cx()).await {
-        if let Err(e) = guard.flush_autosave_on_shutdown().await {
-            eprintln!("Warning: Failed to flush session autosave: {e}");
+    if !cli.no_session {
+        let cx = pi::agent_cx::AgentCx::for_request();
+        if let Ok(mut guard) = session_handle.lock(cx.cx()).await {
+            if let Err(e) = guard.flush_autosave_on_shutdown().await {
+                eprintln!("Warning: Failed to flush session autosave: {e}");
+            }
         }
     }
 
@@ -1252,12 +1573,17 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
 fn spawn_session_index_maintenance() {
     const MAX_INDEX_AGE: Duration = Duration::from_secs(60 * 30);
     let index = SessionIndex::new();
-    if !index.should_reindex(MAX_INDEX_AGE) {
-        return;
-    }
+
+    // Always spawn the background thread to handle cleanup, regardless of reindexing needs.
+    // Cleanup can be slow if there are many temp files, so we don't want to block main.
     std::thread::spawn(move || {
-        if let Err(err) = index.reindex_all() {
-            eprintln!("Warning: failed to reindex session index: {err}");
+        // Clean up old bash tool logs in background
+        pi::tools::cleanup_temp_files();
+
+        if index.should_reindex(MAX_INDEX_AGE) {
+            if let Err(err) = index.reindex_all() {
+                eprintln!("Warning: failed to reindex session index: {err}");
+            }
         }
     });
 }
@@ -1318,8 +1644,16 @@ async fn handle_package_update(manager: &PackageManager, source: Option<String>)
         return Ok(());
     }
 
+    let mut failed = 0;
     for entry in entries {
-        manager.update_source(&entry.source, entry.scope).await?;
+        if let Err(e) = manager.update_source(&entry.source, entry.scope).await {
+            eprintln!("Failed to update {}: {}", entry.source, e);
+            failed += 1;
+        }
+    }
+
+    if failed > 0 {
+        bail!("Failed to update {failed} packages");
     }
     println!("Updated packages");
     Ok(())
@@ -1505,7 +1839,11 @@ fn collect_search_hits(
     limit: usize,
     query: &str,
 ) -> Vec<pi::extension_index::ExtensionSearchHit> {
-    let mut hits = index.search(query, limit);
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut hits = index.search(query, index.entries.len());
 
     // Filter by tag if requested
     if let Some(tag_filter) = tag {
@@ -1528,6 +1866,7 @@ fn collect_search_hits(
         });
     }
 
+    hits.truncate(limit);
     hits
 }
 
@@ -1610,35 +1949,57 @@ async fn handle_info(name: &str) -> Result<()> {
 
 fn handle_info_blocking(name: &str) -> Result<()> {
     let index = ExtensionIndexStore::default_store().load_or_seed()?;
-    let entry = find_index_entry_by_name_or_id(&index, name);
-    let Some(entry) = entry else {
-        println!("Extension \"{name}\" not found.");
-        println!("Try: pi search {name}");
-        return Ok(());
-    };
-    print_extension_info(entry);
+    match find_index_entry_by_name_or_id(&index, name) {
+        ExtensionInfoLookup::Found(entry) => print_extension_info(entry),
+        ExtensionInfoLookup::Ambiguous => {
+            println!("Extension query \"{name}\" is ambiguous.");
+            println!("Try: pi search {name}");
+        }
+        ExtensionInfoLookup::NotFound => {
+            println!("Extension \"{name}\" not found.");
+            println!("Try: pi search {name}");
+        }
+    }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ExtensionInfoLookup<'a> {
+    Found(&'a pi::extension_index::ExtensionIndexEntry),
+    NotFound,
+    Ambiguous,
 }
 
 fn find_index_entry_by_name_or_id<'a>(
     index: &'a pi::extension_index::ExtensionIndex,
     name: &str,
-) -> Option<&'a pi::extension_index::ExtensionIndexEntry> {
-    // Look up by exact id, name, or fuzzy match (top-1 search hit)
-    index
+) -> ExtensionInfoLookup<'a> {
+    // Look up by exact id, name, or fuzzy match when there is a single best hit.
+    if let Some(entry) = index
         .entries
         .iter()
         .find(|e| e.id.eq_ignore_ascii_case(name) || e.name.eq_ignore_ascii_case(name))
-        .or_else(|| {
-            let hits = index.search(name, 1);
-            hits.into_iter()
-                .next()
-                .map(|h| h.entry)
-                .and_then(|matched| {
-                    // Return a reference from the index, not the owned clone
-                    index.entries.iter().find(|e| e.id == matched.id)
-                })
-        })
+    {
+        return ExtensionInfoLookup::Found(entry);
+    }
+
+    let hits = index.search(name, 2);
+    let Some(best_hit) = hits.first() else {
+        return ExtensionInfoLookup::NotFound;
+    };
+
+    if hits
+        .get(1)
+        .is_some_and(|next_hit| next_hit.score == best_hit.score)
+    {
+        return ExtensionInfoLookup::Ambiguous;
+    }
+
+    index
+        .entries
+        .iter()
+        .find(|entry| entry.id == best_hit.entry.id)
+        .map_or(ExtensionInfoLookup::NotFound, ExtensionInfoLookup::Found)
 }
 
 fn print_extension_info(entry: &pi::extension_index::ExtensionIndexEntry) {
@@ -2160,11 +2521,13 @@ fn sort_and_dedupe_package_resources(packages: &mut [ConfigPackageState]) {
     }
 }
 
-async fn collect_config_packages(manager: &PackageManager) -> Vec<ConfigPackageState> {
+fn collect_config_packages_from_entries(
+    entries: Vec<PackageEntry>,
+    resolved_paths: Option<ResolvedPaths>,
+) -> Vec<ConfigPackageState> {
     let mut packages = Vec::new();
     let mut lookup = std::collections::HashMap::<String, usize>::new();
 
-    let entries = manager.list_packages().await.unwrap_or_default();
     for entry in entries {
         let Some(scope) = settings_scope_from_package_scope(entry.scope) else {
             continue;
@@ -2181,57 +2544,89 @@ async fn collect_config_packages(manager: &PackageManager) -> Vec<ConfigPackageS
         });
     }
 
-    match manager.resolve().await {
-        Ok(ResolvedPaths {
-            extensions,
-            skills,
-            prompts,
-            themes,
-        }) => {
-            merge_resolved_resources(
-                ConfigResourceKind::Extensions,
-                &extensions,
-                &mut packages,
-                &mut lookup,
-            );
-            merge_resolved_resources(
-                ConfigResourceKind::Skills,
-                &skills,
-                &mut packages,
-                &mut lookup,
-            );
-            merge_resolved_resources(
-                ConfigResourceKind::Prompts,
-                &prompts,
-                &mut packages,
-                &mut lookup,
-            );
-            merge_resolved_resources(
-                ConfigResourceKind::Themes,
-                &themes,
-                &mut packages,
-                &mut lookup,
-            );
-        }
-        Err(err) => {
-            eprintln!("Warning: failed to resolve package resources for config UI: {err}");
-        }
+    if let Some(ResolvedPaths {
+        extensions,
+        skills,
+        prompts,
+        themes,
+    }) = resolved_paths
+    {
+        merge_resolved_resources(
+            ConfigResourceKind::Extensions,
+            &extensions,
+            &mut packages,
+            &mut lookup,
+        );
+        merge_resolved_resources(
+            ConfigResourceKind::Skills,
+            &skills,
+            &mut packages,
+            &mut lookup,
+        );
+        merge_resolved_resources(
+            ConfigResourceKind::Prompts,
+            &prompts,
+            &mut packages,
+            &mut lookup,
+        );
+        merge_resolved_resources(
+            ConfigResourceKind::Themes,
+            &themes,
+            &mut packages,
+            &mut lookup,
+        );
     }
 
     sort_and_dedupe_package_resources(&mut packages);
     packages
 }
 
+async fn collect_config_packages(manager: &PackageManager) -> Result<Vec<ConfigPackageState>> {
+    let entries = manager.list_packages().await?;
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let resolved_paths = match manager.resolve().await {
+        Ok(paths) => Some(paths),
+        Err(err) => {
+            eprintln!("Warning: failed to resolve package resources for config UI: {err}");
+            None
+        }
+    };
+
+    Ok(collect_config_packages_from_entries(
+        entries,
+        resolved_paths,
+    ))
+}
+
+fn collect_config_packages_blocking(
+    manager: &PackageManager,
+    entries: Vec<PackageEntry>,
+) -> Result<Option<Vec<ConfigPackageState>>> {
+    let Some(resolved_paths) = manager.resolve_package_resources_blocking()? else {
+        return Ok(None);
+    };
+    Ok(Some(collect_config_packages_from_entries(
+        entries,
+        Some(resolved_paths),
+    )))
+}
+
 fn build_config_report(cwd: &Path, packages: &[ConfigPackageState]) -> ConfigReport {
-    let config_path = std::env::var("PI_CONFIG_PATH")
-        .ok()
-        .map_or_else(|| Config::global_dir().join("settings.json"), PathBuf::from);
+    let global_dir = Config::global_dir();
+    let config_override_path = Config::config_path_override_from_env(cwd);
+    let config_path = config_override_path
+        .clone()
+        .unwrap_or_else(|| global_dir.join("settings.json"));
     let project_path = cwd.join(Config::project_dir()).join("settings.json");
 
-    let (config_valid, config_error) = match Config::load() {
-        Ok(_) => (true, None),
-        Err(err) => (false, Some(err.to_string())),
-    };
+    let (config_valid, config_error) =
+        match Config::load_with_roots(config_override_path.as_deref(), &global_dir, cwd) {
+            Ok(_) => (true, None),
+            Err(err) => (false, Some(err.to_string())),
+        };
 
     let packages = packages
         .iter()
@@ -2319,6 +2714,22 @@ fn print_config_report(report: &ConfigReport, include_packages: bool) {
     }
 }
 
+fn handle_config_paths_fast(cwd: &Path) {
+    let report = build_config_report(cwd, &[]);
+    print_config_report(&report, false);
+}
+
+fn handle_config_show_fast(cwd: &Path) {
+    let report = build_config_report(cwd, &[]);
+    print_config_report(&report, true);
+}
+
+fn handle_config_json_fast(cwd: &Path) -> Result<()> {
+    let report = build_config_report(cwd, &[]);
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
 fn format_settings_summary(config: &Config) -> String {
     let provider = config.default_provider.as_deref().unwrap_or("(default)");
     let model = config.default_model.as_deref().unwrap_or("(default)");
@@ -2327,6 +2738,25 @@ fn format_settings_summary(config: &Config) -> String {
         .as_deref()
         .unwrap_or("(default)");
     format!("provider={provider}  model={model}  thinking={thinking}")
+}
+
+fn interactive_config_settings_summary_with_roots(
+    cwd: &Path,
+    global_dir: &Path,
+    config_override_path: Option<&Path>,
+) -> Result<String> {
+    let config = Config::load_with_roots(config_override_path, global_dir, cwd)?;
+    Ok(format_settings_summary(&config))
+}
+
+fn interactive_config_settings_summary(cwd: &Path) -> Result<String> {
+    let global_dir = Config::global_dir();
+    let config_override_path = Config::config_path_override_from_env(cwd);
+    interactive_config_settings_summary_with_roots(
+        cwd,
+        &global_dir,
+        config_override_path.as_deref(),
+    )
 }
 
 fn run_config_tui(
@@ -2513,7 +2943,13 @@ async fn handle_config(
         bail!("`pi config --json` cannot be combined with --show/--paths");
     }
 
-    let packages = collect_config_packages(manager).await;
+    let interactive_requested = !show && !paths;
+    let need_packages = show || json_output || interactive_requested;
+    let packages = if need_packages {
+        collect_config_packages(manager).await?
+    } else {
+        Vec::new()
+    };
     let report = build_config_report(cwd, &packages);
 
     if json_output {
@@ -2521,12 +2957,10 @@ async fn handle_config(
         return Ok(());
     }
 
-    let interactive_requested = !show && !paths;
     let has_tty = io::stdin().is_terminal() && io::stdout().is_terminal();
 
     if interactive_requested && has_tty {
-        let config = Config::load().unwrap_or_default();
-        let settings_summary = format_settings_summary(&config);
+        let settings_summary = interactive_config_settings_summary(cwd)?;
         if let Some(updated) = run_config_tui(packages, settings_summary)? {
             persist_package_toggles(cwd, &updated)?;
             println!("Saved package resource toggles.");
@@ -2706,7 +3140,7 @@ fn print_version() {
 }
 
 fn list_models(registry: &ModelRegistry, pattern: Option<&str>) {
-    let mut models = registry.get_available();
+    let mut models = registry.available_models();
     if models.is_empty() {
         println!("No models available. Set API keys in environment variables.");
         return;
@@ -2733,6 +3167,129 @@ fn list_models(registry: &ModelRegistry, pattern: Option<&str>) {
     print_model_table(&rows);
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedModelRow {
+    provider: String,
+    model: String,
+    context: String,
+    max_out: String,
+    thinking: String,
+    images: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ListModelsCachePayload {
+    error: Option<String>,
+    rows: Vec<CachedModelRow>,
+}
+
+fn list_models_from_cached_rows(rows: &[CachedModelRow], pattern: Option<&str>) {
+    if rows.is_empty() {
+        println!("No models available. Set API keys in environment variables.");
+        return;
+    }
+
+    if let Some(pattern) = pattern {
+        let filtered = rows
+            .iter()
+            .filter(|row| fuzzy_match_model_id(pattern, &row.provider, &row.model))
+            .collect::<Vec<_>>();
+        if filtered.is_empty() {
+            println!("No models matching \"{pattern}\"");
+            return;
+        }
+        print_model_table(&filtered);
+    } else {
+        print_model_table(rows);
+    }
+}
+
+fn should_fingerprint_model_env_var(key: &str) -> bool {
+    if key.ends_with("_API_KEY") || key.ends_with("_TOKEN") || key.ends_with("_KEY") {
+        return true;
+    }
+    PROVIDER_METADATA
+        .iter()
+        .any(|meta| meta.auth_env_keys.contains(&key))
+}
+
+fn append_file_fingerprint(hasher: &mut Sha256, path: &Path) {
+    hasher.update(path.to_string_lossy().as_bytes());
+    match fs::metadata(path) {
+        Ok(meta) => {
+            hasher.update([1]);
+            hasher.update(meta.len().to_le_bytes());
+            if let Ok(modified) = meta.modified() {
+                if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
+                    hasher.update(duration.as_secs().to_le_bytes());
+                    hasher.update(duration.subsec_nanos().to_le_bytes());
+                }
+            }
+        }
+        Err(_) => hasher.update([0]),
+    }
+}
+
+fn list_models_cache_path(models_path: &Path) -> Option<PathBuf> {
+    let mut hasher = Sha256::new();
+    hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+    hasher.update(pi::models::model_catalog_cache_fingerprint().to_le_bytes());
+    append_file_fingerprint(&mut hasher, &Config::auth_path());
+    append_file_fingerprint(&mut hasher, models_path);
+
+    let mut env_vars = std::env::vars()
+        .filter(|(key, _)| should_fingerprint_model_env_var(key))
+        .collect::<Vec<_>>();
+    env_vars.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    for (key, value) in env_vars {
+        hasher.update(key.as_bytes());
+        hasher.update([0xff]);
+        hasher.update(value.as_bytes());
+        hasher.update([0x00]);
+    }
+
+    let key = format!("{:x}", hasher.finalize());
+    dirs::cache_dir().map(|dir| {
+        dir.join("pi")
+            .join("list-models-cache")
+            .join(format!("{key}.json"))
+    })
+}
+
+fn load_list_models_cache(models_path: &Path) -> Option<ListModelsCachePayload> {
+    let cache_path = list_models_cache_path(models_path)?;
+    let body = fs::read_to_string(cache_path).ok()?;
+    serde_json::from_str::<ListModelsCachePayload>(&body).ok()
+}
+
+fn save_list_models_cache(models_path: &Path, payload: &ListModelsCachePayload) {
+    let Some(cache_path) = list_models_cache_path(models_path) else {
+        return;
+    };
+    let Some(parent) = cache_path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+
+    let temp_path = cache_path.with_extension(format!("tmp-{}", std::process::id()));
+    let Ok(file) = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&temp_path)
+    else {
+        return;
+    };
+    let mut writer = io::BufWriter::new(file);
+    if serde_json::to_writer(&mut writer, payload).is_ok() && writer.flush().is_ok() {
+        let _ = fs::rename(&temp_path, cache_path);
+    } else {
+        let _ = fs::remove_file(&temp_path);
+    }
+}
+
 fn list_providers() {
     let mut rows: Vec<(&str, &str, String, String, &str)> = PROVIDER_METADATA
         .iter()
@@ -2756,11 +3313,16 @@ fn list_providers() {
     let env_w = rows.iter().map(|r| r.3.len()).max().unwrap_or(0).max(8);
     let api_w = rows.iter().map(|r| r.4.len()).max().unwrap_or(0).max(3);
 
-    println!(
+    // Buffer all output to reduce write syscalls from O(rows) to O(1).
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    let _ = writeln!(
+        out,
         "{:<id_w$}  {:<name_w$}  {:<alias_w$}  {:<env_w$}  {:<api_w$}",
         "provider", "name", "aliases", "auth env", "api",
     );
-    println!(
+    let _ = writeln!(
+        out,
         "{:<id_w$}  {:<name_w$}  {:<alias_w$}  {:<env_w$}  {:<api_w$}",
         "-".repeat(id_w),
         "-".repeat(name_w),
@@ -2769,108 +3331,168 @@ fn list_providers() {
         "-".repeat(api_w),
     );
     for (id, name, aliases, env_keys, api) in &rows {
-        println!(
+        let _ = writeln!(
+            out,
             "{id:<id_w$}  {name:<name_w$}  {aliases:<alias_w$}  {env_keys:<env_w$}  {api:<api_w$}"
         );
     }
-    println!("\n{} providers available.", rows.len());
+    let _ = writeln!(out, "\n{} providers available.", rows.len());
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetupCredentialKind {
+    ApiKey,
+    OAuthPkce,
+    OAuthDeviceFlow,
 }
 
 #[derive(Clone, Copy)]
 struct ProviderChoice {
-    id: &'static str,
+    provider: &'static str,
     label: &'static str,
+    kind: SetupCredentialKind,
     env: &'static str,
 }
 
-const PROVIDER_CHOICES: [ProviderChoice; 10] = [
+const PROVIDER_CHOICES: &[ProviderChoice] = &[
     ProviderChoice {
-        id: "anthropic",
-        label: "Anthropic (Claude)",
-        env: "ANTHROPIC_API_KEY",
+        provider: "openai-codex",
+        label: "OpenAI Codex (ChatGPT)",
+        kind: SetupCredentialKind::OAuthPkce,
+        env: "",
     },
     ProviderChoice {
-        id: "openai",
+        provider: "openai",
         label: "OpenAI",
+        kind: SetupCredentialKind::ApiKey,
         env: "OPENAI_API_KEY",
     },
     ProviderChoice {
-        id: "google",
+        provider: "anthropic",
+        label: "Anthropic (Claude Code)",
+        kind: SetupCredentialKind::OAuthPkce,
+        env: "",
+    },
+    ProviderChoice {
+        provider: "anthropic",
+        label: "Anthropic (Claude API key)",
+        kind: SetupCredentialKind::ApiKey,
+        env: "ANTHROPIC_API_KEY",
+    },
+    ProviderChoice {
+        provider: "kimi-for-coding",
+        label: "Kimi for Coding",
+        kind: SetupCredentialKind::OAuthDeviceFlow,
+        env: "KIMI_API_KEY",
+    },
+    ProviderChoice {
+        provider: "google-gemini-cli",
+        label: "Google Cloud Code Assist",
+        kind: SetupCredentialKind::OAuthPkce,
+        env: "",
+    },
+    ProviderChoice {
+        provider: "google",
         label: "Google Gemini",
+        kind: SetupCredentialKind::ApiKey,
         env: "GOOGLE_API_KEY",
     },
     ProviderChoice {
-        id: "azure-openai",
+        provider: "google-antigravity",
+        label: "Google Antigravity",
+        kind: SetupCredentialKind::OAuthPkce,
+        env: "",
+    },
+    ProviderChoice {
+        provider: "azure-openai",
         label: "Azure OpenAI",
+        kind: SetupCredentialKind::ApiKey,
         env: "AZURE_OPENAI_API_KEY",
     },
     ProviderChoice {
-        id: "amazon-bedrock",
-        label: "Amazon Bedrock",
-        env: "AWS_ACCESS_KEY_ID",
-    },
-    ProviderChoice {
-        id: "groq",
-        label: "Groq",
-        env: "GROQ_API_KEY",
-    },
-    ProviderChoice {
-        id: "openrouter",
+        provider: "openrouter",
         label: "OpenRouter",
+        kind: SetupCredentialKind::ApiKey,
         env: "OPENROUTER_API_KEY",
-    },
-    ProviderChoice {
-        id: "mistral",
-        label: "Mistral AI",
-        env: "MISTRAL_API_KEY",
-    },
-    ProviderChoice {
-        id: "togetherai",
-        label: "Together AI",
-        env: "TOGETHER_API_KEY",
-    },
-    ProviderChoice {
-        id: "google-vertex",
-        label: "Google Vertex AI",
-        env: "GOOGLE_APPLICATION_CREDENTIALS",
     },
 ];
 
-fn provider_from_token(token: &str) -> Option<ProviderChoice> {
-    let normalized = token.trim().to_lowercase();
+fn provider_choice_default_for_provider(provider: &str) -> Option<ProviderChoice> {
+    let canonical = provider_metadata::canonical_provider_id(provider).unwrap_or(provider);
+    PROVIDER_CHOICES
+        .iter()
+        .copied()
+        .find(|choice| choice.provider.eq_ignore_ascii_case(canonical))
+}
 
-    // Try numbered choice first (1-10)
-    if let Ok(num) = normalized.parse::<usize>() {
+fn provider_choice_from_token(token: &str) -> Option<ProviderChoice> {
+    let raw = token.trim();
+    let normalized = raw.to_ascii_lowercase();
+    let (first, rest) = normalized
+        .split_once(char::is_whitespace)
+        .map_or((normalized.as_str(), ""), |(a, b)| (a, b.trim()));
+    let wants_oauth = rest.contains("oauth");
+    let wants_key = rest.contains("key") || rest.contains("api");
+
+    let select_choice_for_provider = |provider: &str| -> Option<ProviderChoice> {
+        let canonical = provider_metadata::canonical_provider_id(provider).unwrap_or(provider);
+
+        if (wants_oauth || wants_key)
+            && let Some(found) = PROVIDER_CHOICES.iter().copied().find(|choice| {
+                choice.provider.eq_ignore_ascii_case(canonical)
+                    && ((wants_oauth
+                        && matches!(
+                            choice.kind,
+                            SetupCredentialKind::OAuthPkce | SetupCredentialKind::OAuthDeviceFlow
+                        ))
+                        || (wants_key && choice.kind == SetupCredentialKind::ApiKey))
+            })
+        {
+            return Some(found);
+        }
+
+        provider_choice_default_for_provider(canonical)
+    };
+
+    // Try numbered choice first (1-N).
+    if let Ok(num) = first.parse::<usize>() {
         if num >= 1 && num <= PROVIDER_CHOICES.len() {
             return Some(PROVIDER_CHOICES[num - 1]);
         }
         return None;
     }
 
-    // Try exact match against listed providers (including common nicknames)
-    for choice in &PROVIDER_CHOICES {
-        if normalized == choice.id || normalized == choice.label.to_lowercase() {
+    // Try exact match against listed labels.
+    for choice in PROVIDER_CHOICES {
+        if normalized == choice.label.to_ascii_lowercase() {
             return Some(*choice);
         }
     }
+    if let Some(found) = select_choice_for_provider(first) {
+        return Some(found);
+    }
 
-    // Common nicknames that map to listed providers
-    match normalized.as_str() {
-        "claude" => return Some(PROVIDER_CHOICES[0]),
-        "gpt" | "chatgpt" => return Some(PROVIDER_CHOICES[1]),
-        "gemini" => return Some(PROVIDER_CHOICES[2]),
-        "azure" => return Some(PROVIDER_CHOICES[3]),
-        "bedrock" | "aws" => return Some(PROVIDER_CHOICES[4]),
-        "together" => return Some(PROVIDER_CHOICES[8]),
-        "vertex" | "vertexai" => return Some(PROVIDER_CHOICES[9]),
+    // Common nicknames.
+    match first {
+        "codex" | "chatgpt" | "gpt" => return select_choice_for_provider("openai-codex"),
+        "claude" => return select_choice_for_provider("anthropic"),
+        "gemini" => return select_choice_for_provider("google"),
+        "kimi" => return select_choice_for_provider("kimi-for-coding"),
         _ => {}
     }
 
-    // Fall back to provider_metadata registry for any canonical ID or alias
-    let meta = provider_metadata::provider_metadata(&normalized)?;
+    // Fall back to provider_metadata registry for any canonical ID or alias.
+    let meta = provider_metadata::provider_metadata(first)?;
+    let canonical = meta.canonical_id;
+    if let Some(found) = select_choice_for_provider(canonical) {
+        return Some(found);
+    }
+
+    // Otherwise, fall back to API-key style with whatever env var hint we have.
     Some(ProviderChoice {
-        id: meta.canonical_id,
-        label: meta.canonical_id,
+        provider: canonical,
+        label: canonical,
+        kind: SetupCredentialKind::ApiKey,
         env: meta.auth_env_keys.first().copied().unwrap_or(""),
     })
 }
@@ -2887,30 +3509,44 @@ async fn run_first_time_setup(
     console.render_rule(Some("Welcome to Pi"));
     match startup_error {
         StartupError::NoModelsAvailable { .. } => {
-            console.print_markup("[bold]No models are configured yet.[/]\n");
+            console.print_markup("[bold]No authenticated models are available yet.[/]\n");
         }
         StartupError::MissingApiKey { provider } => {
             console.print_markup(&format!(
-                "[bold]Missing API key for provider:[/] {provider}\n"
+                "[bold]Missing credentials for provider:[/] {provider}\n"
             ));
         }
     }
-    console.print_markup("Let’s add your first API key.\n\n");
+    console.print_markup("Let’s authenticate.\n\n");
 
     let provider_hint = match startup_error {
-        StartupError::MissingApiKey { provider } => provider_from_token(provider),
-        StartupError::NoModelsAvailable { .. } => None,
-    };
+        StartupError::MissingApiKey { provider } => provider_choice_from_token(provider),
+        StartupError::NoModelsAvailable { .. } => {
+            provider_choice_default_for_provider("openai-codex")
+        }
+    }
+    .or_else(|| Some(PROVIDER_CHOICES[0]));
 
     console.print_markup("[bold]Choose a provider:[/]\n");
     for (idx, provider) in PROVIDER_CHOICES.iter().enumerate() {
-        let is_default = provider_hint.is_some_and(|hint| hint.id == provider.id);
+        let is_default = provider_hint
+            .is_some_and(|hint| hint.provider == provider.provider && hint.kind == provider.kind);
         let default_marker = if is_default { " [dim](default)[/]" } else { "" };
+        let method = match provider.kind {
+            SetupCredentialKind::ApiKey => "API key",
+            SetupCredentialKind::OAuthPkce => "OAuth",
+            SetupCredentialKind::OAuthDeviceFlow => "OAuth (device flow)",
+        };
+        let hint = if provider.env.trim().is_empty() {
+            method.to_string()
+        } else {
+            format!("{method}  {}", provider.env)
+        };
         console.print_markup(&format!(
             "  [cyan]{})[/] {}  [dim]{}[/]{}\n",
             idx + 1,
             provider.label,
-            provider.env,
+            hint,
             default_marker
         ));
     }
@@ -2962,59 +3598,268 @@ async fn run_first_time_setup(
             console.render_warning("Setup cancelled.");
             return Ok(false);
         }
-        if let Some(provider) = provider_from_token(&normalized) {
+        if let Some(provider) = provider_choice_from_token(&normalized) {
             break provider;
         }
         console.render_warning("Unrecognized choice. Please try again.");
     };
 
-    console.print_markup("Paste your API key (input will be visible):\n");
-    let Some(raw_key) = prompt_line("API key: ")? else {
-        console.render_warning("Setup cancelled (no input).");
-        return Ok(false);
-    };
-    let key = raw_key.trim();
-    if key.is_empty() {
-        console.render_warning("No API key entered. Setup cancelled.");
-        return Ok(false);
-    }
+    let credential = match provider.kind {
+        SetupCredentialKind::ApiKey => {
+            console.print_markup("Paste your API key (input will be visible):\n");
+            let Some(raw_key) = prompt_line("API key: ")? else {
+                console.render_warning("Setup cancelled (no input).");
+                return Ok(false);
+            };
+            let key = raw_key.trim();
+            if key.is_empty() {
+                console.render_warning("No API key entered. Setup cancelled.");
+                return Ok(false);
+            }
 
-    auth.set(
-        provider.id,
-        AuthCredential::ApiKey {
-            key: key.to_string(),
-        },
-    );
+            AuthCredential::ApiKey {
+                key: key.to_string(),
+            }
+        }
+        SetupCredentialKind::OAuthPkce => {
+            let start = match provider.provider {
+                "openai-codex" => pi::auth::start_openai_codex_oauth()?,
+                "anthropic" => pi::auth::start_anthropic_oauth()?,
+                "google-gemini-cli" => pi::auth::start_google_gemini_cli_oauth()?,
+                "google-antigravity" => pi::auth::start_google_antigravity_oauth()?,
+                _ => {
+                    console.render_warning(&format!(
+                        "OAuth login is not supported for {} in this setup flow. Start Pi and run /login {} instead.",
+                        provider.provider, provider.provider
+                    ));
+                    return Ok(false);
+                }
+            };
+
+            if start.provider == "anthropic" {
+                console.render_warning(
+                    "Anthropic OAuth (Claude Code consumer account) is no longer recommended.\n\
+Using consumer OAuth tokens outside the official client may violate Anthropic's consumer Terms of Service and can\n\
+result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_API_KEY) instead.",
+                );
+            }
+
+            // Use the pre-bound callback server when the provider already
+            // created one (e.g. Copilot/GitLab with random port).  Otherwise
+            // start a new one for localhost redirect URIs (issue #22).
+            let callback_server = start.callback_server.or_else(|| {
+                start
+                    .redirect_uri
+                    .as_deref()
+                    .filter(|uri| pi::auth::redirect_uri_needs_callback_server(uri))
+                    .and_then(|uri| match pi::auth::start_oauth_callback_server(uri) {
+                        Ok(server) => {
+                            tracing::info!(port = server.port, "OAuth callback server listening");
+                            Some(server)
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to start OAuth callback server: {e}");
+                            None
+                        }
+                    })
+            });
+
+            let has_callback = callback_server.is_some();
+            if has_callback {
+                console.print_markup(&format!(
+                    "[bold]OAuth login:[/] {}\n\n\
+                     Open this URL:\n{}\n\n\
+                     Listening for callback on port {}...\n\
+                     Complete authorization in your browser — Pi will continue automatically.\n\
+                     (Or paste the callback URL / authorization code manually.)\n",
+                    start.provider,
+                    start.url,
+                    callback_server.as_ref().unwrap().port,
+                ));
+            } else {
+                console.print_markup(&format!(
+                    "[bold]OAuth login:[/] {}\n\nOpen this URL:\n{}\n\n{}\n",
+                    start.provider,
+                    start.url,
+                    start.instructions.as_deref().unwrap_or_default()
+                ));
+            }
+
+            // Race between the callback server (browser redirect) and manual paste.
+            let code_input = if let Some(server) = callback_server {
+                // Use a background thread to wait for the callback so we can
+                // also accept manual paste from stdin.
+                let (manual_tx, manual_rx) = std::sync::mpsc::channel::<String>();
+                let prompt_thread = std::thread::spawn(move || {
+                    if let Ok(Some(line)) =
+                        prompt_line("Paste callback URL or code (or wait for browser): ")
+                    {
+                        let _ = manual_tx.send(line);
+                    }
+                });
+
+                // Wait for whichever source delivers first.
+                let code = loop {
+                    // Check callback server (non-blocking).
+                    if let Ok(path) = server.rx.try_recv() {
+                        // Convert "/auth/callback?code=abc&state=xyz" to a full
+                        // URL that parse_oauth_code_input can handle.
+                        let full_url = format!("http://localhost{path}");
+                        break full_url;
+                    }
+                    // Check manual input (non-blocking).
+                    if let Ok(line) = manual_rx.try_recv() {
+                        break line;
+                    }
+                    asupersync::time::sleep(
+                        asupersync::time::wall_now(),
+                        std::time::Duration::from_millis(50),
+                    )
+                    .await;
+                };
+
+                // Don't wait for the prompt thread — it will exit on its own
+                // or when stdin closes.
+                drop(prompt_thread);
+                code
+            } else {
+                let Some(line) = prompt_line("Paste callback URL or code: ")? else {
+                    console.render_warning("Setup cancelled (no input).");
+                    return Ok(false);
+                };
+                line
+            };
+
+            let code_input = code_input.trim();
+            if code_input.is_empty() {
+                console.render_warning("No authorization code provided. Setup cancelled.");
+                return Ok(false);
+            }
+
+            match start.provider.as_str() {
+                "openai-codex" => {
+                    pi::auth::complete_openai_codex_oauth(code_input, &start.verifier).await?
+                }
+                "anthropic" => {
+                    pi::auth::complete_anthropic_oauth(code_input, &start.verifier).await?
+                }
+                "google-gemini-cli" => {
+                    pi::auth::complete_google_gemini_cli_oauth(code_input, &start.verifier).await?
+                }
+                "google-antigravity" => {
+                    pi::auth::complete_google_antigravity_oauth(code_input, &start.verifier).await?
+                }
+                other => {
+                    console.render_warning(&format!(
+                        "OAuth completion not supported for {other}. Setup cancelled."
+                    ));
+                    return Ok(false);
+                }
+            }
+        }
+        SetupCredentialKind::OAuthDeviceFlow => {
+            if provider.provider != "kimi-for-coding" {
+                console.render_warning(&format!(
+                    "Device-flow login not supported for {} in this setup flow. Start Pi and run /login {} instead.",
+                    provider.provider, provider.provider
+                ));
+                return Ok(false);
+            }
+
+            let device = pi::auth::start_kimi_code_device_flow().await?;
+            let verification_url = device
+                .verification_uri_complete
+                .clone()
+                .unwrap_or_else(|| device.verification_uri.clone());
+            console.print_markup(&format!(
+                "[bold]OAuth login:[/] kimi-for-coding\n\n\
+Open this URL:\n{verification_url}\n\n\
+If prompted, enter this code: {}\n\
+Code expires in {} seconds.\n",
+                device.user_code, device.expires_in
+            ));
+
+            let start = std::time::Instant::now();
+            loop {
+                let elapsed = start.elapsed().as_secs();
+                if elapsed >= device.expires_in {
+                    console.render_warning("Device code expired. Run setup again.");
+                    return Ok(false);
+                }
+
+                let Some(input) = prompt_line("Press Enter to poll (or type q to cancel): ")?
+                else {
+                    console.render_warning("Setup cancelled (no input).");
+                    return Ok(false);
+                };
+                if input.trim().eq_ignore_ascii_case("q") {
+                    console.render_warning("Setup cancelled.");
+                    return Ok(false);
+                }
+
+                match pi::auth::poll_kimi_code_device_flow(&device.device_code).await {
+                    pi::auth::DeviceFlowPollResult::Success(cred) => break cred,
+                    pi::auth::DeviceFlowPollResult::Pending => {
+                        console.render_info("Authorization still pending. Complete the browser step and poll again.");
+                    }
+                    pi::auth::DeviceFlowPollResult::SlowDown => {
+                        console.render_info("Authorization server asked to slow down. Wait a few seconds and poll again.");
+                    }
+                    pi::auth::DeviceFlowPollResult::Expired => {
+                        console.render_warning("Device code expired. Run setup again.");
+                        return Ok(false);
+                    }
+                    pi::auth::DeviceFlowPollResult::AccessDenied => {
+                        console.render_warning("Access denied. Run setup again.");
+                        return Ok(false);
+                    }
+                    pi::auth::DeviceFlowPollResult::Error(err) => {
+                        console.render_warning(&format!("OAuth polling failed: {err}"));
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+    };
+
+    let _ = auth.remove_provider_aliases(provider.provider);
+    auth.set(provider.provider.to_string(), credential);
     auth.save_async().await?;
 
-    if cli.provider.as_deref() != Some(provider.id) {
-        cli.provider = Some(provider.id.to_string());
+    // Make the next startup attempt use the credential we just created.
+    if cli.provider.as_deref() != Some(provider.provider) {
+        cli.provider = Some(provider.provider.to_string());
         cli.model = None;
     }
+    if provider.provider == "openai-codex" {
+        cli.model = Some("gpt-5.4".to_string());
+    }
 
+    let saved_label = match provider.kind {
+        SetupCredentialKind::ApiKey => "API key",
+        SetupCredentialKind::OAuthPkce | SetupCredentialKind::OAuthDeviceFlow => {
+            "OAuth credentials"
+        }
+    };
     console.render_success(&format!(
-        "Saved {label} API key to {path}",
-        label = provider.label,
+        "Saved {label} for {provider} to {path}",
+        label = saved_label,
+        provider = provider.provider,
         path = Config::auth_path().display()
     ));
     console.render_info("Continuing startup...");
     Ok(true)
 }
 
-fn filter_models_by_pattern(models: Vec<ModelEntry>, pattern: &str) -> Vec<ModelEntry> {
+fn filter_models_by_pattern<'a>(models: Vec<&'a ModelEntry>, pattern: &str) -> Vec<&'a ModelEntry> {
     models
         .into_iter()
-        .filter(|entry| {
-            fuzzy_match(
-                pattern,
-                &format!("{} {}", entry.model.provider, entry.model.id),
-            )
-        })
+        .filter(|entry| fuzzy_match_model_id(pattern, &entry.model.provider, &entry.model.id))
         .collect()
 }
 
 fn build_model_rows(
-    models: &[ModelEntry],
+    models: &[&ModelEntry],
 ) -> Vec<(String, String, String, String, String, String)> {
     models
         .iter()
@@ -3035,58 +3880,140 @@ fn build_model_rows(
         .collect()
 }
 
-fn print_model_table(rows: &[(String, String, String, String, String, String)]) {
+trait ModelTableRow {
+    fn provider(&self) -> &str;
+    fn model(&self) -> &str;
+    fn context(&self) -> &str;
+    fn max_out(&self) -> &str;
+    fn thinking(&self) -> &str;
+    fn images(&self) -> &str;
+}
+
+impl ModelTableRow for CachedModelRow {
+    fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    fn model(&self) -> &str {
+        &self.model
+    }
+
+    fn context(&self) -> &str {
+        &self.context
+    }
+
+    fn max_out(&self) -> &str {
+        &self.max_out
+    }
+
+    fn thinking(&self) -> &str {
+        &self.thinking
+    }
+
+    fn images(&self) -> &str {
+        &self.images
+    }
+}
+
+impl ModelTableRow for (String, String, String, String, String, String) {
+    fn provider(&self) -> &str {
+        &self.0
+    }
+
+    fn model(&self) -> &str {
+        &self.1
+    }
+
+    fn context(&self) -> &str {
+        &self.2
+    }
+
+    fn max_out(&self) -> &str {
+        &self.3
+    }
+
+    fn thinking(&self) -> &str {
+        &self.4
+    }
+
+    fn images(&self) -> &str {
+        &self.5
+    }
+}
+
+impl<T: ModelTableRow + ?Sized> ModelTableRow for &T {
+    fn provider(&self) -> &str {
+        (*self).provider()
+    }
+
+    fn model(&self) -> &str {
+        (*self).model()
+    }
+
+    fn context(&self) -> &str {
+        (*self).context()
+    }
+
+    fn max_out(&self) -> &str {
+        (*self).max_out()
+    }
+
+    fn thinking(&self) -> &str {
+        (*self).thinking()
+    }
+
+    fn images(&self) -> &str {
+        (*self).images()
+    }
+}
+
+fn write_model_table<R: ModelTableRow, W: Write>(out: &mut W, rows: &[R]) -> io::Result<()> {
     let headers = (
         "provider", "model", "context", "max-out", "thinking", "images",
     );
 
-    let provider_w = rows
-        .iter()
-        .map(|r| r.0.len())
-        .max()
-        .unwrap_or(0)
-        .max(headers.0.len());
-    let model_w = rows
-        .iter()
-        .map(|r| r.1.len())
-        .max()
-        .unwrap_or(0)
-        .max(headers.1.len());
-    let context_w = rows
-        .iter()
-        .map(|r| r.2.len())
-        .max()
-        .unwrap_or(0)
-        .max(headers.2.len());
-    let max_out_w = rows
-        .iter()
-        .map(|r| r.3.len())
-        .max()
-        .unwrap_or(0)
-        .max(headers.3.len());
-    let thinking_w = rows
-        .iter()
-        .map(|r| r.4.len())
-        .max()
-        .unwrap_or(0)
-        .max(headers.4.len());
-    let images_w = rows
-        .iter()
-        .map(|r| r.5.len())
-        .max()
-        .unwrap_or(0)
-        .max(headers.5.len());
+    let mut provider_w = headers.0.len();
+    let mut model_w = headers.1.len();
+    let mut context_w = headers.2.len();
+    let mut max_out_w = headers.3.len();
+    let mut thinking_w = headers.4.len();
+    let mut images_w = headers.5.len();
+    for row in rows {
+        provider_w = provider_w.max(row.provider().len());
+        model_w = model_w.max(row.model().len());
+        context_w = context_w.max(row.context().len());
+        max_out_w = max_out_w.max(row.max_out().len());
+        thinking_w = thinking_w.max(row.thinking().len());
+        images_w = images_w.max(row.images().len());
+    }
 
     let (provider, model, context, max_out, thinking, images) = headers;
-    println!(
+    writeln!(
+        out,
         "{provider:<provider_w$}  {model:<model_w$}  {context:<context_w$}  {max_out:<max_out_w$}  {thinking:<thinking_w$}  {images:<images_w$}"
-    );
+    )?;
 
-    for (provider, model, context, max_out, thinking, images) in rows {
-        println!(
-            "{provider:<provider_w$}  {model:<model_w$}  {context:<context_w$}  {max_out:<max_out_w$}  {thinking:<thinking_w$}  {images:<images_w$}"
-        );
+    for row in rows {
+        writeln!(
+            out,
+            "{provider:<provider_w$}  {model:<model_w$}  {context:<context_w$}  {max_out:<max_out_w$}  {thinking:<thinking_w$}  {images:<images_w$}",
+            provider = row.provider(),
+            model = row.model(),
+            context = row.context(),
+            max_out = row.max_out(),
+            thinking = row.thinking(),
+            images = row.images(),
+        )?;
     }
+
+    Ok(())
+}
+
+fn print_model_table<R: ModelTableRow>(rows: &[R]) {
+    // Buffer all output to reduce write syscalls from O(rows) to O(1).
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    let _ = write_model_table(&mut out, rows);
 }
 
 fn prompt_line(prompt: &str) -> Result<Option<String>> {
@@ -3112,10 +4039,10 @@ async fn export_session(input_path: &str, output_path: Option<&str>) -> Result<P
 
     if let Some(parent) = output_path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
+            asupersync::fs::create_dir_all(parent).await?;
         }
     }
-    std::fs::write(&output_path, html)?;
+    asupersync::fs::write(&output_path, html).await?;
     Ok(output_path)
 }
 
@@ -3197,13 +4124,16 @@ async fn run_print_mode(
         bail!("No input provided. Use: pi -p \"your message\" or pipe input via stdin");
     }
 
-    let mut last_message: Option<AssistantMessage> = None;
+    let text_stream_state = Arc::new(StdMutex::new(PrintTextStreamState::default()));
     let extensions = session.extensions.as_ref().map(|r| r.manager().clone());
     let emit_json_events = mode == "json";
+    let stream_text_events = mode == "text";
     let runtime_for_events = runtime_handle.clone();
+    let text_stream_state_for_events = Arc::clone(&text_stream_state);
     let make_event_handler = move || {
         let extensions = extensions.clone();
         let runtime_for_events = runtime_for_events.clone();
+        let text_stream_state = Arc::clone(&text_stream_state_for_events);
         let coalescer = extensions
             .as_ref()
             .map(|m| pi::extensions::EventCoalescer::new(m.clone()));
@@ -3212,6 +4142,14 @@ async fn run_print_mode(
                 if let Ok(serialized) = serde_json::to_string(&event) {
                     println!("{serialized}");
                 }
+            } else if stream_text_events
+                && let Some(delta) = streamed_text_delta(&event)
+                && emit_text_delta(delta).is_ok()
+            {
+                let mut guard = text_stream_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.observe_delta(delta);
             }
             // Route non-lifecycle events through the coalescer for
             // batched/coalesced dispatch with lazy serialization.
@@ -3241,63 +4179,156 @@ async fn run_print_mode(
     let retry_enabled = config.retry_enabled();
     let max_retries = config.retry_max_retries();
     let is_json = mode == "json";
+    let mut sent_prompts = 0usize;
 
     if let Some(initial) = initial {
         let content = pi::app::build_initial_content(&initial);
-        last_message = Some(
-            run_print_prompt_with_retry(
-                session,
-                config,
-                &abort_signal,
-                &make_event_handler,
-                retry_enabled,
-                max_retries,
-                is_json,
-                PromptInput::Content(content),
-            )
-            .await?,
-        );
+        reset_print_text_stream_state(&text_stream_state);
+        let message = run_print_prompt_with_retry(
+            session,
+            config,
+            &abort_signal,
+            &make_event_handler,
+            retry_enabled,
+            max_retries,
+            is_json,
+            &text_stream_state,
+            PromptInput::Content(content),
+        )
+        .await?;
+        sent_prompts = sent_prompts.saturating_add(1);
+        if mode == "text" {
+            finish_print_text_response(
+                &message,
+                snapshot_print_text_stream_state(&text_stream_state),
+            )?;
+        }
     }
 
     for message in messages {
-        last_message = Some(
-            run_print_prompt_with_retry(
-                session,
-                config,
-                &abort_signal,
-                &make_event_handler,
-                retry_enabled,
-                max_retries,
-                is_json,
-                PromptInput::Text(message),
-            )
-            .await?,
-        );
+        reset_print_text_stream_state(&text_stream_state);
+        let response = run_print_prompt_with_retry(
+            session,
+            config,
+            &abort_signal,
+            &make_event_handler,
+            retry_enabled,
+            max_retries,
+            is_json,
+            &text_stream_state,
+            PromptInput::Text(message),
+        )
+        .await?;
+        sent_prompts = sent_prompts.saturating_add(1);
+        if mode == "text" {
+            finish_print_text_response(
+                &response,
+                snapshot_print_text_stream_state(&text_stream_state),
+            )?;
+        }
     }
 
-    let Some(last_message) = last_message else {
+    if sent_prompts == 0 {
         if mode == "json" {
             io::stdout().flush()?;
             return Ok(());
         }
         bail!("No messages were sent");
-    };
+    }
 
-    if mode == "text" {
-        if matches!(
-            last_message.stop_reason,
-            StopReason::Error | StopReason::Aborted
-        ) {
-            let message = last_message
-                .error_message
-                .unwrap_or_else(|| "Request error".to_string());
-            bail!(message);
+    io::stdout().flush()?;
+    Ok(())
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PrintTextStreamState {
+    streamed_text: bool,
+    ends_with_newline: bool,
+}
+
+impl PrintTextStreamState {
+    fn observe_delta(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
         }
+        self.streamed_text = true;
+        self.ends_with_newline = delta.ends_with('\n');
+    }
+
+    const fn should_render_final_message(self) -> bool {
+        !self.streamed_text
+    }
+
+    const fn can_retry(self, is_json: bool) -> bool {
+        is_json || !self.streamed_text
+    }
+
+    const fn needs_trailing_newline(self) -> bool {
+        self.streamed_text && !self.ends_with_newline
+    }
+}
+
+fn streamed_text_delta(event: &AgentEvent) -> Option<&str> {
+    match event {
+        AgentEvent::MessageUpdate {
+            assistant_message_event: pi::model::AssistantMessageEvent::TextDelta { delta, .. },
+            ..
+        } => Some(delta.as_str()),
+        _ => None,
+    }
+}
+
+fn emit_text_delta(delta: &str) -> io::Result<()> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    out.write_all(delta.as_bytes())?;
+    out.flush()
+}
+
+fn emit_trailing_print_newline(state: PrintTextStreamState) -> io::Result<()> {
+    if !state.needs_trailing_newline() {
+        return Ok(());
+    }
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    out.write_all(b"\n")?;
+    out.flush()
+}
+
+fn snapshot_print_text_stream_state(
+    state: &Arc<StdMutex<PrintTextStreamState>>,
+) -> PrintTextStreamState {
+    *state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn reset_print_text_stream_state(state: &Arc<StdMutex<PrintTextStreamState>>) {
+    let mut guard = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = PrintTextStreamState::default();
+}
+
+fn finish_print_text_response(
+    message: &AssistantMessage,
+    stream_state: PrintTextStreamState,
+) -> Result<()> {
+    if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
+        emit_trailing_print_newline(stream_state)?;
+        let error_message = message
+            .error_message
+            .clone()
+            .unwrap_or_else(|| "Request error".to_string());
+        bail!(error_message);
+    }
+
+    if stream_state.should_render_final_message() {
         // When stdout is a terminal, render markdown with formatting.
         // When piped, emit plain text via output_final_text to avoid escape codes.
         if std::io::IsTerminal::is_terminal(&io::stdout()) {
             let mut markdown = String::new();
-            for block in &last_message.content {
+            for block in &message.content {
                 if let ContentBlock::Text(text) = block {
                     markdown.push_str(&text.text);
                     if !markdown.ends_with('\n') {
@@ -3311,11 +4342,12 @@ async fn run_print_mode(
                 console.render_markdown(&markdown);
             }
         } else {
-            pi::app::output_final_text(&last_message);
+            pi::app::output_final_text(message);
         }
+        return Ok(());
     }
 
-    io::stdout().flush()?;
+    emit_trailing_print_newline(stream_state)?;
     Ok(())
 }
 
@@ -3362,6 +4394,7 @@ async fn run_print_prompt_with_retry<H, EH>(
     retry_enabled: bool,
     max_retries: u32,
     is_json: bool,
+    text_stream_state: &Arc<StdMutex<PrintTextStreamState>>,
     input: PromptInput,
 ) -> Result<AssistantMessage>
 where
@@ -3410,7 +4443,11 @@ where
                 }
                 return Ok(msg);
             }
-            Ok(msg) if is_retryable_prompt_result(&msg) && retry_count < max_retries => {
+            Ok(msg)
+                if is_retryable_prompt_result(&msg)
+                    && retry_count < max_retries
+                    && snapshot_print_text_stream_state(text_stream_state).can_retry(is_json) =>
+            {
                 let err_msg = msg
                     .error_message
                     .clone()
@@ -3432,6 +4469,9 @@ where
                     Duration::from_millis(u64::from(delay_ms)),
                 )
                 .await;
+
+                // Revert the failed user message before retrying to prevent context duplication.
+                let _ = session.revert_last_user_message().await;
 
                 // Re-send the same prompt (matches RPC retry behaviour).
                 current_result = match &input {
@@ -3473,7 +4513,9 @@ where
             }
             Err(err) => {
                 let err_str = err.to_string();
-                if retry_count < max_retries && pi::error::is_retryable_error(&err_str, None, None)
+                if retry_count < max_retries
+                    && pi::error::is_retryable_error(&err_str, None, None)
+                    && snapshot_print_text_stream_state(text_stream_state).can_retry(is_json)
                 {
                     retry_count += 1;
                     let delay_ms = print_mode_retry_delay_ms(config, retry_count);
@@ -3491,6 +4533,11 @@ where
                         Duration::from_millis(u64::from(delay_ms)),
                     )
                     .await;
+
+                    // Revert the failed user message before retrying to prevent context
+                    // duplication when the provider fails before emitting an assistant
+                    // message.
+                    let _ = session.revert_last_user_message().await;
 
                     current_result = match &input {
                         PromptInput::Text(text) => {
@@ -3561,7 +4608,7 @@ async fn run_interactive_mode(
     // Extract manager for the interactive loop; the region stays alive to
     // handle shutdown when this scope exits.
     let extensions = region.as_ref().map(|r| r.manager().clone());
-    pi::interactive::run_interactive(
+    let interactive_result = pi::interactive::run_interactive(
         agent,
         session,
         config,
@@ -3576,7 +4623,15 @@ async fn run_interactive_mode(
         cwd,
         runtime_handle,
     )
-    .await?;
+    .await;
+    // Explicitly shut down extension runtimes so the QuickJS GC can
+    // collect all objects before JS_FreeRuntime asserts an empty gc_obj_list.
+    // Must run even on error — otherwise ExtensionRegion::drop() runs
+    // synchronously and the GC assertion fires.
+    if let Some(ref region) = region {
+        region.shutdown().await;
+    }
+    interactive_result?;
     Ok(())
 }
 
@@ -3588,7 +4643,8 @@ fn read_piped_stdin() -> Result<Option<String>> {
     }
 
     let mut data = String::new();
-    io::stdin().read_to_string(&mut data)?;
+    let mut handle = io::stdin().take(100 * 1024 * 1024); // 100MB limit
+    handle.read_to_string(&mut data)?;
     if data.is_empty() {
         Ok(None)
     } else {
@@ -3598,17 +4654,17 @@ fn read_piped_stdin() -> Result<Option<String>> {
 
 fn format_token_count(count: u32) -> String {
     if count >= 1_000_000 {
-        let millions = f64::from(count) / 1_000_000.0;
-        if millions.fract() == 0.0 {
-            format!("{millions:.0}M")
+        if count % 1_000_000 == 0 {
+            format!("{}M", count / 1_000_000)
         } else {
+            let millions = f64::from(count) / 1_000_000.0;
             format!("{millions:.1}M")
         }
     } else if count >= 1_000 {
-        let thousands = f64::from(count) / 1_000.0;
-        if thousands.fract() == 0.0 {
-            format!("{thousands:.0}K")
+        if count % 1_000 == 0 {
+            format!("{}K", count / 1_000)
         } else {
+            let thousands = f64::from(count) / 1_000.0;
             format!("{thousands:.1}K")
         }
     } else {
@@ -3617,15 +4673,37 @@ fn format_token_count(count: u32) -> String {
 }
 
 fn fuzzy_match(pattern: &str, value: &str) -> bool {
-    let needle_str = pattern.to_lowercase();
-    let haystack_str = value.to_lowercase();
-    let mut needle = needle_str.chars().filter(|c| !c.is_whitespace());
-    let mut haystack = haystack_str.chars();
+    let mut needle = pattern
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|c| !c.is_whitespace());
+    let mut haystack = value.chars().flat_map(char::to_lowercase);
     for ch in needle.by_ref() {
         if !haystack.by_ref().any(|h| h == ch) {
             return false;
         }
     }
+    true
+}
+
+fn fuzzy_match_model_id(pattern: &str, provider: &str, model_id: &str) -> bool {
+    let mut needle = pattern
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|c| !c.is_whitespace());
+    let mut provider_chars = provider.chars().flat_map(char::to_lowercase);
+    let mut model_chars = model_id.chars().flat_map(char::to_lowercase);
+
+    for ch in needle.by_ref() {
+        if provider_chars.by_ref().any(|h| h == ch) {
+            continue;
+        }
+        if model_chars.by_ref().any(|h| h == ch) {
+            continue;
+        }
+        return false;
+    }
+
     true
 }
 
@@ -3643,6 +4721,12 @@ mod tests {
     use anyhow::anyhow;
     use serde_json::json;
     use tempfile::TempDir;
+
+    fn render_model_table_for_test<R: ModelTableRow>(rows: &[R]) -> String {
+        let mut buf = Vec::new();
+        write_model_table(&mut buf, rows).expect("render model table");
+        String::from_utf8(buf).expect("table output should be utf-8")
+    }
 
     #[test]
     fn exit_code_classifier_marks_usage_errors() {
@@ -3695,6 +4779,28 @@ mod tests {
     }
 
     #[test]
+    fn fuzzy_match_model_id_matches_combined_haystack_behavior() {
+        let cases = [
+            ("g54", "openai-codex", "gpt-5.4"),
+            ("oc54", "openai-codex", "gpt-5.4"),
+            ("g53", "openai-codex", "gpt-5.3-codex"),
+            ("son46", "anthropic", "claude-sonnet-4-6"),
+            ("opn router", "openrouter", "anthropic/claude-3.7-sonnet"),
+            ("zzzz", "openai", "gpt-4o"),
+            ("a4z", "anthropic", "claude-4"),
+        ];
+
+        for (pattern, provider, model_id) in cases {
+            let combined = format!("{provider} {model_id}");
+            assert_eq!(
+                fuzzy_match_model_id(pattern, provider, model_id),
+                fuzzy_match(pattern, &combined),
+                "pattern={pattern} provider={provider} model_id={model_id}"
+            );
+        }
+    }
+
+    #[test]
     fn coerce_extension_flag_bool_defaults_to_true_without_value() {
         let flag = cli::ExtensionCliFlag {
             name: "dry-run".to_string(),
@@ -3715,76 +4821,260 @@ mod tests {
     }
 
     #[test]
-    fn provider_from_token_numbered_choices() {
-        // Original 3 providers by number
-        assert_eq!(provider_from_token("1").unwrap().id, "anthropic");
-        assert_eq!(provider_from_token("2").unwrap().id, "openai");
-        assert_eq!(provider_from_token("3").unwrap().id, "google");
-        // New providers by number
-        assert_eq!(provider_from_token("4").unwrap().id, "azure-openai");
-        assert_eq!(provider_from_token("5").unwrap().id, "amazon-bedrock");
-        assert_eq!(provider_from_token("6").unwrap().id, "groq");
-        assert_eq!(provider_from_token("7").unwrap().id, "openrouter");
-        assert_eq!(provider_from_token("8").unwrap().id, "mistral");
-        assert_eq!(provider_from_token("9").unwrap().id, "togetherai");
-        assert_eq!(provider_from_token("10").unwrap().id, "google-vertex");
+    fn provider_choice_from_token_numbered_choices() {
+        let choice = provider_choice_from_token("1").expect("provider 1");
+        assert_eq!(choice.provider, "openai-codex");
+        assert_eq!(choice.kind, SetupCredentialKind::OAuthPkce);
+
+        let choice = provider_choice_from_token("2").expect("provider 2");
+        assert_eq!(choice.provider, "openai");
+        assert_eq!(choice.kind, SetupCredentialKind::ApiKey);
+
+        let choice = provider_choice_from_token("3").expect("provider 3");
+        assert_eq!(choice.provider, "anthropic");
+        assert_eq!(choice.kind, SetupCredentialKind::OAuthPkce);
+
+        let choice = provider_choice_from_token("4").expect("provider 4");
+        assert_eq!(choice.provider, "anthropic");
+        assert_eq!(choice.kind, SetupCredentialKind::ApiKey);
+
+        let choice = provider_choice_from_token("5").expect("provider 5");
+        assert_eq!(choice.provider, "kimi-for-coding");
+        assert_eq!(choice.kind, SetupCredentialKind::OAuthDeviceFlow);
+
+        let choice = provider_choice_from_token("6").expect("provider 6");
+        assert_eq!(choice.provider, "google-gemini-cli");
+        assert_eq!(choice.kind, SetupCredentialKind::OAuthPkce);
+
+        let choice = provider_choice_from_token("7").expect("provider 7");
+        assert_eq!(choice.provider, "google");
+        assert_eq!(choice.kind, SetupCredentialKind::ApiKey);
+
+        let choice = provider_choice_from_token("8").expect("provider 8");
+        assert_eq!(choice.provider, "google-antigravity");
+        assert_eq!(choice.kind, SetupCredentialKind::OAuthPkce);
+
+        let choice = provider_choice_from_token("9").expect("provider 9");
+        assert_eq!(choice.provider, "azure-openai");
+        assert_eq!(choice.kind, SetupCredentialKind::ApiKey);
+
+        let choice = provider_choice_from_token("10").expect("provider 10");
+        assert_eq!(choice.provider, "openrouter");
+        assert_eq!(choice.kind, SetupCredentialKind::ApiKey);
         // Out of range
-        assert!(provider_from_token("0").is_none());
-        assert!(provider_from_token("11").is_none());
+        assert!(provider_choice_from_token("0").is_none());
+        assert!(provider_choice_from_token("11").is_none());
     }
 
     #[test]
-    fn provider_from_token_common_nicknames() {
-        assert_eq!(provider_from_token("claude").unwrap().id, "anthropic");
-        assert_eq!(provider_from_token("gpt").unwrap().id, "openai");
-        assert_eq!(provider_from_token("chatgpt").unwrap().id, "openai");
-        assert_eq!(provider_from_token("gemini").unwrap().id, "google");
-        assert_eq!(provider_from_token("azure").unwrap().id, "azure-openai");
-        assert_eq!(provider_from_token("bedrock").unwrap().id, "amazon-bedrock");
-        assert_eq!(provider_from_token("aws").unwrap().id, "amazon-bedrock");
-        assert_eq!(provider_from_token("together").unwrap().id, "togetherai");
-        assert_eq!(provider_from_token("vertex").unwrap().id, "google-vertex");
-        assert_eq!(provider_from_token("vertexai").unwrap().id, "google-vertex");
+    fn provider_choice_from_token_common_nicknames() {
+        assert_eq!(
+            provider_choice_from_token("claude").unwrap().provider,
+            "anthropic"
+        );
+        assert_eq!(
+            provider_choice_from_token("gpt").unwrap().provider,
+            "openai-codex"
+        );
+        assert_eq!(
+            provider_choice_from_token("chatgpt").unwrap().provider,
+            "openai-codex"
+        );
+        assert_eq!(
+            provider_choice_from_token("gemini").unwrap().provider,
+            "google"
+        );
+        assert_eq!(
+            provider_choice_from_token("kimi").unwrap().provider,
+            "kimi-for-coding"
+        );
     }
 
     #[test]
-    fn provider_from_token_canonical_ids() {
-        assert_eq!(provider_from_token("anthropic").unwrap().id, "anthropic");
-        assert_eq!(provider_from_token("openai").unwrap().id, "openai");
-        assert_eq!(provider_from_token("groq").unwrap().id, "groq");
-        assert_eq!(provider_from_token("openrouter").unwrap().id, "openrouter");
-        assert_eq!(provider_from_token("mistral").unwrap().id, "mistral");
+    fn provider_choice_from_token_canonical_ids() {
+        assert_eq!(
+            provider_choice_from_token("anthropic").unwrap().provider,
+            "anthropic"
+        );
+        assert_eq!(
+            provider_choice_from_token("openai").unwrap().provider,
+            "openai"
+        );
+        assert_eq!(
+            provider_choice_from_token("openai-codex").unwrap().provider,
+            "openai-codex"
+        );
+        assert_eq!(provider_choice_from_token("groq").unwrap().provider, "groq");
+        assert_eq!(
+            provider_choice_from_token("openrouter").unwrap().provider,
+            "openrouter"
+        );
+        assert_eq!(
+            provider_choice_from_token("mistral").unwrap().provider,
+            "mistral"
+        );
     }
 
     #[test]
-    fn provider_from_token_case_insensitive() {
-        assert_eq!(provider_from_token("ANTHROPIC").unwrap().id, "anthropic");
-        assert_eq!(provider_from_token("Groq").unwrap().id, "groq");
-        assert_eq!(provider_from_token("OpenRouter").unwrap().id, "openrouter");
+    fn provider_choice_from_token_case_insensitive() {
+        assert_eq!(
+            provider_choice_from_token("ANTHROPIC").unwrap().provider,
+            "anthropic"
+        );
+        assert_eq!(provider_choice_from_token("Groq").unwrap().provider, "groq");
+        assert_eq!(
+            provider_choice_from_token("OpenRouter").unwrap().provider,
+            "openrouter"
+        );
     }
 
     #[test]
-    fn provider_from_token_metadata_fallback() {
+    fn provider_choice_from_token_metadata_fallback() {
         // Providers not in the top-10 list but in provider_metadata registry
-        assert_eq!(provider_from_token("deepseek").unwrap().id, "deepseek");
-        assert_eq!(provider_from_token("cerebras").unwrap().id, "cerebras");
-        assert_eq!(provider_from_token("cohere").unwrap().id, "cohere");
-        assert_eq!(provider_from_token("perplexity").unwrap().id, "perplexity");
+        assert_eq!(
+            provider_choice_from_token("deepseek").unwrap().provider,
+            "deepseek"
+        );
+        assert_eq!(
+            provider_choice_from_token("cerebras").unwrap().provider,
+            "cerebras"
+        );
+        assert_eq!(
+            provider_choice_from_token("cohere").unwrap().provider,
+            "cohere"
+        );
+        assert_eq!(
+            provider_choice_from_token("perplexity").unwrap().provider,
+            "perplexity"
+        );
         // Aliases resolve through metadata
-        assert_eq!(provider_from_token("open-router").unwrap().id, "openrouter");
-        assert_eq!(provider_from_token("dashscope").unwrap().id, "alibaba");
+        assert_eq!(
+            provider_choice_from_token("open-router").unwrap().provider,
+            "openrouter"
+        );
+        assert_eq!(
+            provider_choice_from_token("dashscope").unwrap().provider,
+            "alibaba"
+        );
     }
 
     #[test]
-    fn provider_from_token_whitespace_handling() {
-        assert_eq!(provider_from_token("  groq  ").unwrap().id, "groq");
-        assert_eq!(provider_from_token(" 1 ").unwrap().id, "anthropic");
+    fn collect_search_hits_filters_by_tag_before_limit() {
+        let index = pi::extension_index::ExtensionIndex {
+            schema: pi::extension_index::EXTENSION_INDEX_SCHEMA.to_string(),
+            version: pi::extension_index::EXTENSION_INDEX_VERSION,
+            generated_at: None,
+            last_refreshed_at: None,
+            entries: vec![
+                pi::extension_index::ExtensionIndexEntry {
+                    id: "npm/aaa-foo".to_string(),
+                    name: "aaa-foo".to_string(),
+                    description: Some("general extension".to_string()),
+                    tags: vec!["general".to_string()],
+                    license: None,
+                    source: None,
+                    install_source: Some("npm:aaa-foo".to_string()),
+                },
+                pi::extension_index::ExtensionIndexEntry {
+                    id: "npm/zzz-foo".to_string(),
+                    name: "zzz-foo".to_string(),
+                    description: Some("automation extension".to_string()),
+                    tags: vec!["automation".to_string()],
+                    license: None,
+                    source: None,
+                    install_source: Some("npm:zzz-foo".to_string()),
+                },
+            ],
+        };
+
+        let hits = collect_search_hits(&index, Some("automation"), "relevance", 1, "foo");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entry.id, "npm/zzz-foo");
+    }
+
+    fn test_extension_index(
+        entries: Vec<pi::extension_index::ExtensionIndexEntry>,
+    ) -> pi::extension_index::ExtensionIndex {
+        pi::extension_index::ExtensionIndex {
+            schema: pi::extension_index::EXTENSION_INDEX_SCHEMA.to_string(),
+            version: pi::extension_index::EXTENSION_INDEX_VERSION,
+            generated_at: None,
+            last_refreshed_at: None,
+            entries,
+        }
+    }
+
+    fn test_extension_entry(id: &str, name: &str) -> pi::extension_index::ExtensionIndexEntry {
+        pi::extension_index::ExtensionIndexEntry {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: None,
+            tags: Vec::new(),
+            license: None,
+            source: None,
+            install_source: Some(format!("npm:{name}")),
+        }
     }
 
     #[test]
-    fn provider_from_token_unknown_returns_none() {
-        assert!(provider_from_token("nonexistent-provider-xyz").is_none());
-        assert!(provider_from_token("").is_none());
+    fn find_index_entry_by_name_or_id_returns_unique_fuzzy_hit() {
+        let index = test_extension_index(vec![
+            test_extension_entry("npm/foo-helper", "foo-helper"),
+            test_extension_entry("npm/bar-helper", "bar-helper"),
+        ]);
+
+        match find_index_entry_by_name_or_id(&index, "foo") {
+            ExtensionInfoLookup::Found(entry) => assert_eq!(entry.id, "npm/foo-helper"),
+            ExtensionInfoLookup::NotFound => panic!("expected unique fuzzy match, got NotFound"),
+            ExtensionInfoLookup::Ambiguous => {
+                panic!("expected unique fuzzy match, got Ambiguous")
+            }
+        }
+    }
+
+    #[test]
+    fn find_index_entry_by_name_or_id_rejects_ambiguous_fuzzy_hit() {
+        let index = test_extension_index(vec![
+            test_extension_entry("npm/foo-alpha", "foo-alpha"),
+            test_extension_entry("npm/foo-beta", "foo-beta"),
+        ]);
+
+        assert!(
+            matches!(
+                find_index_entry_by_name_or_id(&index, "foo"),
+                ExtensionInfoLookup::Ambiguous
+            ),
+            "ambiguous fuzzy hits should fail safe instead of picking one arbitrarily"
+        );
+    }
+
+    #[test]
+    fn provider_choice_from_token_honors_method_preference() {
+        let provider = provider_choice_from_token("anthropic oauth").expect("anthropic oauth");
+        assert_eq!(provider.provider, "anthropic");
+        assert_eq!(provider.kind, SetupCredentialKind::OAuthPkce);
+
+        let provider = provider_choice_from_token("anthropic key").expect("anthropic key");
+        assert_eq!(provider.provider, "anthropic");
+        assert_eq!(provider.kind, SetupCredentialKind::ApiKey);
+    }
+
+    #[test]
+    fn provider_choice_from_token_whitespace_handling() {
+        assert_eq!(
+            provider_choice_from_token("  groq  ").unwrap().provider,
+            "groq"
+        );
+        assert_eq!(
+            provider_choice_from_token(" 1 ").unwrap().provider,
+            "openai-codex"
+        );
+    }
+
+    #[test]
+    fn provider_choice_from_token_unknown_returns_none() {
+        assert!(provider_choice_from_token("nonexistent-provider-xyz").is_none());
+        assert!(provider_choice_from_token("").is_none());
     }
 
     #[test]
@@ -3861,6 +5151,24 @@ mod tests {
         assert_eq!(
             format_settings_summary(&config),
             "provider=openai  model=gpt-4.1  thinking=high"
+        );
+    }
+
+    #[test]
+    fn interactive_config_settings_summary_with_roots_errors_on_invalid_settings() {
+        let temp = TempDir::new().expect("tempdir");
+        let cwd = temp.path().join("repo");
+        let global_dir = temp.path().join("global");
+        std::fs::create_dir_all(&cwd).expect("create cwd");
+        std::fs::create_dir_all(&global_dir).expect("create global dir");
+        std::fs::write(global_dir.join("settings.json"), "{not-json").expect("write settings");
+
+        let err = interactive_config_settings_summary_with_roots(&cwd, &global_dir, None)
+            .expect_err("invalid settings should be reported");
+
+        assert!(
+            err.to_string().contains("Failed to parse settings file"),
+            "unexpected error: {err}"
         );
     }
 
@@ -4090,5 +5398,135 @@ mod tests {
         let json = serde_json::to_value(&end).unwrap();
         assert_eq!(json["type"], "auto_retry_end");
         assert!(json["success"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn streamed_text_delta_only_matches_text_delta_updates() {
+        let partial = Arc::new(AssistantMessage {
+            content: vec![ContentBlock::Text(pi::model::TextContent::new("hello"))],
+            api: "test-api".to_string(),
+            provider: "test-provider".to_string(),
+            model: "test-model".to_string(),
+            usage: pi::model::Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        });
+        let delta_event = AgentEvent::MessageUpdate {
+            message: pi::model::Message::Assistant(Arc::clone(&partial)),
+            assistant_message_event: pi::model::AssistantMessageEvent::TextDelta {
+                content_index: 0,
+                delta: " world".to_string(),
+                partial,
+            },
+        };
+        assert_eq!(streamed_text_delta(&delta_event), Some(" world"));
+
+        let start_event = AgentEvent::MessageStart {
+            message: pi::model::Message::assistant(AssistantMessage {
+                content: Vec::new(),
+                api: "test-api".to_string(),
+                provider: "test-provider".to_string(),
+                model: "test-model".to_string(),
+                usage: pi::model::Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            }),
+        };
+        assert_eq!(streamed_text_delta(&start_event), None);
+    }
+
+    #[test]
+    fn print_text_stream_state_tracks_visibility_newlines_and_retryability() {
+        let mut state = PrintTextStreamState::default();
+        assert!(state.should_render_final_message());
+        assert!(state.can_retry(false));
+        assert!(!state.needs_trailing_newline());
+
+        state.observe_delta("");
+        assert!(state.should_render_final_message());
+
+        state.observe_delta("hello");
+        assert!(!state.should_render_final_message());
+        assert!(!state.can_retry(false));
+        assert!(state.can_retry(true));
+        assert!(state.needs_trailing_newline());
+
+        state.observe_delta(" world\n");
+        assert!(!state.needs_trailing_newline());
+    }
+
+    #[test]
+    fn model_table_renderer_matches_cached_and_owned_rows() {
+        let cached = vec![
+            CachedModelRow {
+                provider: "anthropic".to_string(),
+                model: "claude-sonnet-4-5".to_string(),
+                context: "200k".to_string(),
+                max_out: "8k".to_string(),
+                thinking: "yes".to_string(),
+                images: "yes".to_string(),
+            },
+            CachedModelRow {
+                provider: "openai".to_string(),
+                model: "gpt-5".to_string(),
+                context: "128k".to_string(),
+                max_out: "16k".to_string(),
+                thinking: "no".to_string(),
+                images: "yes".to_string(),
+            },
+        ];
+        let owned = vec![
+            (
+                "anthropic".to_string(),
+                "claude-sonnet-4-5".to_string(),
+                "200k".to_string(),
+                "8k".to_string(),
+                "yes".to_string(),
+                "yes".to_string(),
+            ),
+            (
+                "openai".to_string(),
+                "gpt-5".to_string(),
+                "128k".to_string(),
+                "16k".to_string(),
+                "no".to_string(),
+                "yes".to_string(),
+            ),
+        ];
+
+        assert_eq!(
+            render_model_table_for_test(&cached),
+            render_model_table_for_test(&owned)
+        );
+    }
+
+    #[test]
+    fn model_table_renderer_supports_borrowed_cached_rows() {
+        let cached = vec![
+            CachedModelRow {
+                provider: "openai".to_string(),
+                model: "gpt-5".to_string(),
+                context: "128k".to_string(),
+                max_out: "16k".to_string(),
+                thinking: "no".to_string(),
+                images: "yes".to_string(),
+            },
+            CachedModelRow {
+                provider: "openrouter".to_string(),
+                model: "anthropic/claude-3.7-sonnet".to_string(),
+                context: "200k".to_string(),
+                max_out: "8k".to_string(),
+                thinking: "yes".to_string(),
+                images: "no".to_string(),
+            },
+        ];
+        let borrowed = cached.iter().collect::<Vec<_>>();
+
+        assert_eq!(
+            render_model_table_for_test(&cached),
+            render_model_table_for_test(&borrowed)
+        );
     }
 }

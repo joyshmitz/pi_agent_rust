@@ -95,6 +95,23 @@ impl CohereProvider {
     }
 }
 
+fn authorization_override(
+    options: &StreamOptions,
+    compat: Option<&CompatConfig>,
+) -> Option<String> {
+    super::first_non_empty_header_value_case_insensitive(&options.headers, &["authorization"])
+        .or_else(|| {
+            compat
+                .and_then(|compat| compat.custom_headers.as_ref())
+                .and_then(|headers| {
+                    super::first_non_empty_header_value_case_insensitive(
+                        headers,
+                        &["authorization"],
+                    )
+                })
+        })
+}
+
 #[async_trait]
 #[allow(clippy::too_many_lines)]
 impl Provider for CohereProvider {
@@ -115,12 +132,9 @@ impl Provider for CohereProvider {
         context: &Context<'_>,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-        let has_authorization_header = options
-            .headers
-            .keys()
-            .any(|key| key.eq_ignore_ascii_case("authorization"));
+        let authorization_override = authorization_override(options, self.compat.as_ref());
 
-        let auth_value = if has_authorization_header {
+        let auth_value = if authorization_override.is_some() {
             None
         } else {
             Some(
@@ -128,7 +142,7 @@ impl Provider for CohereProvider {
                     .api_key
                     .clone()
                     .or_else(|| std::env::var("COHERE_API_KEY").ok())
-                    .ok_or_else(|| Error::provider("cohere", "Missing API key for Cohere. Set COHERE_API_KEY or configure in settings."))?,
+                    .ok_or_else(|| Error::provider("cohere", "Missing API key for provider. Configure credentials with /login <provider> or set the provider's API key env var."))?,
             )
         };
 
@@ -147,16 +161,20 @@ impl Provider for CohereProvider {
         // Apply provider-specific custom headers from compat config.
         if let Some(compat) = &self.compat {
             if let Some(custom_headers) = &compat.custom_headers {
-                for (key, value) in custom_headers {
-                    request = request.header(key, value);
-                }
+                request = super::apply_headers_ignoring_blank_auth_overrides(
+                    request,
+                    custom_headers,
+                    &["authorization"],
+                );
             }
         }
 
         // Per-request headers from StreamOptions (highest priority).
-        for (key, value) in &options.headers {
-            request = request.header(key, value);
-        }
+        request = super::apply_headers_ignoring_blank_auth_overrides(
+            request,
+            &options.headers,
+            &["authorization"],
+        );
 
         let request = request.json(&request_body)?;
 
@@ -336,8 +354,8 @@ where
 
     #[allow(clippy::too_many_lines)]
     fn process_event(&mut self, data: &str) -> Result<()> {
-        let chunk: CohereStreamChunk =
-            serde_json::from_str(data).map_err(|e| Error::api(format!("JSON parse error: {e}")))?;
+        let chunk: CohereStreamChunk = serde_json::from_str(data)
+            .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
 
         match chunk {
             CohereStreamChunk::MessageStart { .. } => {
@@ -476,22 +494,22 @@ where
                             serde_json::Value::Null
                         });
 
-                    if let Some(ContentBlock::ToolCall(block)) =
-                        self.partial.content.get_mut(active.content_index)
-                    {
-                        block.arguments = parsed_args.clone();
-                    }
-
                     self.partial.stop_reason = StopReason::ToolUse;
                     self.pending_events.push_back(StreamEvent::ToolCallEnd {
                         content_index: active.content_index,
                         tool_call: ToolCall {
                             id: active.id,
                             name: active.name,
-                            arguments: parsed_args,
+                            arguments: parsed_args.clone(),
                             thought_signature: None,
                         },
                     });
+
+                    if let Some(ContentBlock::ToolCall(block)) =
+                        self.partial.content.get_mut(active.content_index)
+                    {
+                        block.arguments = parsed_args;
+                    }
                 }
             }
             CohereStreamChunk::MessageEnd { delta } => {
@@ -650,11 +668,7 @@ fn build_cohere_messages(context: &Context<'_>) -> Vec<CohereMessage> {
                 }
 
                 out.push(CohereMessage::Assistant {
-                    content: if tool_calls.is_empty() && !text.is_empty() {
-                        Some(text)
-                    } else {
-                        None
-                    },
+                    content: if text.is_empty() { None } else { Some(text) },
                     tool_calls: if tool_calls.is_empty() {
                         None
                     } else {
@@ -1210,6 +1224,99 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_stream_compat_authorization_header_overrides_api_key_without_duplicate() {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let mut custom_headers = HashMap::new();
+        custom_headers.insert(
+            "Authorization".to_string(),
+            "Bearer compat-header".to_string(),
+        );
+        let provider = CohereProvider::new("command-r")
+            .with_base_url(base_url)
+            .with_compat(Some(CompatConfig {
+                custom_headers: Some(custom_headers),
+                ..Default::default()
+            }));
+        let context = Context::owned(
+            Some("system".to_string()),
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })],
+            Vec::new(),
+        );
+        let options = StreamOptions {
+            api_key: Some("test-cohere-key".to_string()),
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let captured = rx.recv_timeout(Duration::from_secs(2)).expect("captured");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some("Bearer compat-header")
+        );
+        assert_eq!(captured.header_count("authorization"), 1);
+    }
+
+    #[test]
+    fn test_stream_compat_authorization_header_works_without_api_key() {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let mut custom_headers = HashMap::new();
+        custom_headers.insert(
+            "Authorization".to_string(),
+            "Bearer compat-header".to_string(),
+        );
+        let provider = CohereProvider::new("command-r")
+            .with_base_url(base_url)
+            .with_compat(Some(CompatConfig {
+                custom_headers: Some(custom_headers),
+                ..Default::default()
+            }));
+        let context = Context::owned(
+            Some("system".to_string()),
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })],
+            Vec::new(),
+        );
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider
+                .stream(&context, &StreamOptions::default())
+                .await
+                .expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let captured = rx.recv_timeout(Duration::from_secs(2)).expect("captured");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some("Bearer compat-header")
+        );
+        assert_eq!(captured.header_count("authorization"), 1);
+    }
+
     fn collect_events(events: &[Value]) -> Vec<StreamEvent> {
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -1252,7 +1359,17 @@ mod tests {
     #[derive(Debug)]
     struct CapturedRequest {
         headers: HashMap<String, String>,
+        header_lines: Vec<(String, String)>,
         body: String,
+    }
+
+    impl CapturedRequest {
+        fn header_count(&self, name: &str) -> usize {
+            self.header_lines
+                .iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case(name))
+                .count()
+        }
     }
 
     fn run_stream_and_capture_headers(
@@ -1334,7 +1451,7 @@ mod tests {
                     {
                         break;
                     }
-                    Err(err) => panic!("read request failed: {err}"),
+                    Err(err) => panic!(),
                 }
             }
 
@@ -1343,7 +1460,7 @@ mod tests {
                 .position(|window| window == b"\r\n\r\n")
                 .expect("request header boundary");
             let header_text = String::from_utf8_lossy(&bytes[..header_end]).to_string();
-            let headers = parse_headers(&header_text);
+            let (headers, header_lines) = parse_headers(&header_text);
             let mut request_body = bytes[header_end + 4..].to_vec();
 
             let content_length = headers
@@ -1360,12 +1477,13 @@ mod tests {
                     {
                         break;
                     }
-                    Err(err) => panic!("read request body failed: {err}"),
+                    Err(err) => panic!(),
                 }
             }
 
             let captured = CapturedRequest {
                 headers,
+                header_lines,
                 body: String::from_utf8_lossy(&request_body).to_string(),
             };
             tx.send(captured).expect("send captured request");
@@ -1388,14 +1506,18 @@ mod tests {
         (format!("http://{addr}"), rx)
     }
 
-    fn parse_headers(header_text: &str) -> HashMap<String, String> {
+    fn parse_headers(header_text: &str) -> (HashMap<String, String>, Vec<(String, String)>) {
         let mut headers = HashMap::new();
+        let mut header_lines = Vec::new();
         for line in header_text.lines().skip(1) {
             if let Some((name, value)) = line.split_once(':') {
-                headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+                let normalized_name = name.trim().to_ascii_lowercase();
+                let normalized_value = value.trim().to_string();
+                header_lines.push((normalized_name.clone(), normalized_value.clone()));
+                headers.insert(normalized_name, normalized_value);
             }
         }
-        headers
+        (headers, header_lines)
     }
 
     // ─── Request body format tests ──────────────────────────────────────
@@ -1532,6 +1654,46 @@ mod tests {
         // Tool result should reference the tool_call_id.
         assert_eq!(msgs[3]["tool_call_id"], "call_1");
         assert_eq!(msgs[3]["content"], "file contents");
+    }
+
+    #[test]
+    fn test_build_request_assistant_text_preserved_alongside_tool_calls() {
+        let provider = CohereProvider::new("command-r");
+        let context = Context::owned(
+            None,
+            vec![Message::assistant(AssistantMessage {
+                content: vec![
+                    ContentBlock::Text(TextContent::new("Let me read that file.")),
+                    ContentBlock::ToolCall(ToolCall {
+                        id: "call_1".to_string(),
+                        name: "read".to_string(),
+                        arguments: json!({"path": "/tmp/a.txt"}),
+                        thought_signature: None,
+                    }),
+                ],
+                api: "cohere-chat".to_string(),
+                provider: "cohere".to_string(),
+                model: "command-r".to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::ToolUse,
+                error_message: None,
+                timestamp: 0,
+            })],
+            vec![],
+        );
+        let options = StreamOptions::default();
+
+        let req = provider.build_request(&context, &options);
+        let value = serde_json::to_value(&req).expect("serialize");
+        let msgs = value["messages"].as_array().unwrap();
+
+        assert_eq!(msgs[0]["role"], "assistant");
+        assert_eq!(
+            msgs[0]["content"].as_str(),
+            Some("Let me read that file."),
+            "Assistant text must be preserved when tool_calls are also present"
+        );
+        assert_eq!(msgs[0]["tool_calls"].as_array().unwrap().len(), 1);
     }
 
     #[test]

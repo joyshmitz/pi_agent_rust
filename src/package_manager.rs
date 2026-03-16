@@ -24,6 +24,17 @@ use std::process::{Command, Stdio};
 use std::thread;
 use tracing::{info, warn};
 
+fn finish_package_task<T, E>(
+    handle: thread::JoinHandle<()>,
+    recv_result: std::result::Result<Result<T>, E>,
+    cancelled_message: &'static str,
+) -> Result<T> {
+    if let Err(panic_payload) = handle.join() {
+        std::panic::resume_unwind(panic_payload);
+    }
+    recv_result.map_err(|_| Error::tool("package_manager", cancelled_message))?
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackageScope {
     User,
@@ -89,18 +100,27 @@ pub struct ResolveRoots {
     pub project_settings_path: PathBuf,
     pub global_base_dir: PathBuf,
     pub project_base_dir: PathBuf,
+    pub project_settings_enabled: bool,
 }
 
 impl ResolveRoots {
-    /// Build roots using the default Pi settings locations (env + cwd).
-    #[must_use]
-    pub fn from_env(cwd: &Path) -> Self {
+    fn from_override(cwd: &Path, config_override_path: Option<&Path>) -> Self {
         Self {
-            global_settings_path: global_settings_path(),
+            global_settings_path: config_override_path.map_or_else(
+                || Config::global_dir().join("settings.json"),
+                std::path::Path::to_path_buf,
+            ),
             project_settings_path: project_settings_path(cwd),
             global_base_dir: Config::global_dir(),
             project_base_dir: cwd.join(Config::project_dir()),
+            project_settings_enabled: config_override_path.is_none(),
         }
+    }
+
+    /// Build roots using the default Pi settings locations (env + cwd).
+    #[must_use]
+    pub fn from_env(cwd: &Path) -> Self {
+        Self::from_override(cwd, Config::config_path_override_from_env(cwd).as_deref())
     }
 }
 
@@ -244,16 +264,15 @@ impl PackageManager {
         let source = source.to_string();
         let (tx, rx) = oneshot::channel();
 
-        thread::spawn(move || {
+        let handle = thread::spawn(move || {
             let res = this.install_sync(&source, scope);
             let cx = AgentCx::for_request();
             let _ = tx.send(cx.cx(), res);
         });
 
         let cx = AgentCx::for_request();
-        rx.recv(cx.cx())
-            .await
-            .map_err(|_| Error::tool("package_manager", "Install task cancelled"))?
+        let recv_result = rx.recv(cx.cx()).await;
+        finish_package_task(handle, recv_result, "Install task cancelled")
     }
 
     fn install_sync(&self, source: &str, scope: PackageScope) -> Result<()> {
@@ -261,12 +280,12 @@ impl PackageManager {
         match parsed {
             ParsedSource::Npm { spec, .. } => self.install_npm(&spec, scope),
             ParsedSource::Git {
-                repo,
+                clone_source,
                 host,
                 path,
                 r#ref,
                 ..
-            } => self.install_git(&repo, &host, &path, r#ref.as_deref(), scope),
+            } => self.install_git(&clone_source, &host, &path, r#ref.as_deref(), scope),
             ParsedSource::Local { path } => {
                 if path.exists() {
                     Ok(())
@@ -287,16 +306,15 @@ impl PackageManager {
         let source = source.to_string();
         let (tx, rx) = oneshot::channel();
 
-        thread::spawn(move || {
+        let handle = thread::spawn(move || {
             let res = this.remove_sync(&source, scope);
             let cx = AgentCx::for_request();
             let _ = tx.send(cx.cx(), res);
         });
 
         let cx = AgentCx::for_request();
-        rx.recv(cx.cx())
-            .await
-            .map_err(|_| Error::tool("package_manager", "Remove task cancelled"))?
+        let recv_result = rx.recv(cx.cx()).await;
+        finish_package_task(handle, recv_result, "Remove task cancelled")
     }
 
     fn remove_sync(&self, source: &str, scope: PackageScope) -> Result<()> {
@@ -315,16 +333,15 @@ impl PackageManager {
         let source = source.to_string();
         let (tx, rx) = oneshot::channel();
 
-        thread::spawn(move || {
+        let handle = thread::spawn(move || {
             let res = this.update_source_sync(&source, scope);
             let cx = AgentCx::for_request();
             let _ = tx.send(cx.cx(), res);
         });
 
         let cx = AgentCx::for_request();
-        rx.recv(cx.cx())
-            .await
-            .map_err(|_| Error::tool("package_manager", "Update task cancelled"))?
+        let recv_result = rx.recv(cx.cx()).await;
+        finish_package_task(handle, recv_result, "Update task cancelled")
     }
 
     fn update_source_sync(&self, source: &str, scope: PackageScope) -> Result<()> {
@@ -336,14 +353,14 @@ impl PackageManager {
                 }
             }
             ParsedSource::Git {
-                repo,
+                clone_source,
                 host,
                 path,
                 pinned,
                 ..
             } => {
                 if !pinned {
-                    self.update_git(&repo, &host, &path, scope)?;
+                    self.update_git(&clone_source, &host, &path, scope)?;
                 }
             }
             ParsedSource::Local { .. } => {}
@@ -361,16 +378,15 @@ impl PackageManager {
         let source = source.to_string();
         let (tx, rx) = oneshot::channel();
 
-        thread::spawn(move || {
+        let handle = thread::spawn(move || {
             let res = this.installed_path_sync(&source, scope);
             let cx = AgentCx::for_request();
             let _ = tx.send(cx.cx(), res);
         });
 
         let cx = AgentCx::for_request();
-        rx.recv(cx.cx())
-            .await
-            .map_err(|_| Error::tool("package_manager", "Installed path lookup cancelled"))?
+        let recv_result = rx.recv(cx.cx()).await;
+        finish_package_task(handle, recv_result, "Installed path lookup cancelled")
     }
 
     /// Synchronous variant of [`Self::installed_path`] for startup fast paths.
@@ -387,7 +403,7 @@ impl PackageManager {
         Ok(match parsed {
             ParsedSource::Npm { name, .. } => self.npm_install_path(&name, scope)?,
             ParsedSource::Git { host, path, .. } => {
-                Some(self.git_install_path(&host, &path, scope))
+                Some(self.checked_git_install_path(&host, &path, scope)?)
             }
             ParsedSource::Local { path } => Some(path),
         })
@@ -397,31 +413,39 @@ impl PackageManager {
         let this = self.clone();
         let (tx, rx) = oneshot::channel();
 
-        thread::spawn(move || {
+        let handle = thread::spawn(move || {
             let res = this.list_packages_sync();
             let cx = AgentCx::for_request();
             let _ = tx.send(cx.cx(), res);
         });
 
         let cx = AgentCx::for_request();
-        rx.recv(cx.cx())
-            .await
-            .map_err(|_| Error::tool("package_manager", "List packages task cancelled"))?
+        let recv_result = rx.recv(cx.cx()).await;
+        finish_package_task(handle, recv_result, "List packages task cancelled")
     }
 
     /// Synchronous variant of [`Self::list_packages`] for startup fast paths.
     pub fn list_packages_blocking(&self) -> Result<Vec<PackageEntry>> {
-        self.list_packages_sync()
+        let roots = ResolveRoots::from_env(&self.cwd);
+        Self::list_packages_with_roots(&roots)
     }
 
     fn list_packages_sync(&self) -> Result<Vec<PackageEntry>> {
-        let global = list_packages_in_settings(&global_settings_path())?
+        self.list_packages_blocking()
+    }
+
+    fn list_packages_with_roots(roots: &ResolveRoots) -> Result<Vec<PackageEntry>> {
+        let global = list_packages_in_settings(&roots.global_settings_path)?
             .into_iter()
             .map(|mut p| {
                 p.scope = PackageScope::User;
                 p
             });
-        let project = list_packages_in_settings(&project_settings_path(&self.cwd))?
+        let project = roots
+            .project_settings_enabled
+            .then(|| list_packages_in_settings(&roots.project_settings_path))
+            .transpose()?
+            .unwrap_or_default()
             .into_iter()
             .map(|mut p| {
                 p.scope = PackageScope::Project;
@@ -430,29 +454,120 @@ impl PackageManager {
         Ok(global.chain(project).collect())
     }
 
+    /// Best-effort synchronous package resource resolution for startup/config fast paths.
+    ///
+    /// Returns `Ok(Some(...))` when all package resources can be resolved from local state
+    /// without any install/update work. Returns `Ok(None)` when a package source would require
+    /// install/update behavior (for example, missing npm/git package files), allowing callers
+    /// to fall back to the canonical async `resolve()` path.
+    pub fn resolve_package_resources_blocking(&self) -> Result<Option<ResolvedPaths>> {
+        let roots = ResolveRoots::from_env(&self.cwd);
+        self.resolve_package_resources_with_roots_blocking(&roots)
+    }
+
+    fn resolve_package_resources_with_roots_blocking(
+        &self,
+        roots: &ResolveRoots,
+    ) -> Result<Option<ResolvedPaths>> {
+        let global = read_settings_snapshot(&roots.global_settings_path)?;
+        let project = read_project_settings_snapshot(roots)?;
+
+        let mut all_packages: Vec<ScopedPackage> = Vec::new();
+        all_packages.extend(global.packages.iter().cloned().map(|pkg| ScopedPackage {
+            pkg,
+            scope: PackageScope::User,
+        }));
+        all_packages.extend(project.packages.iter().cloned().map(|pkg| ScopedPackage {
+            pkg,
+            scope: PackageScope::Project,
+        }));
+        let package_sources = self.dedupe_packages(all_packages);
+
+        let mut accumulator = ResourceAccumulator::new();
+
+        for entry in package_sources {
+            let source_str = entry.pkg.source.trim();
+            if source_str.is_empty() {
+                continue;
+            }
+
+            let parsed = parse_source(source_str, &self.cwd);
+            let mut metadata = PathMetadata {
+                source: source_str.to_string(),
+                scope: entry.scope,
+                origin: ResourceOrigin::Package,
+                base_dir: None,
+            };
+
+            match parsed {
+                ParsedSource::Local { path } => {
+                    Self::resolve_local_extension_source(
+                        &path,
+                        &mut accumulator,
+                        entry.pkg.filter.as_ref(),
+                        &mut metadata,
+                        entry.scope == PackageScope::Temporary,
+                    )?;
+                }
+                ParsedSource::Npm { name, .. } => {
+                    let installed_path = self
+                        .npm_install_path(&name, entry.scope)?
+                        .unwrap_or_else(|| self.cwd.join("node_modules").join(&name));
+
+                    if !installed_path.exists() {
+                        return Ok(None);
+                    }
+
+                    metadata.base_dir = Some(installed_path.clone());
+                    Self::collect_package_resources(
+                        &installed_path,
+                        &mut accumulator,
+                        entry.pkg.filter.as_ref(),
+                        &metadata,
+                    )?;
+                }
+                ParsedSource::Git { host, path, .. } => {
+                    let installed_path =
+                        self.checked_git_install_path(&host, &path, entry.scope)?;
+                    if !installed_path.exists() {
+                        return Ok(None);
+                    }
+
+                    metadata.base_dir = Some(installed_path.clone());
+                    Self::collect_package_resources(
+                        &installed_path,
+                        &mut accumulator,
+                        entry.pkg.filter.as_ref(),
+                        &metadata,
+                    )?;
+                }
+            }
+        }
+
+        Ok(Some(accumulator.into_resolved_paths()))
+    }
+
     /// Ensure all packages in settings are installed.
     /// Returns the list of packages that were newly installed.
     pub async fn ensure_packages_installed(&self) -> Result<Vec<PackageEntry>> {
-        // This method combines multiple async calls, so we don't need to wrap it in spawn
-        // assuming list_packages and install are properly offloaded.
-        // However, iterating and installing sequentially might be slow.
-        // For now, simple sequential await is fine.
-
         let packages = self.list_packages().await?;
+        self.ensure_package_entries_installed(packages).await
+    }
+
+    async fn ensure_package_entries_installed(
+        &self,
+        packages: Vec<PackageEntry>,
+    ) -> Result<Vec<PackageEntry>> {
         let mut installed = Vec::new();
 
         for entry in packages {
-            // Check if already installed
-            if let Ok(Some(path)) = self.installed_path(&entry.source, entry.scope).await {
-                if path.exists() {
-                    continue;
-                }
+            match self.installed_path(&entry.source, entry.scope).await? {
+                Some(path) if path.exists() => continue,
+                _ => {}
             }
 
-            // Install the package
-            if self.install(&entry.source, entry.scope).await.is_ok() {
-                installed.push(entry);
-            }
+            self.install(&entry.source, entry.scope).await?;
+            installed.push(entry);
         }
 
         Ok(installed)
@@ -475,10 +590,10 @@ impl PackageManager {
         let (tx, rx) = oneshot::channel();
 
         // Offload the heavy lifting (sync I/O) to a thread
-        thread::spawn(move || {
+        let handle = thread::spawn(move || {
             let res: Result<(SettingsSnapshot, SettingsSnapshot, Vec<ScopedPackage>)> = (|| {
                 let global = read_settings_snapshot(&roots_for_setup.global_settings_path)?;
-                let project = read_settings_snapshot(&roots_for_setup.project_settings_path)?;
+                let project = read_project_settings_snapshot(&roots_for_setup)?;
 
                 // 1) Package resources (global + project, deduped; project wins)
                 let mut all_packages: Vec<ScopedPackage> = Vec::new();
@@ -486,10 +601,14 @@ impl PackageManager {
                     pkg,
                     scope: PackageScope::User,
                 }));
-                all_packages.extend(project.packages.iter().cloned().map(|pkg| ScopedPackage {
-                    pkg,
-                    scope: PackageScope::Project,
-                }));
+                if roots_for_setup.project_settings_enabled {
+                    all_packages.extend(project.packages.iter().cloned().map(|pkg| {
+                        ScopedPackage {
+                            pkg,
+                            scope: PackageScope::Project,
+                        }
+                    }));
+                }
                 let package_sources = this_for_setup.dedupe_packages(all_packages);
                 Ok((global, project, package_sources))
             })(
@@ -499,10 +618,9 @@ impl PackageManager {
         });
 
         let cx = AgentCx::for_request();
-        let (global, project, package_sources) = rx
-            .recv(cx.cx())
-            .await
-            .map_err(|_| Error::tool("package_manager", "Resolve setup task cancelled"))??;
+        let recv_result = rx.recv(cx.cx()).await;
+        let (global, project, package_sources) =
+            finish_package_task(handle, recv_result, "Resolve setup task cancelled")?;
 
         let mut accumulator = ResourceAccumulator::new();
 
@@ -515,8 +633,10 @@ impl PackageManager {
         let (tx, rx) = oneshot::channel();
         let accumulator = std::sync::Mutex::new(accumulator);
 
-        thread::spawn(move || {
-            let mut accumulator = accumulator.lock().unwrap();
+        let handle = thread::spawn(move || {
+            let mut accumulator = accumulator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
 
             // 2) Local entries from settings (global and project)
             for resource_type in ResourceType::all() {
@@ -534,18 +654,20 @@ impl PackageManager {
                     &roots.global_base_dir,
                 );
 
-                Self::resolve_local_entries(
-                    project.entries_for(resource_type),
-                    resource_type,
-                    target,
-                    &PathMetadata {
-                        source: "local".to_string(),
-                        scope: PackageScope::Project,
-                        origin: ResourceOrigin::TopLevel,
-                        base_dir: Some(roots.project_base_dir.clone()),
-                    },
-                    &roots.project_base_dir,
-                );
+                if roots.project_settings_enabled {
+                    Self::resolve_local_entries(
+                        project.entries_for(resource_type),
+                        resource_type,
+                        target,
+                        &PathMetadata {
+                            source: "local".to_string(),
+                            scope: PackageScope::Project,
+                            origin: ResourceOrigin::TopLevel,
+                            base_dir: Some(roots.project_base_dir.clone()),
+                        },
+                        &roots.project_base_dir,
+                    );
+                }
             }
 
             // 3) Auto-discovered resources from standard dirs (global and project)
@@ -555,6 +677,7 @@ impl PackageManager {
                 &project,
                 &roots.global_base_dir,
                 &roots.project_base_dir,
+                roots.project_settings_enabled,
             );
 
             let resolved = accumulator.clone().into_resolved_paths();
@@ -565,9 +688,8 @@ impl PackageManager {
         });
 
         let cx = AgentCx::for_request();
-        rx.recv(cx.cx())
-            .await
-            .map_err(|_| Error::tool("package_manager", "Resolve processing task cancelled"))?
+        let recv_result = rx.recv(cx.cx()).await;
+        finish_package_task(handle, recv_result, "Resolve processing task cancelled")
     }
 
     /// Resolve resources for extension sources specified via CLI `-e/--extension`.
@@ -603,7 +725,7 @@ impl PackageManager {
         let (tx, rx) = oneshot::channel();
         let accumulator = std::sync::Mutex::new(accumulator);
 
-        thread::spawn(move || {
+        let handle = thread::spawn(move || {
             let resolved = {
                 let accumulator = accumulator
                     .lock()
@@ -616,9 +738,8 @@ impl PackageManager {
         });
 
         let cx = AgentCx::for_request();
-        rx.recv(cx.cx())
-            .await
-            .map_err(|_| Error::tool("package_manager", "Resolve extensions task cancelled"))?
+        let recv_result = rx.recv(cx.cx()).await;
+        finish_package_task(handle, recv_result, "Resolve extensions task cancelled")
     }
 
     pub async fn add_package_source(&self, source: &str, scope: PackageScope) -> Result<()> {
@@ -626,21 +747,20 @@ impl PackageManager {
         let source = source.to_string();
         let (tx, rx) = oneshot::channel();
 
-        thread::spawn(move || {
+        let handle = thread::spawn(move || {
             let res = this.add_package_source_sync(&source, scope);
             let cx = AgentCx::for_request();
             let _ = tx.send(cx.cx(), res);
         });
 
         let cx = AgentCx::for_request();
-        rx.recv(cx.cx())
-            .await
-            .map_err(|_| Error::tool("package_manager", "Add source task cancelled"))?
+        let recv_result = rx.recv(cx.cx()).await;
+        finish_package_task(handle, recv_result, "Add source task cancelled")
     }
 
     fn add_package_source_sync(&self, source: &str, scope: PackageScope) -> Result<()> {
         let path = match scope {
-            PackageScope::User => global_settings_path(),
+            PackageScope::User => global_settings_path(&self.cwd),
             PackageScope::Project => project_settings_path(&self.cwd),
             PackageScope::Temporary => {
                 return Err(Error::config(
@@ -648,7 +768,7 @@ impl PackageManager {
                 ));
             }
         };
-        update_package_sources(&path, source, UpdateAction::Add)
+        update_package_sources(&path, source, UpdateAction::Add, &self.cwd)
     }
 
     pub async fn remove_package_source(&self, source: &str, scope: PackageScope) -> Result<()> {
@@ -656,21 +776,20 @@ impl PackageManager {
         let source = source.to_string();
         let (tx, rx) = oneshot::channel();
 
-        thread::spawn(move || {
+        let handle = thread::spawn(move || {
             let res = this.remove_package_source_sync(&source, scope);
             let cx = AgentCx::for_request();
             let _ = tx.send(cx.cx(), res);
         });
 
         let cx = AgentCx::for_request();
-        rx.recv(cx.cx())
-            .await
-            .map_err(|_| Error::tool("package_manager", "Remove source task cancelled"))?
+        let recv_result = rx.recv(cx.cx()).await;
+        finish_package_task(handle, recv_result, "Remove source task cancelled")
     }
 
     fn remove_package_source_sync(&self, source: &str, scope: PackageScope) -> Result<()> {
         let path = match scope {
-            PackageScope::User => global_settings_path(),
+            PackageScope::User => global_settings_path(&self.cwd),
             PackageScope::Project => project_settings_path(&self.cwd),
             PackageScope::Temporary => {
                 return Err(Error::config(
@@ -678,7 +797,7 @@ impl PackageManager {
                 ));
             }
         };
-        update_package_sources(&path, source, UpdateAction::Remove)
+        update_package_sources(&path, source, UpdateAction::Remove, &self.cwd)
     }
 
     fn lockfile_path_for_scope(&self, scope: PackageScope) -> Option<PathBuf> {
@@ -839,10 +958,14 @@ impl PackageManager {
         }
 
         let payload = serde_json::to_string(event)?;
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(path)?;
         writeln!(file, "{payload}")?;
         Ok(())
     }
@@ -917,8 +1040,9 @@ impl PackageManager {
                 path,
                 r#ref,
                 pinned,
+                ..
             } => {
-                let installed_path = self.git_install_path(&host, &path, scope);
+                let installed_path = self.checked_git_install_path(&host, &path, scope)?;
                 if !installed_path.exists() {
                     return Err(Error::tool(
                         "package_manager",
@@ -1047,14 +1171,19 @@ impl PackageManager {
         Ok(PathBuf::from(root))
     }
 
+    fn npm_prefix_root(&self, scope: PackageScope) -> Option<PathBuf> {
+        match scope {
+            PackageScope::Project => Some(self.project_npm_root()),
+            PackageScope::Temporary => Some(temporary_dir("npm", None)),
+            PackageScope::User => None,
+        }
+    }
+
     fn npm_install_path(&self, name: &str, scope: PackageScope) -> Result<Option<PathBuf>> {
-        Ok(match scope {
-            PackageScope::Temporary => {
-                Some(temporary_dir("npm", None).join("node_modules").join(name))
-            }
-            PackageScope::Project => Some(self.project_npm_root().join("node_modules").join(name)),
-            PackageScope::User => Some(self.global_npm_root()?.join(name)),
-        })
+        Ok(Some(match self.npm_prefix_root(scope) {
+            Some(prefix_root) => prefix_root.join("node_modules").join(name),
+            None => self.global_npm_root()?.join(name),
+        }))
     }
 
     fn git_root(&self, scope: PackageScope) -> Option<PathBuf> {
@@ -1073,29 +1202,39 @@ impl PackageManager {
         }
     }
 
+    fn checked_git_install_path(
+        &self,
+        host: &str,
+        repo_path: &str,
+        scope: PackageScope,
+    ) -> Result<PathBuf> {
+        if host.trim().is_empty() || repo_path.trim().is_empty() {
+            return Err(Error::tool(
+                "package_manager",
+                "Invalid git package source: remote repositories must include both a host and repository path",
+            ));
+        }
+
+        Ok(self.git_install_path(host, repo_path, scope))
+    }
+
     fn install_npm(&self, spec: &str, scope: PackageScope) -> Result<()> {
         let (name, _) = parse_npm_spec(spec);
-        match scope {
-            PackageScope::User => run_command("npm", ["install", "-g", spec], None)?,
-            PackageScope::Project | PackageScope::Temporary => {
-                let install_root = match scope {
-                    PackageScope::Project => self.project_npm_root(),
-                    PackageScope::Temporary => temporary_dir("npm", None),
-                    PackageScope::User => unreachable!("handled above"),
-                };
-                ensure_npm_project(&install_root)?;
-                run_command(
-                    "npm",
-                    [
-                        "install",
-                        "--prefix",
-                        install_root.to_string_lossy().as_ref(),
-                        "--",
-                        spec,
-                    ],
-                    None,
-                )?;
-            }
+        if let Some(install_root) = self.npm_prefix_root(scope) {
+            ensure_npm_project(&install_root)?;
+            run_command(
+                "npm",
+                [
+                    "install",
+                    "--prefix",
+                    install_root.to_string_lossy().as_ref(),
+                    "--",
+                    spec,
+                ],
+                None,
+            )?;
+        } else {
+            run_command("npm", ["install", "-g", spec], None)?;
         }
 
         // Basic sanity: installed path exists
@@ -1115,15 +1254,9 @@ impl PackageManager {
     }
 
     fn uninstall_npm(&self, name: &str, scope: PackageScope) -> Result<()> {
-        if scope == PackageScope::User {
+        let Some(install_root) = self.npm_prefix_root(scope) else {
             run_command("npm", ["uninstall", "-g", "--", name], None)?;
             return Ok(());
-        }
-
-        let install_root = match scope {
-            PackageScope::Project => self.project_npm_root(),
-            PackageScope::Temporary => temporary_dir("npm", None),
-            PackageScope::User => unreachable!("handled above"),
         };
         if !install_root.exists() {
             return Ok(());
@@ -1150,7 +1283,7 @@ impl PackageManager {
         r#ref: Option<&str>,
         scope: PackageScope,
     ) -> Result<()> {
-        let target_dir = self.git_install_path(host, repo_path, scope);
+        let target_dir = self.checked_git_install_path(host, repo_path, scope)?;
         if target_dir.exists() {
             return Ok(());
         }
@@ -1205,7 +1338,7 @@ impl PackageManager {
             return Ok(());
         }
 
-        let target_dir = self.git_install_path(host, repo_path, scope);
+        let target_dir = self.checked_git_install_path(host, repo_path, scope)?;
         if !target_dir.exists() {
             return self.install_git(repo, host, repo_path, None, scope);
         }
@@ -1222,7 +1355,7 @@ impl PackageManager {
     }
 
     fn remove_git(&self, host: &str, repo_path: &str, scope: PackageScope) -> Result<()> {
-        let target_dir = self.git_install_path(host, repo_path, scope);
+        let target_dir = self.checked_git_install_path(host, repo_path, scope)?;
         if !target_dir.exists() {
             return Ok(());
         }
@@ -1251,7 +1384,7 @@ struct PackageSpec {
     filter: Option<PackageFilter>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct SettingsSnapshot {
     packages: Vec<PackageSpec>,
     extensions: Vec<String>,
@@ -1293,6 +1426,14 @@ fn read_settings_snapshot(path: &Path) -> Result<SettingsSnapshot> {
         prompts: extract_string_array(value.get("prompts")),
         themes: extract_string_array(value.get("themes")),
     })
+}
+
+fn read_project_settings_snapshot(roots: &ResolveRoots) -> Result<SettingsSnapshot> {
+    if roots.project_settings_enabled {
+        read_settings_snapshot(&roots.project_settings_path)
+    } else {
+        Ok(SettingsSnapshot::default())
+    }
 }
 
 fn extract_string_array(value: Option<&Value>) -> Vec<String> {
@@ -1487,7 +1628,8 @@ impl PackageManager {
                         accumulator,
                         entry.pkg.filter.as_ref(),
                         &mut metadata,
-                    );
+                        entry.scope == PackageScope::Temporary,
+                    )?;
                 }
                 ParsedSource::Npm { spec, name, pinned } => {
                     // Offload installed_path check
@@ -1508,7 +1650,7 @@ impl PackageManager {
                         accumulator,
                         entry.pkg.filter.as_ref(),
                         &metadata,
-                    );
+                    )?;
                 }
                 ParsedSource::Git {
                     repo: _,
@@ -1518,7 +1660,8 @@ impl PackageManager {
                     ..
                 } => {
                     // Offload git_install_path
-                    let installed_path = self.git_install_path(&host, &path, entry.scope);
+                    let installed_path =
+                        self.checked_git_install_path(&host, &path, entry.scope)?;
 
                     if !installed_path.exists() {
                         self.install(source_str, entry.scope).await?;
@@ -1530,7 +1673,7 @@ impl PackageManager {
                         accumulator,
                         entry.pkg.filter.as_ref(),
                         &metadata,
-                    );
+                    )?;
                 }
             }
         }
@@ -1559,41 +1702,68 @@ impl PackageManager {
         accumulator: &mut ResourceAccumulator,
         filter: Option<&PackageFilter>,
         metadata: &mut PathMetadata,
-    ) {
+        strict: bool,
+    ) -> Result<()> {
         if !resolved.exists() {
-            return;
+            if strict {
+                return Err(Error::config(format!(
+                    "Extension source '{}' does not exist",
+                    resolved.display()
+                )));
+            }
+            return Ok(());
         }
 
-        let Ok(stats) = fs::metadata(resolved) else {
-            return;
+        let stats = match fs::metadata(resolved) {
+            Ok(stats) => stats,
+            Err(err) => {
+                if strict {
+                    return Err(Error::config(format!(
+                        "Failed to inspect extension source '{}': {err}",
+                        resolved.display()
+                    )));
+                }
+                return Ok(());
+            }
         };
 
         if stats.is_file() {
             if !is_supported_extension_file(resolved) {
-                warn!(
-                    path = %resolved.display(),
-                    "Ignoring unsupported extension source file; use extension.json, *.native.json, or *.wasm"
+                let message = format!(
+                    "Unsupported extension source file '{}'; use extension.json, JS/TS entrypoints, *.native.json, or *.wasm",
+                    resolved.display()
                 );
-                return;
+                if strict {
+                    return Err(Error::config(message));
+                }
+                warn!(path = %resolved.display(), "{message}");
+                return Ok(());
             }
             metadata.base_dir = resolved.parent().map(Path::to_path_buf);
             accumulator
                 .extensions
                 .add(resolved.to_path_buf(), metadata, true);
-            return;
+            return Ok(());
         }
 
         if !stats.is_dir() {
-            return;
+            if strict {
+                return Err(Error::config(format!(
+                    "Extension source '{}' is neither a file nor a directory",
+                    resolved.display()
+                )));
+            }
+            return Ok(());
         }
 
         metadata.base_dir = Some(resolved.to_path_buf());
-        let had_any = Self::collect_package_resources(resolved, accumulator, filter, metadata);
+        let had_any = Self::collect_package_resources(resolved, accumulator, filter, metadata)?;
         if !had_any {
             accumulator
                 .extensions
                 .add(resolved.to_path_buf(), metadata, true);
         }
+        Ok(())
     }
 
     fn resolve_local_entries(
@@ -1629,6 +1799,7 @@ impl PackageManager {
         project: &SettingsSnapshot,
         global_base_dir: &Path,
         project_base_dir: &Path,
+        project_settings_enabled: bool,
     ) {
         let user_metadata = PathMetadata {
             source: "auto".to_string(),
@@ -1671,27 +1842,30 @@ impl PackageManager {
                 target.add(path, &user_metadata, enabled);
             }
 
-            let (project_paths, project_overrides) = match resource_type {
-                ResourceType::Extensions => (
-                    collect_auto_extension_entries(&project_dirs.extensions),
-                    &project.extensions,
-                ),
-                ResourceType::Skills => (
-                    collect_auto_skill_entries(&project_dirs.skills),
-                    &project.skills,
-                ),
-                ResourceType::Prompts => (
-                    collect_auto_prompt_entries(&project_dirs.prompts),
-                    &project.prompts,
-                ),
-                ResourceType::Themes => (
-                    collect_auto_theme_entries(&project_dirs.themes),
-                    &project.themes,
-                ),
-            };
-            for path in project_paths {
-                let enabled = is_enabled_by_overrides(&path, project_overrides, project_base_dir);
-                target.add(path, &project_metadata, enabled);
+            if project_settings_enabled {
+                let (project_paths, project_overrides) = match resource_type {
+                    ResourceType::Extensions => (
+                        collect_auto_extension_entries(&project_dirs.extensions),
+                        &project.extensions,
+                    ),
+                    ResourceType::Skills => (
+                        collect_auto_skill_entries(&project_dirs.skills),
+                        &project.skills,
+                    ),
+                    ResourceType::Prompts => (
+                        collect_auto_prompt_entries(&project_dirs.prompts),
+                        &project.prompts,
+                    ),
+                    ResourceType::Themes => (
+                        collect_auto_theme_entries(&project_dirs.themes),
+                        &project.themes,
+                    ),
+                };
+                for path in project_paths {
+                    let enabled =
+                        is_enabled_by_overrides(&path, project_overrides, project_base_dir);
+                    target.add(path, &project_metadata, enabled);
+                }
             }
         }
     }
@@ -1701,7 +1875,7 @@ impl PackageManager {
         accumulator: &mut ResourceAccumulator,
         filter: Option<&PackageFilter>,
         metadata: &PathMetadata,
-    ) -> bool {
+    ) -> Result<bool> {
         if let Some(filter) = filter {
             for resource_type in ResourceType::all() {
                 let target = accumulator.target_mut(resource_type);
@@ -1719,15 +1893,15 @@ impl PackageManager {
                         resource_type,
                         target,
                         metadata,
-                    );
+                    )?;
                 } else {
-                    Self::collect_default_resources(package_root, resource_type, target, metadata);
+                    Self::collect_default_resources(package_root, resource_type, target, metadata)?;
                 }
             }
-            return true;
+            return Ok(true);
         }
 
-        if let Some(manifest) = read_pi_manifest(package_root) {
+        if let Some(manifest) = read_pi_manifest(package_root)? {
             for resource_type in ResourceType::all() {
                 let entries = manifest.entries_for(resource_type);
                 Self::add_manifest_entries(
@@ -1738,7 +1912,7 @@ impl PackageManager {
                     metadata,
                 );
             }
-            return true;
+            return Ok(true);
         }
 
         let mut has_any_dir = false;
@@ -1754,7 +1928,7 @@ impl PackageManager {
             }
         }
 
-        has_any_dir
+        Ok(has_any_dir)
     }
 
     fn collect_default_resources(
@@ -1762,18 +1936,17 @@ impl PackageManager {
         resource_type: ResourceType,
         target: &mut ResourceList,
         metadata: &PathMetadata,
-    ) {
-        if let Some(manifest) = read_pi_manifest(package_root) {
-            let entries = manifest.entries_for(resource_type);
-            if entries.as_ref().is_some_and(|e| !e.is_empty()) {
+    ) -> Result<()> {
+        if let Some(manifest) = read_pi_manifest(package_root)? {
+            if let Some(entries) = manifest.entries_for(resource_type) {
                 Self::add_manifest_entries(
-                    entries.as_deref(),
+                    Some(&entries),
                     package_root,
                     resource_type,
                     target,
                     metadata,
                 );
-                return;
+                return Ok(());
             }
         }
 
@@ -1784,6 +1957,7 @@ impl PackageManager {
                 target.add(f, metadata, true);
             }
         }
+        Ok(())
     }
 
     fn apply_package_filter(
@@ -1792,14 +1966,14 @@ impl PackageManager {
         resource_type: ResourceType,
         target: &mut ResourceList,
         metadata: &PathMetadata,
-    ) {
-        let (all_files, _) = Self::collect_manifest_files(package_root, resource_type);
+    ) -> Result<()> {
+        let (all_files, _) = Self::collect_manifest_files(package_root, resource_type)?;
 
         if user_patterns.is_empty() {
             for f in all_files {
                 target.add(f, metadata, false);
             }
-            return;
+            return Ok(());
         }
 
         let enabled_by_user = apply_patterns(&all_files, user_patterns, package_root);
@@ -1807,45 +1981,46 @@ impl PackageManager {
             let enabled = enabled_by_user.contains(&f);
             target.add(f, metadata, enabled);
         }
+        Ok(())
     }
 
     fn collect_manifest_files(
         package_root: &Path,
         resource_type: ResourceType,
-    ) -> (Vec<PathBuf>, std::collections::HashSet<PathBuf>) {
-        if let Some(manifest) = read_pi_manifest(package_root) {
-            let entries = manifest.entries_for(resource_type);
-            if let Some(entries) = entries {
-                if !entries.is_empty() {
-                    let all_files =
-                        collect_files_from_manifest_entries(&entries, package_root, resource_type);
-                    let patterns = entries
-                        .iter()
-                        .filter(|e| is_pattern(e))
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    let enabled_by_manifest = if patterns.is_empty() {
-                        all_files
-                            .iter()
-                            .cloned()
-                            .collect::<std::collections::HashSet<_>>()
-                    } else {
-                        apply_patterns(&all_files, &patterns, package_root)
-                    };
-                    let mut enabled_vec = enabled_by_manifest.iter().cloned().collect::<Vec<_>>();
-                    enabled_vec.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
-                    return (enabled_vec, enabled_by_manifest);
+    ) -> Result<(Vec<PathBuf>, std::collections::HashSet<PathBuf>)> {
+        if let Some(manifest) = read_pi_manifest(package_root)? {
+            if let Some(entries) = manifest.entries_for(resource_type) {
+                if entries.is_empty() {
+                    return Ok((Vec::new(), std::collections::HashSet::new()));
                 }
+                let all_files =
+                    collect_files_from_manifest_entries(&entries, package_root, resource_type);
+                let patterns = entries
+                    .iter()
+                    .filter(|e| is_pattern(e))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let enabled_by_manifest = if patterns.is_empty() {
+                    all_files
+                        .iter()
+                        .cloned()
+                        .collect::<std::collections::HashSet<_>>()
+                } else {
+                    apply_patterns(&all_files, &patterns, package_root)
+                };
+                let mut enabled_vec = enabled_by_manifest.iter().cloned().collect::<Vec<_>>();
+                enabled_vec.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
+                return Ok((enabled_vec, enabled_by_manifest));
             }
         }
 
         let convention_dir = package_root.join(resource_type.as_str());
         if !convention_dir.exists() {
-            return (Vec::new(), std::collections::HashSet::new());
+            return Ok((Vec::new(), std::collections::HashSet::new()));
         }
         let all_files = collect_resource_files(&convention_dir, resource_type);
         let set = all_files.iter().cloned().collect();
-        (all_files, set)
+        Ok((all_files, set))
     }
 
     fn add_manifest_entries(
@@ -1916,42 +2091,68 @@ impl PiManifest {
     }
 }
 
-fn read_pi_manifest(package_root: &Path) -> Option<PiManifest> {
-    let package_json = package_root.join("package.json");
-    if !package_json.exists() {
-        return None;
-    }
-    let raw = fs::read_to_string(package_json).ok()?;
-    let json: Value = serde_json::from_str(&raw).ok()?;
-    let pi = json.get("pi")?;
-    let obj = pi.as_object()?;
+fn parse_manifest_entries_field(
+    obj: &serde_json::Map<String, Value>,
+    key: &str,
+    manifest_path: &Path,
+) -> Result<Option<Vec<String>>> {
+    let Some(value) = obj.get(key) else {
+        return Ok(None);
+    };
+    let Some(arr) = value.as_array() else {
+        return Err(Error::config(format!(
+            "Invalid package manifest {}: `pi.{key}` must be an array of strings",
+            manifest_path.display()
+        )));
+    };
 
-    Some(PiManifest {
-        extensions: obj.get("extensions").and_then(Value::as_array).map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        }),
-        skills: obj.get("skills").and_then(Value::as_array).map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        }),
-        prompts: obj.get("prompts").and_then(Value::as_array).map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        }),
-        themes: obj.get("themes").and_then(Value::as_array).map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        }),
-    })
+    let mut out = Vec::with_capacity(arr.len());
+    for entry in arr {
+        let Some(entry) = entry.as_str() else {
+            return Err(Error::config(format!(
+                "Invalid package manifest {}: `pi.{key}` must be an array of strings",
+                manifest_path.display()
+            )));
+        };
+        out.push(entry.to_string());
+    }
+
+    Ok(Some(out))
+}
+
+fn read_pi_manifest(package_root: &Path) -> Result<Option<PiManifest>> {
+    let manifest_path = package_root.join("package.json");
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&manifest_path).map_err(|err| {
+        Error::config(format!(
+            "Failed to read package manifest {}: {err}",
+            manifest_path.display()
+        ))
+    })?;
+    let json: Value = serde_json::from_str(&raw).map_err(|err| {
+        Error::config(format!(
+            "Failed to parse package manifest {}: {err}",
+            manifest_path.display()
+        ))
+    })?;
+    let Some(pi) = json.get("pi") else {
+        return Ok(None);
+    };
+    let Some(obj) = pi.as_object() else {
+        return Err(Error::config(format!(
+            "Invalid package manifest {}: `pi` must be an object",
+            manifest_path.display()
+        )));
+    };
+
+    Ok(Some(PiManifest {
+        extensions: parse_manifest_entries_field(obj, "extensions", &manifest_path)?,
+        skills: parse_manifest_entries_field(obj, "skills", &manifest_path)?,
+        prompts: parse_manifest_entries_field(obj, "prompts", &manifest_path)?,
+        themes: parse_manifest_entries_field(obj, "themes", &manifest_path)?,
+    }))
 }
 
 fn temporary_dir(prefix: &str, suffix: Option<&str>) -> PathBuf {
@@ -2246,7 +2447,7 @@ fn collect_files_from_paths(paths: &[PathBuf], resource_type: ResourceType) -> V
             if resource_type == ResourceType::Extensions && !is_supported_extension_file(p) {
                 warn!(
                     path = %p.display(),
-                    "Ignoring unsupported extension manifest file entry; use extension.json, *.native.json, or *.wasm"
+                    "Ignoring unsupported extension file entry; use extension.json, JS/TS entrypoints, *.native.json, or *.wasm"
                 );
                 continue;
             }
@@ -2312,10 +2513,18 @@ fn collect_files_recursive(dir: &Path, ext: &str) -> Vec<PathBuf> {
     out
 }
 
+fn canonical_identity_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 fn collect_skill_entries(dir: &Path) -> Vec<PathBuf> {
     if !dir.exists() {
         return Vec::new();
     }
+
+    let visited_dirs = std::sync::Mutex::new(std::collections::HashSet::new());
+    let mut out = Vec::new();
+    let mut seen_files = std::collections::HashSet::new();
 
     let mut builder = ignore::WalkBuilder::new(dir);
     builder
@@ -2324,26 +2533,44 @@ fn collect_skill_entries(dir: &Path) -> Vec<PathBuf> {
         .git_global(false)
         .git_exclude(false)
         .add_custom_ignore_filename(".fdignore")
-        .filter_entry(|e| e.file_name() != std::ffi::OsStr::new("node_modules"));
+        .filter_entry(move |entry| {
+            let name = entry.file_name().to_string_lossy();
+            if name == "node_modules" {
+                return false;
+            }
 
-    let mut out = Vec::new();
+            if !entry.path().is_dir() {
+                return true;
+            }
+
+            let canonical_dir = canonical_identity_path(entry.path());
+            visited_dirs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(canonical_dir)
+        });
+
     for entry in builder.build().filter_map(std::result::Result::ok) {
         let path = entry.path();
         if !path.is_file() {
             continue;
         }
+
         let rel = path.strip_prefix(dir).unwrap_or(path);
         let depth = rel.components().count();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let is_top_level_md = depth == 1 && path.extension().and_then(|e| e.to_str()) == Some("md");
+        let is_nested_skill = depth > 1 && name == "SKILL.md";
+        if !is_top_level_md && !is_nested_skill {
+            continue;
+        }
 
-        if depth == 1 {
-            if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                out.push(path.to_path_buf());
-            }
-        } else if name == "SKILL.md" {
+        let canonical_file = canonical_identity_path(path);
+        if seen_files.insert(canonical_file) {
             out.push(path.to_path_buf());
         }
     }
+
     out
 }
 
@@ -2412,9 +2639,17 @@ fn is_supported_extension_file(path: &Path) -> bool {
         return true;
     }
 
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
+    let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+
+    if ext.eq_ignore_ascii_case("wasm") {
+        return true;
+    }
+
+    ["ts", "tsx", "js", "mjs", "cjs", "mts", "cts"]
+        .iter()
+        .any(|candidate| ext.eq_ignore_ascii_case(candidate))
 }
 
 fn resolve_extension_entries(dir: &Path) -> Option<Vec<PathBuf>> {
@@ -2430,27 +2665,31 @@ fn resolve_extension_entries(dir: &Path) -> Option<Vec<PathBuf>> {
 
     let package_json_path = dir.join("package.json");
     if package_json_path.exists() {
-        let manifest = read_pi_manifest(dir);
-        if let Some(manifest) = manifest {
-            if let Some(exts) = manifest.extensions {
-                let mut entries = Vec::new();
-                for ext_path in exts {
-                    let resolved = dir.join(ext_path);
-                    if !resolved.exists() {
-                        continue;
+        match read_pi_manifest(dir) {
+            Ok(Some(manifest)) => {
+                if let Some(exts) = manifest.extensions {
+                    let mut entries = Vec::new();
+                    for ext_path in exts {
+                        let resolved = dir.join(ext_path);
+                        if !resolved.exists() {
+                            continue;
+                        }
+                        if resolved.is_file() && !is_supported_extension_file(&resolved) {
+                            warn!(
+                                path = %resolved.display(),
+                                "Ignoring unsupported package.json#pi.extensions entry; use extension.json, JS/TS entrypoints, *.native.json, or *.wasm"
+                            );
+                            continue;
+                        }
+                        entries.push(resolved);
                     }
-                    if resolved.is_file() && !is_supported_extension_file(&resolved) {
-                        warn!(
-                            path = %resolved.display(),
-                            "Ignoring unsupported package.json#pi.extensions entry; use extension.json, *.native.json, or *.wasm"
-                        );
-                        continue;
-                    }
-                    entries.push(resolved);
-                }
-                if !entries.is_empty() {
                     return Some(entries);
                 }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!(path = %package_json_path.display(), "Invalid package manifest: {err}");
+                return None;
             }
         }
     }
@@ -2460,21 +2699,40 @@ fn resolve_extension_entries(dir: &Path) -> Option<Vec<PathBuf>> {
         return Some(vec![index_native]);
     }
 
-    let index_ts = dir.join("index.ts");
-    if index_ts.exists() {
-        warn!(
-            path = %index_ts.display(),
-            "Ignoring legacy JS/TS extension entrypoint; use index.native.json"
-        );
+    for index_name in [
+        "index.ts",
+        "index.tsx",
+        "index.js",
+        "index.mjs",
+        "index.cjs",
+        "index.mts",
+        "index.cts",
+    ] {
+        let candidate = dir.join(index_name);
+        if candidate.exists() {
+            return Some(vec![candidate]);
+        }
     }
-    let index_js = dir.join("index.js");
-    if index_js.exists() {
-        warn!(
-            path = %index_js.display(),
-            "Ignoring legacy JS/TS extension entrypoint; use index.native.json"
-        );
-    }
+
     None
+}
+
+fn suppress_root_extension_walk(dir: &Path) -> bool {
+    match load_extension_manifest(dir) {
+        Ok(Some(_)) | Err(_) => return true,
+        Ok(None) => {}
+    }
+
+    let package_json_path = dir.join("package.json");
+    if !package_json_path.exists() {
+        return false;
+    }
+
+    match read_pi_manifest(dir) {
+        Ok(Some(manifest)) => manifest.extensions.is_some(),
+        Ok(None) => false,
+        Err(_) => true,
+    }
 }
 
 fn collect_auto_extension_entries(dir: &Path) -> Vec<PathBuf> {
@@ -2483,8 +2741,15 @@ fn collect_auto_extension_entries(dir: &Path) -> Vec<PathBuf> {
     }
 
     let mut out = Vec::new();
+    let suppress_root_walk = suppress_root_extension_walk(dir);
     if let Some(entries) = resolve_extension_entries(dir) {
         out.extend(entries);
+    }
+
+    if suppress_root_walk {
+        out.sort();
+        out.dedup();
+        return out;
     }
 
     let mut builder = ignore::WalkBuilder::new(dir);
@@ -2504,11 +2769,7 @@ fn collect_auto_extension_entries(dir: &Path) -> Vec<PathBuf> {
             continue;
         };
         if stats.is_file() {
-            let is_native_descriptor = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".native.json"));
-            if is_native_descriptor {
+            if is_supported_extension_file(&path) {
                 out.push(path);
             }
             continue;
@@ -2519,6 +2780,8 @@ fn collect_auto_extension_entries(dir: &Path) -> Vec<PathBuf> {
             }
         }
     }
+    out.sort();
+    out.dedup();
     out
 }
 
@@ -2586,6 +2849,7 @@ enum ParsedSource {
         pinned: bool,
     },
     Git {
+        clone_source: String,
         repo: String,
         host: String,
         path: String,
@@ -2649,14 +2913,165 @@ fn resolve_install_source_alias(source: &str, cwd: &Path) -> Option<String> {
     }
 }
 
-fn parse_git_source(spec: &str, cwd: &Path) -> ParsedSource {
-    let mut parts = spec.split('@');
-    let repo_raw = parts.next().unwrap_or("").trim();
-    let r#ref = parts
+fn git_clone_source(source: &str, cwd: &Path) -> String {
+    let spec = source.trim().strip_prefix("git:").unwrap_or(source).trim();
+    let (repo_raw, _) = split_git_spec_ref(spec);
+    if looks_like_local_path(repo_raw) {
+        local_path_from_spec(repo_raw, cwd)
+            .to_string_lossy()
+            .to_string()
+    } else {
+        repo_raw.to_string()
+    }
+}
+
+// Trailing `@ref` is part of Pi's git source syntax, but authenticated HTTPS
+// URLs and SCP-like SSH specs also contain `@` in the authority section.
+fn split_git_spec_ref(spec: &str) -> (&str, Option<&str>) {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return ("", None);
+    }
+
+    if looks_like_local_path(spec) {
+        let mut parts = spec.splitn(2, '@');
+        let repo = parts.next().unwrap_or("").trim();
+        let r#ref = parts.next().map(str::trim).filter(|part| !part.is_empty());
+        return (repo, r#ref);
+    }
+
+    let reserved_prefix_end = git_ref_reserved_prefix_end(spec);
+    for (idx, _) in spec.match_indices('@').rev() {
+        if idx < reserved_prefix_end {
+            continue;
+        }
+        let repo = spec[..idx].trim();
+        let r#ref = spec[idx + 1..].trim();
+        if !repo.is_empty() && !r#ref.is_empty() {
+            return (repo, Some(r#ref));
+        }
+    }
+
+    (spec, None)
+}
+
+fn git_ref_reserved_prefix_end(spec: &str) -> usize {
+    if let Some(scheme_idx) = spec.find("://") {
+        let authority_start = scheme_idx + 3;
+        return spec[authority_start..]
+            .find('/')
+            .map_or(spec.len(), |idx| authority_start + idx);
+    }
+
+    if let Some(at_idx) = spec.find('@') {
+        let tail = &spec[at_idx + 1..];
+        if let Some(colon_idx) = tail.find(':') {
+            let slash_idx = tail.find('/');
+            if slash_idx.is_none_or(|slash| colon_idx < slash) {
+                return at_idx + 1 + colon_idx;
+            }
+        }
+    }
+
+    0
+}
+
+// Normalize clone sources into a stable repo identity without leaking URL
+// userinfo into install paths, trust records, or source matching.
+fn normalize_remote_git_repo(repo_raw: &str) -> (String, String, String) {
+    let repo_raw = repo_raw.trim();
+
+    if let Ok(url) = url::Url::parse(repo_raw) {
+        let host = url.host_str().unwrap_or("").to_string();
+        let path = url
+            .path()
+            .trim_matches('/')
+            .trim_end_matches(".git")
+            .to_string();
+        let repo = if path.is_empty() {
+            host.clone()
+        } else {
+            format!("{host}/{path}")
+        };
+        return (repo, host, path);
+    }
+
+    if !repo_raw.contains("://") {
+        let first_slash = repo_raw.find('/');
+        if let Some(colon_idx) = repo_raw.find(':') {
+            if first_slash.is_none_or(|slash| colon_idx < slash) {
+                let host_part = &repo_raw[..colon_idx];
+                if let Some(at_idx) = host_part.rfind('@') {
+                    let host = host_part[at_idx + 1..].trim().to_string();
+                    let path = repo_raw[colon_idx + 1..]
+                        .trim()
+                        .trim_matches('/')
+                        .trim_end_matches(".git")
+                        .split('/')
+                        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    let repo = if path.is_empty() {
+                        host.clone()
+                    } else {
+                        format!("{host}/{path}")
+                    };
+                    return (repo, host, path);
+                }
+            }
+        }
+    }
+
+    let normalized = repo_raw
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches(".git")
+        .to_string();
+
+    let segments = normalized
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != "." && *segment != "..")
+        .collect::<Vec<_>>();
+
+    let host = segments
+        .first()
+        .copied()
+        .unwrap_or("")
+        .rsplit('@')
         .next()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+        .unwrap_or("")
+        .to_string();
+    let path = if segments.len() >= 2 {
+        segments[1..].join("/")
+    } else {
+        String::new()
+    };
+    let repo = if path.is_empty() {
+        host.clone()
+    } else {
+        format!("{host}/{path}")
+    };
+
+    (repo, host, path)
+}
+
+fn normalized_git_repo_key(spec: &str) -> String {
+    let (repo_raw, _) = split_git_spec_ref(spec);
+    if looks_like_local_path(repo_raw) {
+        repo_raw.to_string()
+    } else {
+        let (repo, _, _) = normalize_remote_git_repo(repo_raw);
+        repo
+    }
+}
+
+fn parse_git_source(spec: &str, cwd: &Path) -> ParsedSource {
+    let (repo_raw, parsed_ref) = split_git_spec_ref(spec);
+    let r#ref = parsed_ref.map(str::to_string);
     let pinned = r#ref.is_some();
+    // Derive the actual clone target from the already-resolved git spec so
+    // extension-index aliases and authenticated URLs keep their install-time source.
+    let clone_source = git_clone_source(spec, cwd);
 
     let (repo, host, path) = if looks_like_local_path(repo_raw) {
         let repo_path = local_path_from_spec(repo_raw, cwd);
@@ -2674,28 +3089,11 @@ fn parse_git_source(spec: &str, cwd: &Path) -> ParsedSource {
             key,
         )
     } else {
-        let normalized = repo_raw
-            .trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .trim_end_matches(".git")
-            .to_string();
-
-        let segments = normalized
-            .split('/')
-            .filter(|s| !s.is_empty() && *s != "." && *s != "..")
-            .collect::<Vec<_>>();
-
-        let host = segments.first().copied().unwrap_or("").to_string();
-        let path = if segments.len() >= 2 {
-            segments[1..].join("/")
-        } else {
-            String::new()
-        };
-
-        (normalized, host, path)
+        normalize_remote_git_repo(repo_raw)
     };
 
     ParsedSource::Git {
+        clone_source,
         repo,
         host,
         path,
@@ -3170,11 +3568,9 @@ fn collect_digest_files_recursive(
     Ok(())
 }
 
-fn global_settings_path() -> PathBuf {
-    if let Ok(path) = std::env::var("PI_CONFIG_PATH") {
-        return PathBuf::from(path);
-    }
-    Config::global_dir().join("settings.json")
+fn global_settings_path(cwd: &Path) -> PathBuf {
+    Config::config_path_override_from_env(cwd)
+        .unwrap_or_else(|| Config::global_dir().join("settings.json"))
 }
 
 fn project_settings_path(cwd: &Path) -> PathBuf {
@@ -3208,33 +3604,40 @@ fn list_packages_in_settings(path: &Path) -> Result<Vec<PackageEntry>> {
     Ok(out)
 }
 
-fn update_package_sources(path: &Path, source: &str, action: UpdateAction) -> Result<()> {
+fn update_package_sources(
+    path: &Path,
+    source: &str,
+    action: UpdateAction,
+    cwd: &Path,
+) -> Result<()> {
+    let source = source.trim();
+    if source.is_empty() {
+        return Err(Error::Config(
+            "settings package source cannot be empty".to_string(),
+        ));
+    }
+
     let mut root = read_settings_json(path)?;
     if !root.is_object() {
         root = serde_json::json!({});
     }
 
-    let packages_value = root.get_mut("packages");
-    let packages = match packages_value {
-        Some(Value::Array(arr)) => arr,
-        Some(_) => {
-            *packages_value.unwrap() = Value::Array(Vec::new());
-            root.get_mut("packages")
-                .and_then(Value::as_array_mut)
-                .unwrap()
-        }
-        None => {
-            root["packages"] = Value::Array(Vec::new());
-            root.get_mut("packages")
-                .and_then(Value::as_array_mut)
-                .unwrap()
-        }
-    };
+    if !matches!(root.get("packages"), Some(Value::Array(_))) {
+        root["packages"] = Value::Array(Vec::new());
+    }
+
+    let packages = root
+        .get_mut("packages")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            Error::Config("failed to initialize settings 'packages' as an array".to_string())
+        })?;
 
     match action {
         UpdateAction::Add => {
             let exists = packages.iter().any(|existing| {
-                extract_package_source(existing).is_some_and(|(s, _)| sources_match(&s, source))
+                extract_package_source(existing)
+                    .is_some_and(|(s, _)| sources_match_in_dir(&s, source, cwd))
             });
             if !exists {
                 packages.push(Value::String(source.to_string()));
@@ -3242,7 +3645,8 @@ fn update_package_sources(path: &Path, source: &str, action: UpdateAction) -> Re
         }
         UpdateAction::Remove => {
             packages.retain(|existing| {
-                !extract_package_source(existing).is_some_and(|(s, _)| sources_match(&s, source))
+                !extract_package_source(existing)
+                    .is_some_and(|(s, _)| sources_match_in_dir(&s, source, cwd))
             });
         }
     }
@@ -3276,6 +3680,11 @@ fn sources_match(a: &str, b: &str) -> bool {
     normalize_source(a).is_some_and(|left| normalize_source(b).is_some_and(|right| left == right))
 }
 
+fn sources_match_in_dir(a: &str, b: &str, cwd: &Path) -> bool {
+    normalize_source_in_dir(a, cwd)
+        .is_some_and(|left| normalize_source_in_dir(b, cwd).is_some_and(|right| left == right))
+}
+
 fn normalize_source(source: &str) -> Option<NormalizedSource> {
     let source = source.trim();
     if source.is_empty() {
@@ -3290,32 +3699,46 @@ fn normalize_source(source: &str) -> Option<NormalizedSource> {
         });
     }
     if let Some(rest) = source.strip_prefix("git:") {
-        let repo = rest.trim().split('@').next().unwrap_or("");
-        let normalized = repo
-            .trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .trim_end_matches(".git");
         return Some(NormalizedSource {
             kind: NormalizedKind::Git,
-            key: normalized.to_string(),
+            key: normalized_git_repo_key(rest.trim()),
         });
     }
     if looks_like_git_url(source) || source.starts_with("https://") || source.starts_with("http://")
     {
-        let repo = source.split('@').next().unwrap_or("");
-        let normalized = repo
-            .trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .trim_end_matches(".git");
         return Some(NormalizedSource {
             kind: NormalizedKind::Git,
-            key: normalized.to_string(),
+            key: normalized_git_repo_key(source),
         });
     }
     Some(NormalizedSource {
         kind: NormalizedKind::Local,
         key: source.to_string(),
     })
+}
+
+fn normalize_source_in_dir(source: &str, cwd: &Path) -> Option<NormalizedSource> {
+    let source = source.trim();
+    if source.is_empty() {
+        return None;
+    }
+
+    // Settings dedupe/removal should follow install-time source resolution so equivalent local
+    // paths and shorthand aliases collapse to the same package entry.
+    match parse_source(source, cwd) {
+        ParsedSource::Npm { name, .. } => Some(NormalizedSource {
+            kind: NormalizedKind::Npm,
+            key: name,
+        }),
+        ParsedSource::Git { repo, .. } => Some(NormalizedSource {
+            kind: NormalizedKind::Git,
+            key: repo,
+        }),
+        ParsedSource::Local { path } => Some(NormalizedSource {
+            kind: NormalizedKind::Local,
+            key: path.to_string_lossy().to_string(),
+        }),
+    }
 }
 
 fn read_settings_json(path: &Path) -> Result<Value> {
@@ -3414,6 +3837,45 @@ mod tests {
     }
 
     #[test]
+    fn test_finish_package_task_propagates_panic_before_cancellation() {
+        let handle = std::thread::spawn(|| -> () {
+            panic!("package manager worker panic");
+        });
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<()> = finish_package_task(handle, Err(()), "Install task cancelled");
+        }));
+
+        assert!(
+            panic.is_err(),
+            "worker panic should not be masked as cancellation"
+        );
+    }
+
+    #[test]
+    fn test_finish_package_task_maps_nonpanic_cancellation_to_tool_error() {
+        let handle = std::thread::spawn(|| {});
+
+        let err = finish_package_task::<(), _>(handle, Err(()), "Install task cancelled")
+            .expect_err("error");
+
+        assert!(
+            err.to_string().contains("Install task cancelled"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_finish_package_task_returns_success_payload() {
+        let handle = std::thread::spawn(|| {});
+
+        let value =
+            finish_package_task::<usize, ()>(handle, Ok(Ok(7usize)), "task cancelled").unwrap();
+
+        assert_eq!(value, 7);
+    }
+
+    #[test]
     fn test_parse_npm_spec_scoped_and_unscoped() {
         assert_eq!(parse_npm_spec("foo"), ("foo".to_string(), None));
         assert_eq!(
@@ -3441,6 +3903,10 @@ mod tests {
             "https://github.com/a/b.git@v1",
             "github.com/a/b"
         ));
+        assert!(sources_match(
+            "git:https://token-a@github.com/a/b.git@v1",
+            "git:https://token-b@github.com/a/b.git@v2"
+        ));
         assert!(!sources_match("npm:foo", "npm:bar"));
         assert!(!sources_match("git:github.com/a/b", "git:github.com/a/c"));
     }
@@ -3459,6 +3925,10 @@ mod tests {
             manager.package_identity("git:https://github.com/a/b.git@v1"),
             "git:github.com/a/b"
         );
+        assert_eq!(
+            manager.package_identity("git:https://token@github.com/a/b.git@v1"),
+            "git:github.com/a/b"
+        );
 
         let identity = manager.package_identity("./foo/../bar");
         let expected_suffix = format!("{}/bar", dir.path().display());
@@ -3473,7 +3943,7 @@ mod tests {
 
         match parse_source("checkpoint-pi", dir.path()) {
             ParsedSource::Local { path } => assert_eq!(path, local),
-            other => panic!("expected local source, got {other:?}"),
+            other => panic!("Unexpected parsed source: {:?}", other),
         }
     }
 
@@ -3512,6 +3982,15 @@ mod tests {
                 .join("github.com")
                 .join("user/repo")
         );
+
+        let git_with_auth = manager
+            .installed_path_sync(
+                "git:https://token@github.com/user/repo.git@main",
+                PackageScope::Project,
+            )
+            .expect("installed_path")
+            .expect("path");
+        assert_eq!(git_with_auth, git);
     }
 
     #[test]
@@ -3540,6 +4019,31 @@ mod tests {
                 .join(key),
             "local git sources should map to a stable hashed install directory",
         );
+    }
+
+    #[test]
+    fn remove_sync_rejects_git_host_only_source_without_deleting_host_bucket() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = PackageManager::new(dir.path().to_path_buf());
+        let host_bucket = dir
+            .path()
+            .join(Config::project_dir())
+            .join("git")
+            .join("github.com");
+        let repo_dir = host_bucket.join("user").join("repo");
+        fs::create_dir_all(&repo_dir).expect("create repo dir");
+        fs::write(repo_dir.join("package.json"), "{}").expect("write sentinel");
+
+        let err = manager
+            .remove_sync("git:github.com", PackageScope::Project)
+            .expect_err("host-only git source should be rejected");
+
+        assert!(
+            err.to_string().contains("Invalid git package source"),
+            "unexpected error: {err}"
+        );
+        assert!(host_bucket.exists(), "host bucket should be preserved");
+        assert!(repo_dir.exists(), "nested repo should be preserved");
     }
 
     #[test]
@@ -3589,6 +4093,7 @@ mod tests {
                 project_settings_path: project_settings_path.clone(),
                 global_base_dir: temp_dir.path().join("global-base"),
                 project_base_dir: project_root.join(".pi"),
+                project_settings_enabled: true,
             };
             fs::create_dir_all(&roots.global_base_dir).expect("create global base dir");
 
@@ -3616,6 +4121,147 @@ mod tests {
                     .extensions
                     .iter()
                     .all(|entry| entry.metadata.scope == PackageScope::Project)
+            );
+        });
+    }
+
+    #[test]
+    fn test_list_packages_with_override_roots_ignores_project_settings() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let project_root = temp_dir.path().join("project");
+        fs::create_dir_all(project_root.join(".pi")).expect("create project settings dir");
+
+        let override_settings_path = temp_dir.path().join("override-settings.json");
+        let project_settings_path = project_root.join(".pi/settings.json");
+
+        fs::write(
+            &override_settings_path,
+            serde_json::to_string_pretty(&json!({
+                "packages": ["npm:override-only"]
+            }))
+            .expect("serialize override settings"),
+        )
+        .expect("write override settings");
+        fs::write(
+            &project_settings_path,
+            serde_json::to_string_pretty(&json!({
+                "packages": ["npm:project-leak"]
+            }))
+            .expect("serialize project settings"),
+        )
+        .expect("write project settings");
+
+        let roots = ResolveRoots::from_override(&project_root, Some(&override_settings_path));
+        let manager = PackageManager::new(project_root);
+        let packages = PackageManager::list_packages_with_roots(&roots).expect("list packages");
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].source, "npm:override-only");
+        assert_eq!(packages[0].scope, PackageScope::User);
+        assert!(
+            !roots.project_settings_enabled,
+            "full config override should disable project settings"
+        );
+    }
+
+    #[test]
+    fn test_config_override_roots_ignore_project_package_filters() {
+        run_async(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let project_root = temp_dir.path().join("project");
+            fs::create_dir_all(project_root.join(".pi")).expect("create project settings dir");
+            fs::create_dir_all(project_root.join(".pi/extensions"))
+                .expect("create project extension dir");
+
+            let package_root = temp_dir.path().join("pkg");
+            fs::create_dir_all(package_root.join("extensions")).expect("create extensions dir");
+            fs::write(package_root.join("extensions/a.native.json"), "{}")
+                .expect("write a.native.json");
+
+            let package_root2 = temp_dir.path().join("pkg2");
+            fs::create_dir_all(package_root2.join("extensions")).expect("create extensions dir");
+            fs::write(package_root2.join("extensions/b.native.json"), "{}")
+                .expect("write b.native.json");
+            let project_local_extension =
+                project_root.join(".pi/extensions/project-local.native.json");
+            let project_auto_extension =
+                project_root.join(".pi/extensions/project-auto.native.json");
+            fs::write(&project_local_extension, "{}").expect("write project local extension");
+            fs::write(&project_auto_extension, "{}").expect("write project auto extension");
+
+            let override_settings_path = temp_dir.path().join("override-settings.json");
+            let project_settings_path = project_root.join(".pi/settings.json");
+
+            let override_settings = json!({
+                "packages": [{
+                    "source": package_root.to_string_lossy(),
+                    "extensions": ["extensions/a.native.json"]
+                }]
+            });
+            fs::write(
+                &override_settings_path,
+                serde_json::to_string_pretty(&override_settings)
+                    .expect("serialize override settings"),
+            )
+            .expect("write override settings");
+
+            let project_settings = json!({
+                "extensions": ["extensions/project-local.native.json"],
+                "packages": [{
+                    "source": package_root2.to_string_lossy(),
+                    "extensions": ["extensions/b.native.json"]
+                }]
+            });
+            fs::write(
+                &project_settings_path,
+                serde_json::to_string_pretty(&project_settings)
+                    .expect("serialize project settings"),
+            )
+            .expect("write project settings");
+
+            let roots = ResolveRoots {
+                global_settings_path: override_settings_path.clone(),
+                project_settings_path: project_settings_path.clone(),
+                global_base_dir: temp_dir.path().join("global-base"),
+                project_base_dir: project_root.join(".pi"),
+                project_settings_enabled: false,
+            };
+            fs::create_dir_all(&roots.global_base_dir).expect("create global base dir");
+
+            let manager = PackageManager::new(project_root);
+            let resolved = manager.resolve_with_roots(&roots).await.expect("resolve");
+
+            let enabled_extensions = resolved
+                .extensions
+                .iter()
+                .filter(|entry| entry.enabled)
+                .collect::<Vec<_>>();
+            assert_eq!(enabled_extensions.len(), 1);
+            assert_eq!(
+                enabled_extensions[0].path,
+                package_root.join("extensions/a.native.json")
+            );
+            assert_eq!(enabled_extensions[0].metadata.scope, PackageScope::User);
+            assert!(
+                resolved
+                    .extensions
+                    .iter()
+                    .all(|entry| entry.path != package_root2.join("extensions/b.native.json")),
+                "project package resources should be ignored when a full config override is active"
+            );
+            assert!(
+                resolved
+                    .extensions
+                    .iter()
+                    .all(|entry| entry.path != project_local_extension),
+                "project local settings entries should be ignored when a full config override is active"
+            );
+            assert!(
+                resolved
+                    .extensions
+                    .iter()
+                    .all(|entry| entry.path != project_auto_extension),
+                "project auto-discovered resources should be ignored when a full config override is active"
             );
         });
     }
@@ -3651,6 +4297,58 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_extension_sources_rejects_missing_local_path() {
+        run_async(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let missing_path = temp_dir.path().join("missing.native.json");
+
+            let manager = PackageManager::new(temp_dir.path().to_path_buf());
+            let err = manager
+                .resolve_extension_sources(
+                    &[missing_path.to_string_lossy().to_string()],
+                    ResolveExtensionSourcesOptions {
+                        local: false,
+                        temporary: true,
+                    },
+                )
+                .await
+                .expect_err("missing CLI extension path should fail");
+
+            assert!(
+                err.to_string().contains("does not exist"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_resolve_extension_sources_rejects_unsupported_local_file() {
+        run_async(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let unsupported_path = temp_dir.path().join("notes.txt");
+            fs::write(&unsupported_path, "not an extension").expect("write unsupported file");
+
+            let manager = PackageManager::new(temp_dir.path().to_path_buf());
+            let err = manager
+                .resolve_extension_sources(
+                    &[unsupported_path.to_string_lossy().to_string()],
+                    ResolveExtensionSourcesOptions {
+                        local: false,
+                        temporary: true,
+                    },
+                )
+                .await
+                .expect_err("unsupported CLI extension file should fail");
+
+            assert!(
+                err.to_string()
+                    .contains("Unsupported extension source file"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
     fn test_resolve_local_path_normalizes_dot_segments() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let resolved = resolve_local_path("./foo/../bar", temp_dir.path());
@@ -3680,7 +4378,9 @@ mod tests {
             &mut accumulator,
             None,
             &mut metadata,
-        );
+            true,
+        )
+        .expect("resolve symlink extension source");
 
         assert_eq!(accumulator.extensions.items.len(), 1);
         assert_eq!(accumulator.extensions.items[0].path, symlink_path);
@@ -3733,6 +4433,35 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_extension_sources_errors_on_malformed_package_manifest() {
+        run_async(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let package_root = temp_dir.path().join("pkg");
+            let extensions_dir = package_root.join("extensions");
+            fs::create_dir_all(&extensions_dir).expect("create extensions dir");
+            fs::write(extensions_dir.join("a.native.json"), "{}").expect("write extension");
+            fs::write(package_root.join("package.json"), "{ not valid json")
+                .expect("write malformed package.json");
+
+            let manager = PackageManager::new(temp_dir.path().to_path_buf());
+            let err = manager
+                .resolve_extension_sources(
+                    &[package_root.to_string_lossy().to_string()],
+                    ResolveExtensionSourcesOptions {
+                        local: false,
+                        temporary: true,
+                    },
+                )
+                .await
+                .expect_err("malformed package manifest must fail closed");
+
+            let message = err.to_string();
+            assert!(message.contains("Failed to parse package manifest"));
+            assert!(message.contains(&package_root.join("package.json").display().to_string()));
+        });
+    }
+
+    #[test]
     fn test_extension_manifest_directory_detected() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let extension_dir = temp_dir.path().join("ext");
@@ -3756,6 +4485,21 @@ mod tests {
 
         let entries = resolve_extension_entries(&extension_dir).expect("entries");
         assert_eq!(entries, vec![extension_dir]);
+    }
+
+    #[test]
+    fn test_resolve_extension_entries_skips_invalid_package_manifest() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let extension_dir = temp_dir.path().join("ext");
+        fs::create_dir_all(&extension_dir).expect("create extension dir");
+        fs::write(extension_dir.join("package.json"), "{ not valid json")
+            .expect("write malformed package.json");
+        fs::write(extension_dir.join("index.ts"), "export {};\n").expect("write fallback entry");
+
+        assert!(
+            resolve_extension_entries(&extension_dir).is_none(),
+            "invalid package.json should not fall back to index.* entrypoints"
+        );
     }
 
     // ======================================================================
@@ -4211,6 +4955,13 @@ mod tests {
     }
 
     #[test]
+    fn normalize_source_git_https_with_userinfo_and_ref() {
+        let result = normalize_source("git:https://token@github.com/user/repo.git@v2").unwrap();
+        assert_eq!(result.kind, NormalizedKind::Git);
+        assert_eq!(result.key, "github.com/user/repo");
+    }
+
+    #[test]
     fn normalize_source_local() {
         let result = normalize_source("my-local-package").unwrap();
         assert_eq!(result.kind, NormalizedKind::Local);
@@ -4381,22 +5132,108 @@ mod tests {
         let path = dir.path().join("settings.json");
         fs::write(&path, "{}").expect("write initial");
 
-        update_package_sources(&path, "npm:foo", UpdateAction::Add).expect("add");
+        update_package_sources(&path, "npm:foo", UpdateAction::Add, dir.path()).expect("add");
         let settings = read_settings_json(&path).expect("read");
         let packages = settings["packages"].as_array().expect("packages array");
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0], json!("npm:foo"));
 
         // Adding same source again should not duplicate
-        update_package_sources(&path, "npm:foo@2.0", UpdateAction::Add).expect("add again");
+        update_package_sources(&path, "npm:foo@2.0", UpdateAction::Add, dir.path())
+            .expect("add again");
         let settings = read_settings_json(&path).expect("read");
         let packages = settings["packages"].as_array().expect("packages array");
         assert_eq!(packages.len(), 1, "duplicate source should not be added");
 
-        update_package_sources(&path, "npm:foo", UpdateAction::Remove).expect("remove");
+        update_package_sources(&path, "npm:foo", UpdateAction::Remove, dir.path()).expect("remove");
         let settings = read_settings_json(&path).expect("read");
         let packages = settings["packages"].as_array().expect("packages array");
         assert!(packages.is_empty());
+    }
+
+    #[test]
+    fn update_package_sources_normalizes_non_array_packages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        let malformed = json!({
+            "packages": { "source": "npm:legacy" }
+        });
+        fs::write(
+            &path,
+            serde_json::to_string(&malformed).expect("serialize malformed settings"),
+        )
+        .expect("write malformed settings");
+
+        update_package_sources(&path, "npm:foo", UpdateAction::Add, dir.path()).expect("add");
+        let settings = read_settings_json(&path).expect("read");
+        let packages = settings["packages"].as_array().expect("packages array");
+        assert_eq!(packages, &vec![json!("npm:foo")]);
+    }
+
+    #[test]
+    fn update_package_sources_normalizes_non_object_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        fs::write(&path, "[]").expect("write malformed root");
+
+        update_package_sources(&path, "npm:foo", UpdateAction::Add, dir.path()).expect("add");
+        let settings = read_settings_json(&path).expect("read");
+        let packages = settings["packages"].as_array().expect("packages array");
+        assert_eq!(packages, &vec![json!("npm:foo")]);
+    }
+
+    #[test]
+    fn update_package_sources_rejects_empty_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        fs::write(&path, "{}").expect("write initial");
+
+        let err = update_package_sources(&path, "   ", UpdateAction::Add, dir.path())
+            .expect_err("must fail");
+        assert!(
+            err.to_string()
+                .contains("settings package source cannot be empty"),
+            "unexpected error: {err}"
+        );
+
+        let settings = read_settings_json(&path).expect("read");
+        assert!(
+            settings.get("packages").is_none(),
+            "failed update must not mutate packages"
+        );
+    }
+
+    #[test]
+    fn update_package_sources_deduplicates_equivalent_local_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        fs::write(&path, "{}").expect("write initial");
+
+        update_package_sources(&path, "./foo/../bar", UpdateAction::Add, dir.path()).expect("add");
+        update_package_sources(&path, "./bar", UpdateAction::Add, dir.path()).expect("add again");
+
+        let settings = read_settings_json(&path).expect("read");
+        let packages = settings["packages"].as_array().expect("packages array");
+        assert_eq!(
+            packages.len(),
+            1,
+            "equivalent local paths should deduplicate"
+        );
+        assert_eq!(packages[0], json!("./foo/../bar"));
+    }
+
+    #[test]
+    fn update_package_sources_remove_matches_equivalent_local_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        fs::write(&path, "{}").expect("write initial");
+
+        update_package_sources(&path, "./foo/../bar", UpdateAction::Add, dir.path()).expect("add");
+        update_package_sources(&path, "./bar", UpdateAction::Remove, dir.path()).expect("remove");
+
+        let settings = read_settings_json(&path).expect("read");
+        let packages = settings["packages"].as_array().expect("packages array");
+        assert!(packages.is_empty(), "equivalent local paths should remove");
     }
 
     // ======================================================================
@@ -4442,7 +5279,7 @@ mod tests {
             serde_json::to_string(&manifest).unwrap(),
         )
         .expect("write");
-        let result = read_pi_manifest(dir.path());
+        let result = read_pi_manifest(dir.path()).expect("read manifest");
         assert!(result.is_some());
         let result = result.unwrap();
         assert_eq!(
@@ -4462,13 +5299,64 @@ mod tests {
             r#"{"name": "test", "version": "1.0.0"}"#,
         )
         .expect("write");
-        assert!(read_pi_manifest(dir.path()).is_none());
+        assert!(
+            read_pi_manifest(dir.path())
+                .expect("read manifest")
+                .is_none()
+        );
     }
 
     #[test]
     fn read_pi_manifest_no_package_json() {
         let dir = tempfile::tempdir().expect("tempdir");
-        assert!(read_pi_manifest(dir.path()).is_none());
+        assert!(
+            read_pi_manifest(dir.path())
+                .expect("read manifest")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn read_pi_manifest_errors_on_malformed_package_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = dir.path().join("package.json");
+        fs::write(&manifest_path, "{ not valid json").expect("write malformed package.json");
+
+        let err = read_pi_manifest(dir.path()).expect_err("malformed package.json must error");
+        let message = err.to_string();
+        assert!(message.contains("Failed to parse package manifest"));
+        assert!(message.contains(&manifest_path.display().to_string()));
+    }
+
+    #[test]
+    fn read_pi_manifest_errors_when_pi_field_is_not_object() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = dir.path().join("package.json");
+        fs::write(&manifest_path, r#"{"name":"pkg","pi":"not-an-object"}"#)
+            .expect("write invalid pi manifest");
+
+        let err = read_pi_manifest(dir.path()).expect_err("non-object `pi` field must error");
+        let message = err.to_string();
+        assert!(message.contains("Invalid package manifest"));
+        assert!(message.contains("`pi` must be an object"));
+        assert!(message.contains(&manifest_path.display().to_string()));
+    }
+
+    #[test]
+    fn read_pi_manifest_errors_when_resource_entries_are_not_string_arrays() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest_path = dir.path().join("package.json");
+        fs::write(
+            &manifest_path,
+            r#"{"name":"pkg","pi":{"extensions":["ok",7]}}"#,
+        )
+        .expect("write invalid pi manifest");
+
+        let err = read_pi_manifest(dir.path()).expect_err("non-string manifest entries must error");
+        let message = err.to_string();
+        assert!(message.contains("Invalid package manifest"));
+        assert!(message.contains("`pi.extensions` must be an array of strings"));
+        assert!(message.contains(&manifest_path.display().to_string()));
     }
 
     // ======================================================================
@@ -4491,6 +5379,22 @@ mod tests {
         let path_str = result.to_string_lossy();
         assert!(path_str.contains("pi-extensions"));
         assert!(path_str.contains("git-github.com"));
+    }
+
+    #[test]
+    fn npm_prefix_root_matches_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = PackageManager::new(dir.path().to_path_buf());
+
+        assert_eq!(
+            manager.npm_prefix_root(PackageScope::Project),
+            Some(dir.path().join(Config::project_dir()).join("npm"))
+        );
+        assert_eq!(
+            manager.npm_prefix_root(PackageScope::Temporary),
+            Some(temporary_dir("npm", None))
+        );
+        assert_eq!(manager.npm_prefix_root(PackageScope::User), None);
     }
 
     // ======================================================================
@@ -4531,7 +5435,7 @@ mod tests {
                 assert_eq!(name, "@scope/pkg");
                 assert!(pinned);
             }
-            other => panic!("expected Npm, got {other:?}"),
+            other => panic!("Unexpected parsed source: {:?}", other),
         }
     }
 
@@ -4542,7 +5446,7 @@ mod tests {
             ParsedSource::Npm { pinned, .. } => {
                 assert!(!pinned);
             }
-            other => panic!("expected Npm, got {other:?}"),
+            other => panic!("Unexpected parsed source: {:?}", other),
         }
     }
 
@@ -4551,19 +5455,21 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         match parse_source("git:github.com/user/repo@v2", dir.path()) {
             ParsedSource::Git {
+                clone_source,
                 repo,
                 host,
                 path,
                 r#ref,
                 pinned,
             } => {
+                assert_eq!(clone_source, "github.com/user/repo");
                 assert_eq!(repo, "github.com/user/repo");
                 assert_eq!(host, "github.com");
                 assert_eq!(path, "user/repo");
                 assert_eq!(r#ref, Some("v2".to_string()));
                 assert!(pinned);
             }
-            other => panic!("expected Git, got {other:?}"),
+            other => panic!("Unexpected parsed source: {:?}", other),
         }
     }
 
@@ -4575,7 +5481,33 @@ mod tests {
                 assert_eq!(repo, "github.com/user/repo");
                 assert_eq!(host, "github.com");
             }
-            other => panic!("expected Git, got {other:?}"),
+            other => panic!(),
+        }
+    }
+
+    #[test]
+    fn parse_source_https_github_url_with_userinfo_and_ref() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        match parse_source(
+            "git:https://token@github.com/user/repo.git@main",
+            dir.path(),
+        ) {
+            ParsedSource::Git {
+                clone_source,
+                repo,
+                host,
+                path,
+                r#ref,
+                pinned,
+            } => {
+                assert_eq!(clone_source, "https://token@github.com/user/repo.git");
+                assert_eq!(repo, "github.com/user/repo");
+                assert_eq!(host, "github.com");
+                assert_eq!(path, "user/repo");
+                assert_eq!(r#ref, Some("main".to_string()));
+                assert!(pinned);
+            }
+            other => panic!("Unexpected parsed source: {:?}", other),
         }
     }
 
@@ -4586,7 +5518,7 @@ mod tests {
             ParsedSource::Local { path } => {
                 assert_eq!(path, dir.path().join("my-ext"));
             }
-            other => panic!("expected Local, got {other:?}"),
+            other => panic!(),
         }
     }
 
@@ -4598,7 +5530,7 @@ mod tests {
             ParsedSource::Local { path } => {
                 assert_eq!(path, PathBuf::from("/abs/my-ext"));
             }
-            other => panic!("expected Local, got {other:?}"),
+            other => panic!(),
         }
     }
 
@@ -4612,10 +5544,23 @@ mod tests {
         let result1 = parse_git_source("./local-repo", dir.path());
         let result2 = parse_git_source("./local-repo", dir.path());
         match (&result1, &result2) {
-            (ParsedSource::Git { path: p1, .. }, ParsedSource::Git { path: p2, .. }) => {
+            (
+                ParsedSource::Git {
+                    clone_source: clone_a,
+                    path: p1,
+                    ..
+                },
+                ParsedSource::Git {
+                    clone_source: clone_b,
+                    path: p2,
+                    ..
+                },
+            ) => {
+                assert_eq!(clone_a, &dir.path().join("local-repo").to_string_lossy());
+                assert_eq!(clone_b, &dir.path().join("local-repo").to_string_lossy());
                 assert_eq!(p1, p2, "same local source should produce same hash");
             }
-            _ => panic!("expected Git for both"),
+            _ => panic!(),
         }
     }
 
@@ -4705,6 +5650,29 @@ mod tests {
         assert_eq!(deduped.len(), 2);
     }
 
+    #[test]
+    fn ensure_packages_installed_propagates_install_errors() {
+        run_async(async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let manager = PackageManager::new(dir.path().to_path_buf());
+            let missing_local_package = dir.path().join("missing-package");
+
+            let err = manager
+                .ensure_package_entries_installed(vec![PackageEntry {
+                    scope: PackageScope::Project,
+                    source: missing_local_package.to_string_lossy().into_owned(),
+                    filter: None,
+                }])
+                .await
+                .expect_err("missing package install should fail");
+
+            assert!(
+                err.to_string().contains("does not exist"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
     // ======================================================================
     // collect_auto_prompt_entries / collect_auto_theme_entries
     // ======================================================================
@@ -4771,6 +5739,102 @@ mod tests {
         assert!(!has_md, "should not find .md files");
     }
 
+    #[test]
+    fn collect_auto_extension_entries_finds_root_js_entry_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ext_dir = dir.path().join("extensions");
+        fs::create_dir_all(&ext_dir).expect("create dir");
+        fs::write(ext_dir.join("my_extension.ts"), "export default {}").expect("write");
+
+        let entries = collect_auto_extension_entries(&ext_dir);
+        assert!(
+            entries
+                .iter()
+                .any(|p| p.file_name().unwrap() == "my_extension.ts")
+        );
+    }
+
+    #[test]
+    fn collect_auto_extension_entries_deduplicates_index_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ext_dir = dir.path().join("extensions");
+        fs::create_dir_all(&ext_dir).expect("create dir");
+        fs::write(ext_dir.join("index.ts"), "export default {}").expect("write");
+
+        let entries = collect_auto_extension_entries(&ext_dir);
+        let count = entries
+            .iter()
+            .filter(|p| p.file_name().unwrap() == "index.ts")
+            .count();
+        assert_eq!(count, 1, "index.ts should only be present once");
+    }
+
+    #[test]
+    fn collect_auto_extension_entries_fail_closed_on_malformed_root_package_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ext_dir = dir.path().join("extensions");
+        fs::create_dir_all(&ext_dir).expect("create dir");
+        fs::write(ext_dir.join("package.json"), "{ not valid json")
+            .expect("write malformed package.json");
+        fs::write(ext_dir.join("index.ts"), "export default {}").expect("write index.ts");
+
+        let entries = collect_auto_extension_entries(&ext_dir);
+        assert!(
+            entries.is_empty(),
+            "malformed root package.json must not fall back to conventional entrypoints"
+        );
+    }
+
+    #[test]
+    fn collect_auto_extension_entries_respects_empty_root_manifest_extensions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ext_dir = dir.path().join("extensions");
+        fs::create_dir_all(&ext_dir).expect("create dir");
+        fs::write(
+            ext_dir.join("package.json"),
+            serde_json::to_string_pretty(&json!({
+                "name": "test-pkg",
+                "pi": {
+                    "extensions": []
+                }
+            }))
+            .expect("serialize package.json"),
+        )
+        .expect("write package.json");
+        fs::write(ext_dir.join("index.ts"), "export default {}").expect("write index.ts");
+
+        let entries = collect_auto_extension_entries(&ext_dir);
+        assert!(
+            entries.is_empty(),
+            "explicit empty root package.json#pi.extensions must disable conventional fallback"
+        );
+    }
+
+    #[test]
+    fn collect_auto_extension_entries_respects_missing_root_manifest_targets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ext_dir = dir.path().join("extensions");
+        fs::create_dir_all(&ext_dir).expect("create dir");
+        fs::write(
+            ext_dir.join("package.json"),
+            serde_json::to_string_pretty(&json!({
+                "name": "test-pkg",
+                "pi": {
+                    "extensions": ["missing/index.ts"]
+                }
+            }))
+            .expect("serialize package.json"),
+        )
+        .expect("write package.json");
+        fs::write(ext_dir.join("index.ts"), "export default {}").expect("write index.ts");
+
+        let entries = collect_auto_extension_entries(&ext_dir);
+        assert!(
+            entries.is_empty(),
+            "missing root package.json#pi.extensions targets must disable conventional fallback"
+        );
+    }
+
     // ======================================================================
     // resolve_extension_entries with index.native.json / legacy JS fallback
     // ======================================================================
@@ -4787,23 +5851,25 @@ mod tests {
     }
 
     #[test]
-    fn resolve_extension_entries_ignores_index_ts() {
+    fn resolve_extension_entries_finds_index_ts() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ext_dir = dir.path().join("ext");
         fs::create_dir_all(&ext_dir).expect("create dir");
         fs::write(ext_dir.join("index.ts"), "export default {}").expect("write");
 
-        assert!(resolve_extension_entries(&ext_dir).is_none());
+        let entries = resolve_extension_entries(&ext_dir).expect("entries");
+        assert_eq!(entries, vec![ext_dir.join("index.ts")]);
     }
 
     #[test]
-    fn resolve_extension_entries_ignores_index_js() {
+    fn resolve_extension_entries_finds_index_js() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ext_dir = dir.path().join("ext");
         fs::create_dir_all(&ext_dir).expect("create dir");
         fs::write(ext_dir.join("index.js"), "export default {}").expect("write");
 
-        assert!(resolve_extension_entries(&ext_dir).is_none());
+        let entries = resolve_extension_entries(&ext_dir).expect("entries");
+        assert_eq!(entries, vec![ext_dir.join("index.js")]);
     }
 
     #[test]
@@ -4835,11 +5901,129 @@ mod tests {
     }
 
     #[test]
+    fn resolve_extension_entries_empty_manifest_extensions_fail_closed_without_index_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ext_dir = dir.path().join("ext");
+        fs::create_dir_all(&ext_dir).expect("create dir");
+        fs::write(
+            ext_dir.join("package.json"),
+            serde_json::to_string_pretty(&json!({
+                "name": "test-pkg",
+                "pi": {
+                    "extensions": []
+                }
+            }))
+            .expect("serialize package.json"),
+        )
+        .expect("write package.json");
+        fs::write(ext_dir.join("index.ts"), "export default {}").expect("write index.ts");
+
+        let entries = resolve_extension_entries(&ext_dir).expect("entries");
+        assert!(
+            entries.is_empty(),
+            "explicit empty package.json#pi.extensions must not fall back to index.*"
+        );
+    }
+
+    #[test]
+    fn resolve_extension_entries_missing_manifest_targets_fail_closed_without_index_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ext_dir = dir.path().join("ext");
+        fs::create_dir_all(&ext_dir).expect("create dir");
+        fs::write(
+            ext_dir.join("package.json"),
+            serde_json::to_string_pretty(&json!({
+                "name": "test-pkg",
+                "pi": {
+                    "extensions": ["extensions/missing.js"]
+                }
+            }))
+            .expect("serialize package.json"),
+        )
+        .expect("write package.json");
+        fs::write(ext_dir.join("index.ts"), "export default {}").expect("write index.ts");
+
+        let entries = resolve_extension_entries(&ext_dir).expect("entries");
+        assert!(
+            entries.is_empty(),
+            "missing package.json#pi.extensions targets must not fall back to index.*"
+        );
+    }
+
+    #[test]
     fn resolve_extension_entries_empty_dir_returns_none() {
         let dir = tempfile::tempdir().expect("tempdir");
         let ext_dir = dir.path().join("ext");
         fs::create_dir_all(&ext_dir).expect("create dir");
         assert!(resolve_extension_entries(&ext_dir).is_none());
+    }
+
+    #[test]
+    fn collect_default_resources_respects_empty_manifest_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let package_root = dir.path().join("pkg");
+        let skills_dir = package_root.join("skills").join("my-skill");
+        fs::create_dir_all(&skills_dir).expect("create skills dir");
+        fs::write(skills_dir.join("SKILL.md"), "# Skill").expect("write skill");
+        fs::write(
+            package_root.join("package.json"),
+            serde_json::to_string_pretty(&json!({
+                "name": "pkg",
+                "pi": {
+                    "skills": []
+                }
+            }))
+            .expect("serialize package.json"),
+        )
+        .expect("write package.json");
+
+        let mut target = ResourceList::default();
+        let metadata = PathMetadata {
+            source: package_root.display().to_string(),
+            scope: PackageScope::Project,
+            origin: ResourceOrigin::Package,
+            base_dir: Some(package_root.clone()),
+        };
+
+        PackageManager::collect_default_resources(
+            &package_root,
+            ResourceType::Skills,
+            &mut target,
+            &metadata,
+        )
+        .expect("collect default resources");
+
+        assert!(
+            target.items.is_empty(),
+            "explicit empty package.json#pi.skills must disable convention fallback"
+        );
+    }
+
+    #[test]
+    fn collect_manifest_files_respects_empty_manifest_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let package_root = dir.path().join("pkg");
+        let extensions_dir = package_root.join("extensions");
+        fs::create_dir_all(&extensions_dir).expect("create extensions dir");
+        fs::write(extensions_dir.join("index.ts"), "export default {}").expect("write index.ts");
+        fs::write(
+            package_root.join("package.json"),
+            serde_json::to_string_pretty(&json!({
+                "name": "pkg",
+                "pi": {
+                    "extensions": []
+                }
+            }))
+            .expect("serialize package.json"),
+        )
+        .expect("write package.json");
+
+        let (all_files, enabled) =
+            PackageManager::collect_manifest_files(&package_root, ResourceType::Extensions)
+                .expect("collect manifest files");
+
+        assert!(all_files.is_empty());
+        assert!(enabled.is_empty());
     }
 
     // ======================================================================
@@ -4867,6 +6051,46 @@ mod tests {
                 .iter()
                 .any(|p| p.file_name().unwrap() == "readme.txt")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_skill_entries_ignores_symlink_cycles() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skills_dir = dir.path().join("skills");
+        let skill_dir = skills_dir.join("my-skill");
+        fs::create_dir_all(&skill_dir).expect("create dir");
+        fs::write(skill_dir.join("SKILL.md"), "# Skill").expect("write skill");
+
+        let loop_link = skill_dir.join("loop");
+        std::os::unix::fs::symlink(&skill_dir, &loop_link).expect("create symlink loop");
+
+        let entries = collect_skill_entries(&skills_dir);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], skill_dir.join("SKILL.md"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_skill_entries_dedupes_alias_symlink_to_same_skill_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skills_dir = dir.path().join("skills");
+        let real_root = skills_dir.join("real");
+        let skill_dir = real_root.join("my-skill");
+        fs::create_dir_all(&skill_dir).expect("create dir");
+        fs::write(skill_dir.join("SKILL.md"), "# Skill").expect("write skill");
+
+        std::os::unix::fs::symlink(&real_root, skills_dir.join("alias"))
+            .expect("create alias symlink");
+
+        let entries = collect_skill_entries(&skills_dir);
+        assert_eq!(entries.len(), 1);
+        let canonical_entries = entries
+            .iter()
+            .map(|path| canonical_identity_path(path))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(canonical_entries.len(), 1);
+        assert!(canonical_entries.contains(&canonical_identity_path(&skill_dir.join("SKILL.md"))));
     }
 
     // ======================================================================
@@ -5087,7 +6311,7 @@ mod tests {
                 // After sanitization, traversal segments are filtered out.
                 assert_eq!(host, "local");
             }
-            other => panic!("expected Git, got {other:?}"),
+            other => panic!(),
         }
 
         // Case 2: Traversal in middle
@@ -5097,7 +6321,7 @@ mod tests {
                 assert_eq!(host, "github.com");
                 assert_eq!(path, "user/repo");
             }
-            other => panic!("expected Git, got {other:?}"),
+            other => panic!(),
         }
 
         // Case 3: Just dots
@@ -5106,8 +6330,25 @@ mod tests {
                 // ".." starts with ".." -> looks_like_local_path -> local hash
                 assert_eq!(host, "local");
             }
-            other => panic!("expected Git, got {other:?}"),
+            other => panic!(),
         }
+
+        // Case 4: SCP-like path with traversal segments must be sanitized
+        let (_, host, path) = normalize_remote_git_repo("git@evil.com:../../etc/passwd");
+        assert_eq!(host, "evil.com");
+        assert_eq!(
+            path, "etc/passwd",
+            "dot-dot segments must be stripped from SCP-like paths"
+        );
+        assert!(
+            !path.contains(".."),
+            "path must not contain traversal segments"
+        );
+
+        // Case 5: SCP-like path with single traversal
+        let (_, _, path) = normalize_remote_git_repo("git@github.com:../user/repo");
+        assert!(!path.contains(".."));
+        assert_eq!(path, "user/repo");
     }
 
     fn sample_npm_lock_entry(

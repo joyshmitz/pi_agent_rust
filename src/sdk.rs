@@ -62,10 +62,21 @@ pub type ToolDefinition = ToolDef;
 // Tool Factory Functions
 // ============================================================================
 
-use crate::tools::{BashTool, EditTool, FindTool, GrepTool, LsTool, ReadTool, WriteTool};
+use crate::tools::{
+    BashTool, EditTool, FindTool, GrepTool, HashlineEditTool, LsTool, ReadTool, WriteTool,
+};
 
 /// All built-in tool names.
-pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "grep", "find", "ls"];
+pub const BUILTIN_TOOL_NAMES: &[&str] = &[
+    "read",
+    "bash",
+    "edit",
+    "write",
+    "grep",
+    "find",
+    "ls",
+    "hashline_edit",
+];
 
 /// Create a read tool configured for `cwd`.
 pub fn create_read_tool(cwd: &Path) -> Box<dyn Tool> {
@@ -102,6 +113,11 @@ pub fn create_ls_tool(cwd: &Path) -> Box<dyn Tool> {
     Box::new(LsTool::new(cwd))
 }
 
+/// Create a hashline edit tool configured for `cwd`.
+pub fn create_hashline_edit_tool(cwd: &Path) -> Box<dyn Tool> {
+    Box::new(HashlineEditTool::new(cwd))
+}
+
 /// Create all built-in tools configured for `cwd`.
 pub fn create_all_tools(cwd: &Path) -> Vec<Box<dyn Tool>> {
     vec![
@@ -112,6 +128,7 @@ pub fn create_all_tools(cwd: &Path) -> Vec<Box<dyn Tool>> {
         create_grep_tool(cwd),
         create_find_tool(cwd),
         create_ls_tool(cwd),
+        create_hashline_edit_tool(cwd),
     ]
 }
 
@@ -208,11 +225,14 @@ impl EventListeners {
 
     /// Dispatch an [`AgentEvent`] to all registered subscribers.
     pub fn notify(&self, event: &AgentEvent) {
-        let subs = self
-            .subscribers
-            .lock()
-            .expect("EventListeners lock poisoned");
-        for listener in subs.values() {
+        let listeners: Vec<_> = {
+            let subs = self
+                .subscribers
+                .lock()
+                .expect("EventListeners lock poisoned");
+            subs.values().cloned().collect()
+        };
+        for listener in listeners {
             listener(event.clone());
         }
     }
@@ -387,6 +407,7 @@ pub struct RpcModelInfo {
 /// Session state payload returned by RPC `get_state`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)]
 pub struct RpcSessionState {
     #[serde(default)]
     pub model: Option<RpcModelInfo>,
@@ -409,9 +430,13 @@ pub struct RpcSessionState {
     #[serde(default)]
     pub auto_compaction_enabled: bool,
     #[serde(default)]
+    pub auto_retry_enabled: bool,
+    #[serde(default)]
     pub message_count: usize,
     #[serde(default)]
     pub pending_message_count: usize,
+    #[serde(default)]
+    pub durability_mode: String,
 }
 
 /// Session-level token aggregates returned by RPC `get_session_stats`.
@@ -1136,6 +1161,41 @@ impl AgentSessionHandle {
             .await
     }
 
+    /// Continue the current agent loop without adding a new user prompt.
+    ///
+    /// This is useful for retry/continuation flows where session history or
+    /// injected messages should drive the next turn without synthesizing a new
+    /// user message through [`Self::prompt`].
+    pub async fn continue_turn(
+        &mut self,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
+        let combined = self.make_combined_callback(on_event);
+        self.session
+            .sync_runtime_selection_from_session_header()
+            .await?;
+        self.session
+            .agent
+            .run_continue_with_abort(None, combined)
+            .await
+    }
+
+    /// Continue the current agent loop with an explicit abort signal.
+    pub async fn continue_turn_with_abort(
+        &mut self,
+        abort_signal: AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
+        let combined = self.make_combined_callback(on_event);
+        self.session
+            .sync_runtime_selection_from_session_header()
+            .await?;
+        self.session
+            .agent
+            .run_continue_with_abort(Some(abort_signal), combined)
+            .await
+    }
+
     /// Create a new abort handle/signal pair for prompt cancellation.
     pub fn new_abort_handle() -> (AbortHandle, AbortSignal) {
         AbortHandle::new()
@@ -1225,20 +1285,40 @@ impl AgentSessionHandle {
 
     /// Update thinking level and persist it to session metadata.
     pub async fn set_thinking_level(&mut self, level: crate::model::ThinkingLevel) -> Result<()> {
-        let level_string = level.to_string();
         let cx = crate::agent_cx::AgentCx::for_request();
-        {
+        let (effective_level, changed) = {
             let mut guard = self
                 .session
                 .session
                 .lock(cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
+            let (provider_id, model_id) = match (
+                guard.header.provider.as_deref(),
+                guard.header.model_id.as_deref(),
+            ) {
+                (Some(provider_id), Some(model_id)) => {
+                    (provider_id.to_string(), model_id.to_string())
+                }
+                _ => self.model(),
+            };
+            let effective_level =
+                self.session
+                    .clamp_thinking_level_for_model(&provider_id, &model_id, level);
+            let level_string = effective_level.to_string();
+            let changed = guard.header.thinking_level.as_deref() != Some(level_string.as_str());
             guard.set_model_header(None, None, Some(level_string.clone()));
-            guard.append_thinking_level_change(level_string);
+            if changed {
+                guard.append_thinking_level_change(level_string);
+            }
+            (effective_level, changed)
+        };
+        self.session.agent.stream_options_mut().thinking_level = Some(effective_level);
+        if changed {
+            self.session.persist_session().await
+        } else {
+            Ok(())
         }
-        self.session.agent.stream_options_mut().thinking_level = Some(level);
-        self.session.persist_session().await
     }
 
     /// Return all model messages for the current session path.
@@ -1552,6 +1632,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         &global_dir,
         &package_dir,
         std::env::var_os("PI_TEST_MODE").is_some(),
+        !cli.hide_cwd_in_prompt,
     );
 
     let provider = providers::create_provider(&selection.model_entry, None)
@@ -1620,7 +1701,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
             .await?;
     }
 
-    agent_session.set_model_registry(model_registry);
+    agent_session.set_model_registry(model_registry.clone());
     agent_session.set_auth_storage(auth);
 
     let history = {
@@ -1654,6 +1735,7 @@ mod tests {
     use super::*;
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::runtime::reactor::create_reactor;
+    use asupersync::sync::Mutex as AsyncMutex;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
@@ -1680,12 +1762,12 @@ mod tests {
 
         let handle = run_async(create_agent_session(options)).expect("create session");
         let provider = handle.session().agent.provider();
-        assert_eq!(provider.name(), "anthropic");
-        assert_eq!(provider.model_id(), "claude-opus-4-5");
+        assert_eq!(provider.name(), "openai-codex");
+        assert_eq!(provider.model_id(), "gpt-5.4");
     }
 
     #[test]
-    fn create_agent_session_respects_provider_model_and_thinking() {
+    fn create_agent_session_respects_provider_model_and_clamps_thinking() {
         let tmp = tempdir().expect("tempdir");
         let options = SessionOptions {
             provider: Some("openai".to_string()),
@@ -1702,7 +1784,7 @@ mod tests {
         assert_eq!(provider.model_id(), "gpt-4o");
         assert_eq!(
             handle.session().agent.stream_options().thinking_level,
-            Some(crate::model::ThinkingLevel::Low)
+            Some(crate::model::ThinkingLevel::Off)
         );
     }
 
@@ -1748,6 +1830,120 @@ mod tests {
     }
 
     #[test]
+    fn create_agent_session_set_thinking_level_clamps_and_dedupes_history() {
+        let tmp = tempdir().expect("tempdir");
+        let options = SessionOptions {
+            provider: Some("openai".to_string()),
+            model: Some("gpt-4o".to_string()),
+            working_directory: Some(tmp.path().to_path_buf()),
+            no_session: true,
+            ..SessionOptions::default()
+        };
+
+        let mut handle = run_async(create_agent_session(options)).expect("create session");
+        run_async(handle.set_thinking_level(crate::model::ThinkingLevel::High))
+            .expect("set thinking");
+        run_async(handle.set_thinking_level(crate::model::ThinkingLevel::High))
+            .expect("reapply thinking");
+
+        assert_eq!(
+            handle.session().agent.stream_options().thinking_level,
+            Some(crate::model::ThinkingLevel::Off)
+        );
+
+        let thinking_changes = run_async(async {
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let guard = handle
+                .session()
+                .session
+                .lock(cx.cx())
+                .await
+                .expect("lock session");
+            assert_eq!(guard.header.thinking_level.as_deref(), Some("off"));
+            guard
+                .entries_for_current_path()
+                .iter()
+                .filter(|entry| {
+                    matches!(entry, crate::session::SessionEntry::ThinkingLevelChange(_))
+                })
+                .count()
+        });
+        assert_eq!(thinking_changes, 1);
+    }
+
+    #[test]
+    fn from_session_with_listeners_set_thinking_level_uses_session_header_target() {
+        let dir = tempdir().expect("tempdir");
+        let auth_path = dir.path().join("auth.json");
+        let auth = crate::auth::AuthStorage::load(auth_path).expect("load auth");
+        let mut registry = ModelRegistry::load(&auth, None);
+        registry.merge_entries(vec![ModelEntry {
+            model: Model {
+                id: "plain-model".to_string(),
+                name: "Plain Model".to_string(),
+                api: "openai-completions".to_string(),
+                provider: "acme".to_string(),
+                base_url: "https://example.invalid/v1".to_string(),
+                reasoning: false,
+                input: vec![InputType::Text],
+                cost: ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 128_000,
+                max_tokens: 8_192,
+                headers: HashMap::new(),
+            },
+            api_key: None,
+            headers: HashMap::new(),
+            auth_header: false,
+            compat: None,
+            oauth_config: None,
+        }]);
+        let entry = registry
+            .find("anthropic", "claude-sonnet-4-5")
+            .expect("anthropic model in registry");
+        let provider = providers::create_provider(&entry, None).expect("create anthropic provider");
+        let tools = crate::tools::ToolRegistry::new(&[], std::path::Path::new("."), None);
+        let agent = Agent::new(
+            provider,
+            tools,
+            AgentConfig {
+                system_prompt: None,
+                max_tool_iterations: 50,
+                stream_options: StreamOptions::default(),
+                block_images: false,
+            },
+        );
+
+        let mut session = Session::in_memory();
+        session.header.provider = Some("acme".to_string());
+        session.header.model_id = Some("plain-model".to_string());
+
+        let mut agent_session = AgentSession::new(
+            agent,
+            Arc::new(AsyncMutex::new(session)),
+            false,
+            ResolvedCompactionSettings::default(),
+        );
+        agent_session.set_model_registry(registry);
+
+        let mut handle =
+            AgentSessionHandle::from_session_with_listeners(agent_session, EventListeners::new());
+        run_async(handle.set_thinking_level(crate::model::ThinkingLevel::High))
+            .expect("set thinking");
+
+        assert_eq!(
+            handle.session().agent.stream_options().thinking_level,
+            Some(crate::model::ThinkingLevel::Off)
+        );
+        assert_eq!(handle.model().0, "anthropic");
+        assert_eq!(handle.model().1, "claude-sonnet-4-5");
+    }
+
+    #[test]
     fn compact_without_history_is_noop() {
         let tmp = tempdir().expect("tempdir");
         let options = SessionOptions {
@@ -1768,7 +1964,10 @@ mod tests {
         .expect("compact");
 
         assert!(
-            events.lock().expect("events lock").is_empty(),
+            events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
             "expected no compaction lifecycle events for empty session"
         );
     }
@@ -1797,24 +1996,35 @@ mod tests {
 
         let recv_clone = Arc::clone(&received);
         let id = listeners.subscribe(Arc::new(move |event| {
-            recv_clone.lock().expect("lock").push(event);
+            recv_clone
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(event);
         }));
 
         let event = AgentEvent::AgentStart {
-            session_id: "test-123".to_string(),
+            session_id: "test-123".into(),
         };
         listeners.notify(&event);
 
-        let events = received.lock().expect("lock");
+        let events = received
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(events.len(), 1);
 
         // Verify unsubscribe
         drop(events);
         assert!(listeners.unsubscribe(id));
         listeners.notify(&AgentEvent::AgentStart {
-            session_id: "test-456".to_string(),
+            session_id: "test-456".into(),
         });
-        assert_eq!(received.lock().expect("lock").len(), 1);
+        assert_eq!(
+            received
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1831,20 +2041,30 @@ mod tests {
 
         let ca = Arc::clone(&count_a);
         listeners.subscribe(Arc::new(move |_| {
-            *ca.lock().expect("lock") += 1;
+            *ca.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
         }));
 
         let cb = Arc::clone(&count_b);
         listeners.subscribe(Arc::new(move |_| {
-            *cb.lock().expect("lock") += 1;
+            *cb.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
         }));
 
         listeners.notify(&AgentEvent::AgentStart {
-            session_id: "s".to_string(),
+            session_id: "s".into(),
         });
 
-        assert_eq!(*count_a.lock().expect("lock"), 1);
-        assert_eq!(*count_b.lock().expect("lock"), 1);
+        assert_eq!(
+            *count_a
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            1
+        );
+        assert_eq!(
+            *count_b
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            1
+        );
     }
 
     #[test]
@@ -1863,7 +2083,9 @@ mod tests {
 
         let e = Arc::clone(&ends);
         listeners.on_tool_end = Some(Arc::new(move |name, _output, is_error| {
-            e.lock().expect("lock").push((name.to_string(), is_error));
+            e.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((name.to_string(), is_error));
         }));
 
         let args = serde_json::json!({"path": "/foo"});
@@ -1876,14 +2098,18 @@ mod tests {
         listeners.notify_tool_end("bash", &output, false);
 
         {
-            let s = starts.lock().expect("lock");
+            let s = starts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert_eq!(s.len(), 1);
             assert_eq!(s[0].0, "bash");
             drop(s);
         }
 
         {
-            let e = ends.lock().expect("lock");
+            let e = ends
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             assert_eq!(e.len(), 1);
             assert_eq!(e[0].0, "bash");
             assert!(!e[0].1);
@@ -1898,7 +2124,9 @@ mod tests {
 
         let r = Arc::clone(&received);
         listeners.on_stream_event = Some(Arc::new(move |ev| {
-            r.lock().expect("lock").push(format!("{ev:?}"));
+            r.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(format!("{ev:?}"));
         }));
 
         let event = StreamEvent::TextDelta {
@@ -1907,7 +2135,13 @@ mod tests {
         };
         listeners.notify_stream_event(&event);
 
-        assert_eq!(received.lock().expect("lock").len(), 1);
+        assert_eq!(
+            received
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -1920,14 +2154,21 @@ mod tests {
             working_directory: Some(tmp.path().to_path_buf()),
             no_session: true,
             on_event: Some(Arc::new(move |event| {
-                r.lock().expect("lock").push(format!("{event:?}"));
+                r.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(format!("{event:?}"));
             })),
             ..SessionOptions::default()
         };
 
         let handle = run_async(create_agent_session(options)).expect("create session");
         // Verify the listener was registered
-        let count = handle.listeners().subscribers.lock().expect("lock").len();
+        let count = handle
+            .listeners()
+            .subscribers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
         assert_eq!(
             count, 1,
             "on_event from SessionOptions should register one subscriber"
@@ -1946,13 +2187,23 @@ mod tests {
         let handle = run_async(create_agent_session(options)).expect("create session");
         let id = handle.subscribe(|_event| {});
         assert_eq!(
-            handle.listeners().subscribers.lock().expect("lock").len(),
+            handle
+                .listeners()
+                .subscribers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
             1
         );
 
         assert!(handle.unsubscribe(id));
         assert_eq!(
-            handle.listeners().subscribers.lock().expect("lock").len(),
+            handle
+                .listeners()
+                .subscribers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
             0
         );
 
@@ -1989,7 +2240,7 @@ mod tests {
                 assert_eq!(content_index, 2);
                 assert_eq!(delta, "chunk");
             }
-            other => panic!("unexpected variant: {other:?}"),
+            other => unreachable!("expected TextDelta, got {other:?}"),
         }
     }
 
@@ -2099,10 +2350,10 @@ mod tests {
     }
 
     #[test]
-    fn create_all_tools_returns_seven() {
+    fn create_all_tools_returns_eight() {
         let tmp = tempdir().expect("tempdir");
         let tools = super::create_all_tools(tmp.path());
-        assert_eq!(tools.len(), 7, "should create all 7 built-in tools");
+        assert_eq!(tools.len(), 8, "should create all 8 built-in tools");
 
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         for expected in BUILTIN_TOOL_NAMES {
@@ -2125,10 +2376,10 @@ mod tests {
     }
 
     #[test]
-    fn all_tool_definitions_returns_seven_schemas() {
+    fn all_tool_definitions_returns_eight_schemas() {
         let tmp = tempdir().expect("tempdir");
         let defs = super::all_tool_definitions(tmp.path());
-        assert_eq!(defs.len(), 7);
+        assert_eq!(defs.len(), 8);
 
         for def in &defs {
             assert!(!def.name.is_empty());

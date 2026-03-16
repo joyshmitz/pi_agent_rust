@@ -431,17 +431,31 @@ impl TraceJitCompiler {
 
         self.generation += 1;
 
-        // Check if trace is compiled.
-        let compiled = match self.cache.get(plan_id) {
-            Some(compiled) => compiled.clone(),
-            None => {
+        // Check if trace is compiled, evaluating guards without holding mutable borrow or cloning
+        let (tier_improvement_delta, failed_guard) = {
+            let Some(compiled) = self.cache.get(plan_id) else {
                 return JitExecutionResult {
                     jit_hit: false,
                     plan_id: Some(plan_id.to_string()),
                     deopt_reason: Some(DeoptReason::NotCompiled),
                     cost_delta: 0,
                 };
+            };
+
+            let mut failed_guard = None;
+            for (idx, guard) in compiled.guards.iter().enumerate() {
+                if !guard.check(trace, ctx) {
+                    let description = match guard {
+                        TraceGuard::OpcodePrefix(_) => "opcode_prefix_mismatch",
+                        TraceGuard::SafetyEnvelopeNotVetoing => "safety_envelope_vetoing",
+                        TraceGuard::MinSupportCount(_) => "support_count_below_threshold",
+                    };
+                    failed_guard = Some((idx, description));
+                    break;
+                }
             }
+
+            (compiled.tier_improvement_delta, failed_guard)
         };
 
         // Update LRU.
@@ -449,29 +463,22 @@ impl TraceJitCompiler {
             profile.last_access_generation = self.generation;
         }
 
-        // Check guards.
-        for (idx, guard) in compiled.guards.iter().enumerate() {
-            if !guard.check(trace, ctx) {
-                let invalidated_after_failures = self.record_guard_failure(plan_id);
-                let description = match guard {
-                    TraceGuard::OpcodePrefix(_) => "opcode_prefix_mismatch",
-                    TraceGuard::SafetyEnvelopeNotVetoing => "safety_envelope_vetoing",
-                    TraceGuard::MinSupportCount(_) => "support_count_below_threshold",
-                };
-                let deopt_reason = invalidated_after_failures.map_or_else(
-                    || DeoptReason::GuardFailure {
-                        guard_index: idx,
-                        description: description.to_string(),
-                    },
-                    |total_failures| DeoptReason::TraceInvalidated { total_failures },
-                );
-                return JitExecutionResult {
-                    jit_hit: false,
-                    plan_id: Some(plan_id.to_string()),
-                    deopt_reason: Some(deopt_reason),
-                    cost_delta: 0,
-                };
-            }
+        // Handle guard failure if one occurred.
+        if let Some((idx, description)) = failed_guard {
+            let invalidated_after_failures = self.record_guard_failure(plan_id);
+            let deopt_reason = invalidated_after_failures.map_or_else(
+                || DeoptReason::GuardFailure {
+                    guard_index: idx,
+                    description: description.to_string(),
+                },
+                |total_failures| DeoptReason::TraceInvalidated { total_failures },
+            );
+            return JitExecutionResult {
+                jit_hit: false,
+                plan_id: Some(plan_id.to_string()),
+                deopt_reason: Some(deopt_reason),
+                cost_delta: 0,
+            };
         }
 
         // All guards passed — JIT dispatch.
@@ -484,7 +491,7 @@ impl TraceJitCompiler {
             jit_hit: true,
             plan_id: Some(plan_id.to_string()),
             deopt_reason: None,
-            cost_delta: compiled.tier_improvement_delta,
+            cost_delta: tier_improvement_delta,
         }
     }
 

@@ -2,6 +2,25 @@ use super::commands::model_entry_matches;
 use super::*;
 
 impl PiApp {
+    pub(super) fn handle_custom_extension_key(&mut self, key: &KeyMsg) -> bool {
+        if !self.custom_overlay_input_is_available() {
+            return false;
+        }
+        if key.key_type == KeyType::CtrlC {
+            return false;
+        }
+
+        if let Some(encoded) = encode_custom_ui_key(key) {
+            const MAX_CUSTOM_KEY_QUEUE: usize = 256;
+            if self.extension_custom_key_queue.len() >= MAX_CUSTOM_KEY_QUEUE {
+                let _ = self.extension_custom_key_queue.pop_front();
+            }
+            self.extension_custom_key_queue.push_back(encoded);
+        }
+
+        true
+    }
+
     /// Format keyboard shortcuts for /hotkeys display.
     ///
     /// Groups actions by category and shows their key bindings.
@@ -251,6 +270,10 @@ impl PiApp {
 
         let temp_path = temp_file.path().to_path_buf();
 
+        // Pause terminal UI so the external editor can use the terminal correctly
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+
         // Spawn editor via shell to handle EDITOR with arguments (e.g., "code --wait")
         // The shell properly handles quoting, arguments, and PATH lookup
         #[cfg(unix)]
@@ -258,12 +281,22 @@ impl PiApp {
             .args(["-c", &format!("{editor} \"$1\"")])
             .arg("--") // separator for positional args
             .arg(&temp_path)
-            .status()?;
+            .status();
 
         #[cfg(not(unix))]
         let status = std::process::Command::new("cmd")
             .args(["/c", &format!("{} \"{}\"", editor, temp_path.display())])
-            .status()?;
+            .status();
+
+        // Resume terminal UI
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen);
+        let _ = crossterm::terminal::enable_raw_mode();
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+        );
+
+        let status = status?;
 
         if !status.success() {
             return Err(std::io::Error::other(format!(
@@ -409,32 +442,22 @@ impl PiApp {
                 return;
             }
         };
-
-        let Ok(mut agent_guard) = self.agent.try_lock() else {
-            self.status_message = Some("Agent busy; try again".to_string());
+        let resolved_key_opt = super::commands::resolve_model_key_from_default_auth(&next);
+        if crate::models::model_requires_configured_credential(&next) && resolved_key_opt.is_none()
+        {
+            self.status_message = Some(format!(
+                "Missing credentials for provider {}. Run /login {}.",
+                next.model.provider, next.model.provider
+            ));
             return;
-        };
-        agent_guard.set_provider(provider_impl);
-        drop(agent_guard);
-
-        let Ok(mut session_guard) = self.session.try_lock() else {
-            self.status_message = Some("Session busy; try again".to_string());
-            return;
-        };
-        session_guard.header.provider = Some(next.model.provider.clone());
-        session_guard.header.model_id = Some(next.model.id.clone());
-        session_guard.append_model_change(next.model.provider.clone(), next.model.id.clone());
-        drop(session_guard);
-        self.spawn_save_session();
-
-        self.model_entry = next.clone();
-        if let Ok(mut guard) = self.model_entry_shared.lock() {
-            *guard = next;
         }
-        self.model = format!(
-            "{}/{}",
-            self.model_entry.model.provider, self.model_entry.model.id
-        );
+
+        if let Err(message) =
+            self.switch_active_model(&next, provider_impl, resolved_key_opt.as_deref())
+        {
+            self.status_message = Some(message);
+            return;
+        }
         self.status_message = Some(if fell_back_to_available {
             format!(
                 "No scoped models matched; cycling all available models. Switched model: {}",
@@ -450,9 +473,16 @@ impl PiApp {
             manager.clear_ui_sender();
         }
 
+        // Schedule a guaranteed bridge shutdown instead of a lossy try_send so quit
+        // still unwinds when the bounded event queue is already saturated.
+        let shutdown_tx = self.event_tx.clone();
+        self.runtime_handle.spawn(async move {
+            let shutdown_cx = Cx::for_request();
+            super::enqueue_ui_shutdown(&shutdown_tx, &shutdown_cx).await;
+        });
+
         // Drop the async → bubbletea bridge sender so bubbletea can shut down cleanly.
         // Without this, bubbletea's external forwarder thread can block on `recv()` during quit.
-        let _ = self.event_tx.try_send(PiMsg::UiShutdown);
         let (tx, _rx) = mpsc::channel::<PiMsg>(1);
         drop(std::mem::replace(&mut self.event_tx, tx));
         quit()
@@ -597,7 +627,7 @@ impl PiApp {
                 None
             }
             AppAction::SelectModel => {
-                self.open_model_selector();
+                self.open_model_selector_configured_only();
                 None
             }
 
@@ -672,22 +702,28 @@ impl PiApp {
             // =========================================================
             AppAction::PageUp => {
                 // Sync viewport content and height so page_up() has correct
-                // line count and page size.
+                // line count and page size.  Save/restore y_offset across
+                // set_content() which can clamp or reset the offset.
+                let saved_offset = self.conversation_viewport.y_offset();
                 let content = self.build_conversation_content();
                 let effective = self.view_effective_conversation_height().max(1);
                 self.conversation_viewport.height = effective;
                 self.conversation_viewport.set_content(content.trim_end());
+                self.conversation_viewport.set_y_offset(saved_offset);
                 self.conversation_viewport.page_up();
                 self.follow_stream_tail = false;
                 None
             }
             AppAction::PageDown => {
                 // Sync viewport content and height so page_down() has correct
-                // line count and page size.
+                // line count and page size.  Save/restore y_offset across
+                // set_content() which can clamp or reset the offset.
+                let saved_offset = self.conversation_viewport.y_offset();
                 let content = self.build_conversation_content();
                 let effective = self.view_effective_conversation_height().max(1);
                 self.conversation_viewport.height = effective;
                 self.conversation_viewport.set_content(content.trim_end());
+                self.conversation_viewport.set_y_offset(saved_offset);
                 self.conversation_viewport.page_down();
                 // Re-enable auto-follow if the user scrolled back to the bottom.
                 if self.is_at_bottom() {
@@ -870,5 +906,578 @@ impl PiApp {
             // Other actions pass through to TextArea
             _ => false,
         }
+    }
+}
+
+fn encode_custom_ui_key(key: &KeyMsg) -> Option<String> {
+    let control = |byte: u8| Some(char::from(byte).to_string());
+    match key.key_type {
+        KeyType::Runes => {
+            if key.runes.is_empty() {
+                None
+            } else {
+                let text: String = key.runes.iter().collect();
+                if key.alt {
+                    Some(format!("\u{1b}{text}"))
+                } else {
+                    Some(text)
+                }
+            }
+        }
+        KeyType::Space => Some(" ".to_string()),
+        KeyType::Enter | KeyType::ShiftEnter | KeyType::CtrlEnter | KeyType::CtrlShiftEnter => {
+            Some("\r".to_string())
+        }
+        KeyType::Tab => Some("\t".to_string()),
+        KeyType::ShiftTab => Some("\u{1b}[Z".to_string()),
+        KeyType::Esc => Some("\u{1b}".to_string()),
+        KeyType::Backspace | KeyType::CtrlH => Some("\u{7f}".to_string()),
+        KeyType::Up => Some("\u{1b}[A".to_string()),
+        KeyType::Down => Some("\u{1b}[B".to_string()),
+        KeyType::Right => Some("\u{1b}[C".to_string()),
+        KeyType::Left => Some("\u{1b}[D".to_string()),
+        KeyType::Home => Some("\u{1b}[H".to_string()),
+        KeyType::End => Some("\u{1b}[F".to_string()),
+        KeyType::PgUp => Some("\u{1b}[5~".to_string()),
+        KeyType::PgDown => Some("\u{1b}[6~".to_string()),
+        KeyType::Delete => Some("\u{1b}[3~".to_string()),
+        KeyType::Insert => Some("\u{1b}[2~".to_string()),
+        KeyType::CtrlA => control(0x01),
+        KeyType::CtrlB => control(0x02),
+        KeyType::CtrlD => control(0x04),
+        KeyType::CtrlE => control(0x05),
+        KeyType::CtrlF => control(0x06),
+        KeyType::CtrlG => control(0x07),
+        KeyType::CtrlJ => control(0x0a),
+        KeyType::CtrlK => control(0x0b),
+        KeyType::CtrlL => control(0x0c),
+        KeyType::CtrlN => control(0x0e),
+        KeyType::CtrlO => control(0x0f),
+        KeyType::CtrlP => control(0x10),
+        KeyType::CtrlQ => control(0x11),
+        KeyType::CtrlR => control(0x12),
+        KeyType::CtrlS => control(0x13),
+        KeyType::CtrlT => control(0x14),
+        KeyType::CtrlU => control(0x15),
+        KeyType::CtrlV => control(0x16),
+        KeyType::CtrlW => control(0x17),
+        KeyType::CtrlX => control(0x18),
+        KeyType::CtrlY => control(0x19),
+        KeyType::CtrlZ => control(0x1a),
+        KeyType::Null => control(0x00),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::{Agent, AgentConfig};
+    use crate::config::Config;
+    use crate::model::{StreamEvent, Usage};
+    use crate::models::ModelEntry;
+    use crate::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions};
+    use crate::resources::{ResourceCliOptions, ResourceLoader};
+    use crate::session::Session;
+    use crate::tools::ToolRegistry;
+    use asupersync::channel::mpsc;
+    use asupersync::runtime::RuntimeBuilder;
+    use futures::stream;
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::OnceLock;
+
+    struct DummyProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for DummyProvider {
+        fn name(&self) -> &'static str {
+            "dummy"
+        }
+
+        fn api(&self) -> &'static str {
+            "dummy"
+        }
+
+        fn model_id(&self) -> &'static str {
+            "dummy-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    fn runtime() -> &'static asupersync::runtime::Runtime {
+        static RT: OnceLock<asupersync::runtime::Runtime> = OnceLock::new();
+        RT.get_or_init(|| {
+            RuntimeBuilder::multi_thread()
+                .blocking_threads(1, 8)
+                .build()
+                .expect("build runtime")
+        })
+    }
+
+    fn runtime_handle() -> asupersync::runtime::RuntimeHandle {
+        runtime().handle()
+    }
+
+    fn model_entry(
+        provider: &str,
+        id: &str,
+        api_key: Option<&str>,
+        headers: HashMap<String, String>,
+    ) -> ModelEntry {
+        ModelEntry {
+            model: Model {
+                id: id.to_string(),
+                name: id.to_string(),
+                api: "openai-completions".to_string(),
+                provider: provider.to_string(),
+                base_url: "https://example.invalid".to_string(),
+                reasoning: true,
+                input: vec![InputType::Text],
+                cost: ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 128_000,
+                max_tokens: 8_192,
+                headers: HashMap::new(),
+            },
+            api_key: api_key.map(str::to_string),
+            headers,
+            auth_header: true,
+            compat: None,
+            oauth_config: None,
+        }
+    }
+
+    fn build_test_app_with_event_rx(
+        current: ModelEntry,
+        available: Vec<ModelEntry>,
+    ) -> (PiApp, mpsc::Receiver<PiMsg>) {
+        let provider: Arc<dyn Provider> = Arc::new(DummyProvider);
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig::default(),
+        );
+        let session = Arc::new(asupersync::sync::Mutex::new(Session::in_memory()));
+        let resources = ResourceLoader::empty(false);
+        let resource_cli = ResourceCliOptions {
+            no_skills: false,
+            no_prompt_templates: false,
+            no_extensions: false,
+            no_themes: false,
+            skill_paths: Vec::new(),
+            prompt_paths: Vec::new(),
+            extension_paths: Vec::new(),
+            theme_paths: Vec::new(),
+        };
+        let (event_tx, event_rx) = mpsc::channel(64);
+        (
+            PiApp::new(
+                agent,
+                session,
+                Config::default(),
+                resources,
+                resource_cli,
+                Path::new(".").to_path_buf(),
+                current,
+                Vec::new(),
+                available,
+                Vec::new(),
+                event_tx,
+                runtime_handle(),
+                true,
+                None,
+                Some(KeyBindings::new()),
+                Vec::new(),
+                Usage::default(),
+            ),
+            event_rx,
+        )
+    }
+
+    fn build_test_app(current: ModelEntry, available: Vec<ModelEntry>) -> PiApp {
+        let (app, _event_rx) = build_test_app_with_event_rx(current, available);
+        app
+    }
+
+    #[test]
+    fn cycle_model_replaces_stream_options_api_key_and_headers() {
+        let mut current_headers = HashMap::new();
+        current_headers.insert("x-stale".to_string(), "old".to_string());
+        let current = model_entry("openai", "gpt-4o-mini", Some("old-key"), current_headers);
+
+        let mut next_headers = HashMap::new();
+        next_headers.insert("x-provider-header".to_string(), "next".to_string());
+        let next = model_entry(
+            "openrouter",
+            "openai/gpt-4o-mini",
+            Some("next-key"),
+            next_headers,
+        );
+
+        let mut app = build_test_app(current.clone(), vec![current, next]);
+        {
+            let mut guard = app.agent.try_lock().expect("agent lock");
+            guard.stream_options_mut().api_key = Some("stale-key".to_string());
+            guard
+                .stream_options_mut()
+                .headers
+                .insert("x-stale".to_string(), "stale".to_string());
+        }
+
+        app.cycle_model(1);
+
+        let mut guard = app.agent.try_lock().expect("agent lock");
+        assert_eq!(
+            guard.stream_options_mut().api_key.as_deref(),
+            Some("next-key")
+        );
+        assert_eq!(
+            guard
+                .stream_options_mut()
+                .headers
+                .get("x-provider-header")
+                .map(String::as_str),
+            Some("next")
+        );
+        assert!(
+            !guard.stream_options_mut().headers.contains_key("x-stale"),
+            "cycling models must replace stale provider headers"
+        );
+    }
+
+    #[test]
+    fn cycle_model_clears_stale_api_key_when_next_model_has_no_key() {
+        let current = model_entry("openai", "gpt-4o-mini", Some("old-key"), HashMap::new());
+        let mut next = model_entry("ollama", "llama3.2", None, HashMap::new());
+        next.auth_header = false;
+        let mut app = build_test_app(current.clone(), vec![current, next]);
+        {
+            let mut guard = app.agent.try_lock().expect("agent lock");
+            guard.stream_options_mut().api_key = Some("stale-key".to_string());
+            guard
+                .stream_options_mut()
+                .headers
+                .insert("x-stale".to_string(), "stale".to_string());
+        }
+
+        app.cycle_model(1);
+
+        let mut guard = app.agent.try_lock().expect("agent lock");
+        assert!(
+            guard.stream_options_mut().api_key.is_none(),
+            "cycling to a keyless model must clear stale API key"
+        );
+        assert!(
+            guard.stream_options_mut().headers.is_empty(),
+            "cycling to keyless model with no headers must clear stale headers"
+        );
+    }
+
+    #[test]
+    fn cycle_model_clamps_thinking_level_for_non_reasoning_targets() {
+        let current = model_entry("openai", "gpt-5.2", Some("old-key"), HashMap::new());
+        let mut next = model_entry("ollama", "llama3.2", None, HashMap::new());
+        next.auth_header = false;
+        next.model.reasoning = false;
+        let mut app = build_test_app(current.clone(), vec![current, next]);
+
+        {
+            let mut guard = app.agent.try_lock().expect("agent lock");
+            guard.stream_options_mut().thinking_level = Some(crate::model::ThinkingLevel::High);
+        }
+        {
+            let mut guard = app.session.try_lock().expect("session lock");
+            guard.header.thinking_level = Some(crate::model::ThinkingLevel::High.to_string());
+        }
+
+        app.cycle_model(1);
+
+        let mut agent_guard = app.agent.try_lock().expect("agent lock");
+        assert_eq!(
+            agent_guard.stream_options_mut().thinking_level,
+            Some(crate::model::ThinkingLevel::Off)
+        );
+        drop(agent_guard);
+
+        let session_guard = app.session.try_lock().expect("session lock");
+        assert_eq!(
+            session_guard.header.thinking_level.as_deref(),
+            Some("off"),
+            "session thinking level should clamp alongside the active model"
+        );
+    }
+
+    #[test]
+    fn slash_model_allows_switch_to_keyless_provider_without_api_key() {
+        let current = model_entry("openai", "gpt-4o-mini", Some("old-key"), HashMap::new());
+        let mut keyless = model_entry("ollama", "llama3.2", None, HashMap::new());
+        keyless.auth_header = false;
+        let mut app = build_test_app(current.clone(), vec![current, keyless]);
+
+        let _ = app.handle_slash_command(SlashCommand::Model, "ollama/llama3.2");
+
+        assert_eq!(app.model, "ollama/llama3.2");
+        let mut guard = app.agent.try_lock().expect("agent lock");
+        assert!(
+            guard.stream_options_mut().api_key.is_none(),
+            "keyless model switch must not keep stale API key"
+        );
+    }
+
+    #[test]
+    fn slash_model_rejects_missing_credentials_for_required_provider() {
+        let current = model_entry("openai", "gpt-4o-mini", Some("old-key"), HashMap::new());
+        let mut requires_creds = model_entry("acme-remote", "cloud-model", None, HashMap::new());
+        requires_creds.auth_header = true;
+        let mut app = build_test_app(current.clone(), vec![current, requires_creds]);
+
+        let _ = app.handle_slash_command(SlashCommand::Model, "acme-remote/cloud-model");
+
+        assert_eq!(app.model, "openai/gpt-4o-mini");
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|msg| msg.contains("Missing credentials for provider acme-remote")),
+            "switch should fail fast when selected provider still lacks credentials"
+        );
+    }
+
+    #[test]
+    fn slash_model_treats_blank_inline_key_as_missing_credentials() {
+        let current = model_entry("openai", "gpt-4o-mini", Some("old-key"), HashMap::new());
+        let mut blank_key = model_entry("acme-remote", "cloud-model", Some("   "), HashMap::new());
+        blank_key.auth_header = true;
+        let mut app = build_test_app(current.clone(), vec![current, blank_key]);
+
+        let _ = app.handle_slash_command(SlashCommand::Model, "acme-remote/cloud-model");
+
+        assert_eq!(app.model, "openai/gpt-4o-mini");
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|msg| msg.contains("Missing credentials for provider acme-remote")),
+            "blank inline keys must not bypass credential checks"
+        );
+    }
+
+    #[test]
+    fn slash_thinking_clamps_and_avoids_duplicate_history_for_non_reasoning_models() {
+        let mut current = model_entry("ollama", "llama3.2", None, HashMap::new());
+        current.auth_header = false;
+        current.model.reasoning = false;
+        let mut app = build_test_app(current.clone(), vec![current]);
+
+        let _ = app.handle_slash_command(SlashCommand::Thinking, "high");
+        let _ = app.handle_slash_command(SlashCommand::Thinking, "high");
+
+        let agent_guard = app.agent.try_lock().expect("agent lock");
+        assert_eq!(
+            agent_guard.stream_options().thinking_level,
+            Some(crate::model::ThinkingLevel::Off)
+        );
+        drop(agent_guard);
+
+        let session_guard = app.session.try_lock().expect("session lock");
+        assert_eq!(session_guard.header.thinking_level.as_deref(), Some("off"));
+        let thinking_changes = session_guard
+            .entries_for_current_path()
+            .iter()
+            .filter(|entry| matches!(entry, crate::session::SessionEntry::ThinkingLevelChange(_)))
+            .count();
+        assert_eq!(
+            thinking_changes, 1,
+            "reapplying the same effective thinking level should not add duplicate history"
+        );
+    }
+
+    #[test]
+    fn session_header_sync_updates_runtime_model_and_clamps_thinking() {
+        let current = model_entry("openai", "gpt-5.2", Some("old-key"), HashMap::new());
+        let mut next_headers = HashMap::new();
+        next_headers.insert("x-provider-header".to_string(), "next".to_string());
+        let mut next = model_entry("acme-local", "plain-model", None, next_headers.clone());
+        next.auth_header = false;
+        next.model.reasoning = false;
+        let mut app = build_test_app(current.clone(), vec![current, next.clone()]);
+
+        {
+            let mut guard = app.agent.try_lock().expect("agent lock");
+            guard.stream_options_mut().api_key = Some("stale-key".to_string());
+            let _ = guard
+                .stream_options_mut()
+                .headers
+                .insert("x-stale".to_string(), "old".to_string());
+            guard.stream_options_mut().thinking_level = Some(crate::model::ThinkingLevel::High);
+        }
+        {
+            let mut guard = app.session.try_lock().expect("session lock");
+            guard.header.provider = Some(next.model.provider.clone());
+            guard.header.model_id = Some(next.model.id);
+            guard.header.thinking_level = Some(crate::model::ThinkingLevel::High.to_string());
+        }
+
+        app.sync_runtime_selection_from_session_header()
+            .expect("sync runtime selection");
+
+        let agent_guard = app.agent.try_lock().expect("agent lock");
+        assert_eq!(agent_guard.provider().name(), "acme-local");
+        assert_eq!(agent_guard.provider().model_id(), "plain-model");
+        assert_eq!(agent_guard.stream_options().api_key, None);
+        assert_eq!(agent_guard.stream_options().headers, next_headers);
+        assert_eq!(
+            agent_guard.stream_options().thinking_level,
+            Some(crate::model::ThinkingLevel::Off)
+        );
+        drop(agent_guard);
+
+        assert_eq!(app.model, "acme-local/plain-model");
+        assert_eq!(app.model_entry.model.provider, "acme-local");
+        assert_eq!(app.model_entry.model.id, "plain-model");
+        let shared_guard = app.model_entry_shared.lock().expect("shared model lock");
+        assert_eq!(shared_guard.model.provider, "acme-local");
+        assert_eq!(shared_guard.model.id, "plain-model");
+        drop(shared_guard);
+
+        let session_guard = app.session.try_lock().expect("session lock");
+        assert_eq!(session_guard.header.thinking_level.as_deref(), Some("off"));
+        let thinking_changes = session_guard
+            .entries_for_current_path()
+            .iter()
+            .filter(|entry| matches!(entry, crate::session::SessionEntry::ThinkingLevelChange(_)))
+            .count();
+        assert_eq!(thinking_changes, 1);
+    }
+
+    #[test]
+    fn session_header_sync_rejects_missing_credentials_without_switching() {
+        let current = model_entry("openai", "gpt-4o-mini", Some("old-key"), HashMap::new());
+        let mut requires_creds = model_entry("acme-remote", "cloud-model", None, HashMap::new());
+        requires_creds.auth_header = true;
+        let mut app = build_test_app(current.clone(), vec![current, requires_creds]);
+
+        {
+            let mut guard = app.session.try_lock().expect("session lock");
+            guard.header.provider = Some("acme-remote".to_string());
+            guard.header.model_id = Some("cloud-model".to_string());
+        }
+
+        let err = app
+            .sync_runtime_selection_from_session_header()
+            .expect_err("missing credentials should fail closed");
+        assert_eq!(
+            err,
+            "Missing credentials for provider acme-remote. Run /login acme-remote."
+        );
+        assert_eq!(app.model, "openai/gpt-4o-mini");
+        assert_eq!(app.model_entry.model.provider, "openai");
+        assert_eq!(app.model_entry.model.id, "gpt-4o-mini");
+    }
+
+    #[test]
+    fn session_header_sync_ignores_incomplete_model_header_and_keeps_current_runtime() {
+        let mut current = model_entry("acme-local", "plain-model", None, HashMap::new());
+        current.auth_header = false;
+        current.model.reasoning = false;
+        let mut app = build_test_app(current.clone(), vec![current]);
+
+        {
+            let mut guard = app.agent.try_lock().expect("agent lock");
+            guard.stream_options_mut().thinking_level = Some(crate::model::ThinkingLevel::High);
+        }
+        {
+            let mut guard = app.session.try_lock().expect("session lock");
+            guard.header.provider = Some("partial-provider".to_string());
+            guard.header.model_id = None;
+            guard.header.thinking_level = Some(crate::model::ThinkingLevel::High.to_string());
+        }
+
+        app.sync_runtime_selection_from_session_header()
+            .expect("incomplete headers should not block runtime sync");
+
+        let agent_guard = app.agent.try_lock().expect("agent lock");
+        assert_eq!(agent_guard.provider().name(), "acme-local");
+        assert_eq!(agent_guard.provider().model_id(), "plain-model");
+        assert_eq!(
+            agent_guard.stream_options().thinking_level,
+            Some(crate::model::ThinkingLevel::Off)
+        );
+        drop(agent_guard);
+
+        assert_eq!(app.model, "acme-local/plain-model");
+        assert_eq!(app.model_entry.model.provider, "acme-local");
+        assert_eq!(app.model_entry.model.id, "plain-model");
+
+        let session_guard = app.session.try_lock().expect("session lock");
+        assert_eq!(
+            session_guard.header.provider.as_deref(),
+            Some("partial-provider")
+        );
+        assert_eq!(session_guard.header.model_id, None);
+        assert_eq!(session_guard.header.thinking_level.as_deref(), Some("off"));
+    }
+
+    #[test]
+    fn custom_extension_key_handler_queues_rune_input_when_active() {
+        let current = model_entry("openai", "gpt-4o-mini", Some("old-key"), HashMap::new());
+        let mut app = build_test_app(current.clone(), vec![current]);
+        app.extension_custom_active = true;
+
+        let consumed = app.handle_custom_extension_key(&KeyMsg::from_char('w'));
+        assert!(consumed, "custom overlay should consume key input");
+        assert_eq!(
+            app.extension_custom_key_queue.pop_front().as_deref(),
+            Some("w")
+        );
+    }
+
+    #[test]
+    fn custom_extension_key_handler_preserves_ctrl_c_for_global_exit() {
+        let current = model_entry("openai", "gpt-4o-mini", Some("old-key"), HashMap::new());
+        let mut app = build_test_app(current.clone(), vec![current]);
+        app.extension_custom_active = true;
+
+        let consumed = app.handle_custom_extension_key(&KeyMsg::from_type(KeyType::CtrlC));
+        assert!(
+            !consumed,
+            "Ctrl+C should remain available for normal global handling"
+        );
+        assert!(app.extension_custom_key_queue.is_empty());
+    }
+
+    #[test]
+    fn quit_cmd_schedules_shutdown_when_event_queue_is_full() {
+        let current = model_entry("openai", "gpt-4o-mini", Some("old-key"), HashMap::new());
+        let (mut app, event_rx) = build_test_app_with_event_rx(current.clone(), vec![current]);
+        app.event_tx
+            .try_send(PiMsg::System("busy".to_string()))
+            .expect("fill bounded event channel");
+
+        let _ = app.quit_cmd();
+
+        let (first, second) = runtime().block_on(async {
+            let cx = asupersync::Cx::for_request();
+            let first = event_rx.recv(&cx).await.expect("first queued message");
+            let second = event_rx.recv(&cx).await.expect("shutdown message");
+            (first, second)
+        });
+
+        assert!(matches!(first, PiMsg::System(text) if text == "busy"));
+        assert!(matches!(second, PiMsg::UiShutdown));
     }
 }
