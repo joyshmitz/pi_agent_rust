@@ -50,7 +50,8 @@ def result():
             "snippet_choice": "Type(${1|red,green|})$0",
             "snippet_nested": "Type(${1:outer(${2:inner})})$0",
             "snippet_variable": "Type($CLIPBOARD)$0",
-            "snippet_transform": "Type(${1/(.*)/$1/})$0",
+            "snippet_transform": "Type(${1/(?=a)/$1/})$0",
+            "snippet_transform_apply": "Type(${1:my_name}, ${1/(.*)/${1:/pascalcase}/}, $1)$0",
             "snippet_malformed": "Type(${1:unfinished",
             "snippet_conflict": "Type(${1:one}, ${1:two})",
             "snippet_defaults": "Type(${1:default})$0",
@@ -109,7 +110,7 @@ while True:
         if mode != "unsupported":
             resolve = mode not in ("array", "plain", "replace", "command", "indent")
             if mode.startswith("snippet"):
-                resolve = mode in ("snippet_lazy", "snippet_defaults")
+                resolve = mode in ("snippet_lazy", "snippet_defaults", "snippet_transform_apply")
             server["completionProvider"] = {"resolveProvider": resolve}
         response["result"] = {"capabilities": server}
     elif method == "textDocument/completion":
@@ -134,7 +135,7 @@ while True:
         item["additionalTextEdits"] = [{"range": {"start": {"line": 0, "character": 0},
                                                     "end": {"line": 0, "character": 0}},
                                          "newText": "use example::Type;\n"}]
-        if mode == "snippet_lazy":
+        if mode in ("snippet_lazy", "snippet_transform_apply"):
             item["additionalTextEdits"][0]["newText"] += "// literal $0 ${1:keep}\n"
         if mode == "overlap":
             item["additionalTextEdits"][0]["range"] = span(12,14)

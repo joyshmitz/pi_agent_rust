@@ -156,11 +156,54 @@ placeholder-looking expressions, and still commit with the primary edit in
 one checked transaction. Caller substitutions are never parsed again: shell
 syntax, dollar signs and backslashes in a value are inserted literally.
 
-Variables (including environment-, filename- and clipboard-derived values),
-regular-expression transforms and other unsupported syntax are rejected
-before any file changes. Pi does not guess their expansion or obtain ambient
-data. The entire snippet is parsed even when an outer placeholder has an
-explicit override; that override cannot hide unsupported syntax.
+### Numeric-placeholder transforms
+
+A transformed occurrence can derive text from another numeric placeholder:
+
+```text
+${1:my_name} ${1/(.*)/${1:/pascalcase}/} $1
+```
+
+This expands to `my_name MyName my_name`. Supplying `{"1":"other_name"}`
+changes it to `other_name OtherName other_name`. The transform belongs only
+to its occurrence: it does not alter the source field, another mirror, the
+cached server item or the original source file during preview. Forward
+references and nested defaults use the same dependency and cycle checks.
+A positive transformed field without a default still requires an explicit
+`snippetValues` entry before application, even if the replacement is constant.
+
+The supported form is `${index/pattern/replacement/options}`. A replacement
+can contain `$0` for the full match, `$1` or `${1}` for a capture, and the five
+case modifiers `upcase`, `downcase`, `capitalize`, `camelcase` and `pascalcase`.
+Conditional formats are `${1:+yes}`, `${1:-no}`, `${1:default}` and
+`${1:?yes:no}`. Empty captures are false. Conditional arms are literal text,
+not recursively evaluated snippets; nested `${...}` formats in an arm are
+rejected. Escape a literal dollar with `\$`, closing brace with `\}`, slash
+with `\/` or backslash with `\\`; `\:` escapes a conditional separator.
+
+Replacement affects the first match unless `g` is supplied. `i` enables
+ASCII case-insensitive matching; only `g` and `i` flags are supported. Global
+empty matches advance by one ASCII character, including a possible final
+empty match. An unmatched pattern leaves the original value unchanged unless
+a format contains a nonempty else arm, in which case that replacement is
+rendered with empty captures. Captured or generated text is never reparsed as
+snippet syntax and never executed.
+
+This is deliberately **not a full JavaScript regular-expression engine**.
+Both the regex pattern and transformed source value must be ASCII and contain
+no CR or LF. Ordinary untransformed snippet fields still support Unicode and
+multiline text. Supported patterns use the shared subset of literals,
+character classes, anchors, alternatives, captures and quantifiers. Lookaround,
+backreferences, Unicode escapes/properties, inline flags, named groups,
+repeated groups using `*`, `+` or `{...}`, and Rust-only character-set
+operators are rejected. These restrictions avoid silently changing the
+server's UTF-16, Unicode, newline or repeated-capture semantics. Unsupported
+syntax fails during parsing even inside an overridden outer default; an
+unsupported supplied value fails before any insertion or auto-import.
+
+Variables (including environment-, filename- and clipboard-derived values)
+remain unsupported. Pi does not read ambient data to expand a completion.
+Commands and indentation-adjusting items remain separate rejected cases.
 
 ## Limits and validation
 
@@ -176,11 +219,18 @@ Snippet input and expanded insertion text are bounded at 64 KiB, with at most
 64 distinct placeholder indices, 32 options per choice, 2048 syntax nodes and
 32 nesting/expansion levels. Substitutions are at most 16 KiB each and 64 KiB
 combined. Expansion has a separate work budget and a 2 MiB memoized-text cap.
+Transforms additionally admit at most 32 occurrences, 1024 pattern bytes,
+64 capture groups, 128 replacement parts, and 64 KiB compiled-regex and DFA
+limits per pattern. Matching shares a conservative 16 MiB pattern-times-suffix
+work allowance across the entire expansion; this can reject large global
+replacements before the output limit. These are computational bounds, not a
+hard real-time execution guarantee.
 All limits fail before applying an edit; response-size limits still apply to
 preview edits and placeholder metadata.
 
-Regression tests are in `src/lsp/completion/tests.rs`, `completion/item/tests.rs`
-`completion/snippet/tests.rs` and `completion/tests/protocol.rs`. The latter drives the real tool over framed
+Regression tests are in `src/lsp/completion/tests.rs`, `completion/item/tests.rs`,
+`completion/snippet/tests.rs`, `completion/snippet/transform/tests.rs` and
+`completion/tests/protocol.rs`. Protocol tests drive the real tool over framed
 child stdio and real temporary source files. `PI_LSP_REQUIRE_PROTOCOL` makes a
 missing Python peer an error rather than a skip. Run the repository's DSR
 quality entry point; standalone Python-peer checks are not Rust test evidence.

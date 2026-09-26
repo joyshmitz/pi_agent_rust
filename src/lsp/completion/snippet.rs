@@ -2,7 +2,9 @@
 //!
 //! Parse the whole snippet before applying any caller substitutions. Defaults
 //! may nest and references may precede their definition. Values are literal
-//! text, never reparsed as snippets. The server's cached item stays immutable.
+//! text, never reparsed as snippets. Bounded numeric-placeholder transforms
+//! derive individual occurrences without changing their source field. The
+//! server's cached item stays immutable.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -11,6 +13,8 @@ use serde_json::{Value, json};
 use super::{MAX_ITEM_BYTES, bounded_size, malformed};
 use crate::error::Result;
 use crate::lsp::tool_err;
+
+mod transform;
 
 pub(super) type Values = BTreeMap<String, String>;
 const MAX_FIELDS: usize = 64;
@@ -24,6 +28,7 @@ const MAX_MEMO: usize = 2 * 1024 * 1024;
 enum Node {
     Text(String),
     Field(u32),
+    Transformed(u32, transform::Transform),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -36,6 +41,7 @@ struct Parser<'a> {
     input: &'a str,
     offset: usize,
     nodes: usize,
+    transforms: usize,
     ids: BTreeSet<u32>,
     defaults: BTreeMap<u32, DefaultValue>,
 }
@@ -77,6 +83,7 @@ impl<'a> Parser<'a> {
             input,
             offset: 0,
             nodes: 0,
+            transforms: 0,
             ids: BTreeSet::new(),
             defaults: BTreeMap::new(),
         })
@@ -120,8 +127,8 @@ impl<'a> Parser<'a> {
                     if !text.is_empty() {
                         self.push(&mut nodes, Node::Text(std::mem::take(&mut text)))?;
                     }
-                    let id = self.field(depth)?;
-                    self.push(&mut nodes, Node::Field(id))?;
+                    let field = self.field(depth)?;
+                    self.push(&mut nodes, field)?;
                 }
                 Some(ch) => text.push(ch),
             }
@@ -132,7 +139,7 @@ impl<'a> Parser<'a> {
         Ok(nodes)
     }
 
-    fn field(&mut self, depth: usize) -> Result<u32> {
+    fn field(&mut self, depth: usize) -> Result<Node> {
         let braced = self.peek() == Some('{');
         if braced {
             let _ = self.take();
@@ -140,7 +147,7 @@ impl<'a> Parser<'a> {
         if !self.peek().is_some_and(|ch| ch.is_ascii_digit()) {
             return Err(tool_err(
                 "LSP_COMPLETION_UNSUPPORTED",
-                "snippet variables and transformations are not supported; no environment or clipboard is read",
+                "snippet variables are not supported; no environment or clipboard is read",
             ));
         }
         let start = self.offset;
@@ -157,17 +164,19 @@ impl<'a> Parser<'a> {
             return Err(limit());
         }
         if !braced {
-            return Ok(id);
+            return Ok(Node::Field(id));
         }
         let default = match self.take() {
-            Some('}') => return Ok(id),
+            Some('}') => return Ok(Node::Field(id)),
             Some(':') => DefaultValue::Nodes(self.sequence(true, depth + 1)?),
             Some('|') => DefaultValue::Choices(self.choices()?),
             Some('/') => {
-                return Err(tool_err(
-                    "LSP_COMPLETION_UNSUPPORTED",
-                    "snippet transformations are not supported",
-                ));
+                self.transforms += 1;
+                if self.transforms > transform::MAX_TRANSFORMS {
+                    return Err(limit());
+                }
+                let transform = transform::Transform::parse(self.input, &mut self.offset)?;
+                return Ok(Node::Transformed(id, transform));
             }
             _ => return Err(malformed("invalid snippet placeholder suffix")),
         };
@@ -181,7 +190,7 @@ impl<'a> Parser<'a> {
             ));
         }
         self.defaults.insert(id, default);
-        Ok(id)
+        Ok(Node::Field(id))
     }
 
     fn choices(&mut self) -> Result<Vec<String>> {
@@ -221,6 +230,7 @@ struct Renderer<'a> {
     used: BTreeSet<u32>,
     missing: BTreeSet<u32>,
     work: usize,
+    transform_scan: usize,
     memo_bytes: usize,
 }
 
@@ -243,6 +253,11 @@ impl Renderer<'_> {
             match node {
                 Node::Text(text) => append(&mut output, text)?,
                 Node::Field(id) => append(&mut output, &self.field(*id, depth + 1)?)?,
+                Node::Transformed(id, transform) => {
+                    let source = self.field(*id, depth + 1)?;
+                    let text = transform.apply(&source, &mut self.work, &mut self.transform_scan)?;
+                    append(&mut output, &text)?;
+                }
             }
         }
         Ok(output)
@@ -373,6 +388,7 @@ pub(super) fn prepare(item: &Value, values: Option<&Values>) -> Result<Expanded>
         used: BTreeSet::new(),
         missing: BTreeSet::new(),
         work: MAX_WORK,
+        transform_scan: transform::SCAN_BUDGET,
         memo_bytes: 0,
     };
     let text = renderer.sequence(&nodes, 0)?;

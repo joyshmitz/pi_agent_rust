@@ -155,11 +155,11 @@ fn contradictory_defaults_and_cycles_fail_closed() {
 }
 
 #[test]
-fn variables_and_transforms_are_rejected_even_in_overridden_defaults() {
+fn variables_and_unsupported_transforms_are_rejected_even_in_overridden_defaults() {
     for text in [
         "$CLIPBOARD",
         "${TM_FILENAME:default}",
-        "${1/(.*)/$1/}",
+        "${1/(?=a)/$1/}",
         "${1:${TM_FILEPATH}}",
     ] {
         let error = prepare(&item(text), Some(&values(&[("1", "override")])))
